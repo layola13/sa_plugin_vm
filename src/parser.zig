@@ -69,6 +69,8 @@ pub const OpCode = enum {
     shr,
     gt,
     lt,
+    assume_borrow,
+    assume_safe,
     call,
     call_indirect,
     load,
@@ -91,7 +93,6 @@ pub const OpCode = enum {
     jmp,
     consume,
     assign,
-    assume_safe,
     raw_cast,
     panic,
     panic_msg,
@@ -362,6 +363,7 @@ pub const Parser = struct {
     }
 
     fn preprocessFile(self: *Parser, base_dir: []const u8, file_path: []const u8, out_lines: *std.ArrayList([]const u8)) !void {
+        // std.debug.print("Preprocessing file: {s} (base: {s})\n", .{file_path, base_dir});
         const raw_lines = try self.readLines(file_path);
         defer {
             for (raw_lines) |l| self.allocator.free(l);
@@ -498,11 +500,8 @@ pub const Parser = struct {
                 const val_copy = try self.allocator.dupe(u8, val_raw);
                 try self.def_macros.put(name_copy, val_copy);
                 idx += 1;
-            } else if (std.mem.startsWith(u8, line, "@const")) {
-                const eq_idx = std.mem.indexOf(u8, line, "=") orelse {
-                    idx += 1;
-                    continue;
-                };
+            } else if (std.mem.startsWith(u8, line, "@const") and std.mem.indexOf(u8, line, "=") != null) {
+                const eq_idx = std.mem.indexOf(u8, line, "=").?;
                 const name_raw = std.mem.trim(u8, line["@const".len..eq_idx], " \t");
                 const val_raw = std.mem.trim(u8, line[eq_idx + 1 ..], " \t");
 
@@ -518,6 +517,10 @@ pub const Parser = struct {
                 try self.def_macros.put(name_len, val_len);
 
                 try self.constants.put(name_copy, decoded);
+                idx += 1;
+            } else if (std.mem.startsWith(u8, line, "@extern") or std.mem.startsWith(u8, line, "@const")) {
+                // If it's @extern or @const without '=', treat it as a potential function name for now (passed to out_lines)
+                try out_lines.append(try self.allocator.dupe(u8, line));
                 idx += 1;
             } else if (std.mem.startsWith(u8, line, "EXPAND")) {
                 const parts_str = line["EXPAND".len..];
@@ -751,6 +754,31 @@ pub const Parser = struct {
             return try result.toOwnedSlice();
         }
 
+        if (std.mem.startsWith(u8, raw, "hex:")) {
+            const content = raw["hex:".len..];
+            var result = std.ArrayList(u8).init(self.allocator);
+            errdefer result.deinit();
+
+            var i: usize = 0;
+            while (i < content.len) {
+                if (content[i] == '\\' and i + 1 < content.len and content[i + 1] == 'x') {
+                    if (i + 3 < content.len) {
+                        const hex = content[i + 2 .. i + 4];
+                        const val = try std.fmt.parseInt(u8, hex, 16);
+                        try result.append(val);
+                        i += 4;
+                    } else {
+                        try result.append(content[i]);
+                        i += 1;
+                    }
+                } else {
+                    try result.append(content[i]);
+                    i += 1;
+                }
+            }
+            return try result.toOwnedSlice();
+        }
+
         // Handle struct literal: struct { fieldname: SIZE = hex:\xNN\xNN..., ... }
         // Decode by extracting all hex:\xNN... segments in order.
         if (std.mem.startsWith(u8, raw, "struct")) {
@@ -807,6 +835,7 @@ pub const Parser = struct {
                 idx += 1;
                 continue;
             }
+            // std.debug.print("Parsing line {d}: '{s}'\n", .{idx, line});
 
             if (std.mem.startsWith(u8, line, "@") and std.mem.indexOf(u8, line, "(") != null and std.mem.indexOf(u8, line, ")") != null and std.mem.endsWith(u8, line, ":")) {
                 if (current_func_name) |func_name| {
@@ -845,11 +874,18 @@ pub const Parser = struct {
                 }
 
                 var real_name = name;
-                if (std.mem.startsWith(u8, real_name, "export ")) {
-                    real_name = std.mem.trim(u8, real_name["export ".len..], " \t");
-                } else if (std.mem.startsWith(u8, real_name, "extern ")) {
-                    real_name = std.mem.trim(u8, real_name["extern ".len..], " \t");
+                while (true) {
+                    if (std.mem.startsWith(u8, real_name, "export ")) {
+                        real_name = std.mem.trim(u8, real_name["export ".len..], " \t");
+                    } else if (std.mem.startsWith(u8, real_name, "extern ")) {
+                        real_name = std.mem.trim(u8, real_name["extern ".len..], " \t");
+                    } else if (std.mem.startsWith(u8, real_name, "ffi_wrapper ")) {
+                        real_name = std.mem.trim(u8, real_name["ffi_wrapper ".len..], " \t");
+                    } else if (std.mem.startsWith(u8, real_name, "pub ")) {
+                        real_name = std.mem.trim(u8, real_name["pub ".len..], " \t");
+                    } else break;
                 }
+                // std.debug.print("Parsed function name: '{s}' (from '{s}')\n", .{real_name, name});
                 current_func_name = try self.allocator.dupe(u8, real_name);
                 current_func_params = try params_list.toOwnedSlice();
                 current_instructions = std.ArrayList(Instruction).init(self.allocator);
@@ -992,6 +1028,10 @@ pub const Parser = struct {
         } else if (std.mem.eql(u8, first_token, "assume_safe")) {
             op = .assume_safe;
             const arg = token_it.next() orelse return error.MissingAssumeSafeArg;
+            try args_list.append(try self.parseOperand(arg));
+        } else if (std.mem.eql(u8, first_token, "assume_borrow")) {
+            op = .assume_borrow;
+            const arg = token_it.next() orelse return error.MissingAssumeBorrowArg;
             try args_list.append(try self.parseOperand(arg));
         } else if (std.mem.eql(u8, first_token, "panic") or std.mem.startsWith(u8, first_token, "panic(")) {
             op = .panic;
@@ -1343,7 +1383,8 @@ pub const Parser = struct {
         };
     }
 
-    fn parseOperand(self: *Parser, raw: []const u8) !Operand {
+    fn parseOperand(self: *Parser, raw_in: []const u8) !Operand {
+        const raw = std.mem.trim(u8, raw_in, " \t\r\n");
         if (raw.len == 0) {
             return error.EmptyOperand;
         }

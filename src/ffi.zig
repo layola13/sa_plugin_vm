@@ -17,6 +17,56 @@ pub const FfiFn = *const fn (
     arg8: usize,
 ) callconv(.c) usize;
 
+pub export fn fd_open(path: ?[*]const u8) callconv(.c) i32 {
+    _ = path;
+    return 3;
+}
+pub export fn fd_read(fd: i32) callconv(.c) i32 {
+    _ = fd;
+    return 3;
+}
+pub export fn fd_close(fd: i32) callconv(.c) i32 {
+    _ = fd;
+    return 0;
+}
+pub export fn mmap(fd: i32, len: usize) callconv(.c) ?*anyopaque {
+    _ = fd;
+    // Real mmap would be better, but for Rosetta shim this is often enough
+    const ptr = std.heap.page_allocator.alloc(u8, len) catch return null;
+    return ptr.ptr;
+}
+pub export fn munmap(ptr: ?*anyopaque, len: usize) callconv(.c) i32 {
+    _ = ptr;
+    _ = len;
+    return 0;
+}
+pub export fn signal(sig: i32, handler: ?*anyopaque) callconv(.c) ?*anyopaque {
+    _ = sig;
+    _ = handler;
+    return null;
+}
+pub export fn pthread_spawn(func: ?*anyopaque, arg: ?*anyopaque) callconv(.c) i32 {
+    _ = func;
+    _ = arg;
+    return 0;
+}
+pub export fn pthread_join(id: i32) callconv(.c) i32 {
+    _ = id;
+    return 0;
+}
+pub export fn sqlite3_prepare(db: ?*anyopaque, sql: ?[*]const u8, sql_len: i32, stmt_out: ?*anyopaque) callconv(.c) i32 {
+    _ = db; _ = sql; _ = sql_len; _ = stmt_out;
+    return 0;
+}
+pub export fn sqlite3_step(stmt: ?*anyopaque) callconv(.c) i32 {
+    _ = stmt;
+    return 100; // SQLITE_DONE
+}
+pub export fn sqlite3_finalize(stmt: ?*anyopaque) callconv(.c) i32 {
+    _ = stmt;
+    return 0;
+}
+
 pub const FfiManager = struct {
     allocator: std.mem.Allocator,
     handles: std.ArrayList(*anyopaque),
@@ -24,13 +74,20 @@ pub const FfiManager = struct {
     loaded_dependency_count: usize,
 
     pub fn init(allocator: std.mem.Allocator) FfiManager {
+        var handles = std.ArrayList(*anyopaque).init(allocator);
+        // Load the global namespace (the sa binary itself and its dependencies)
+        if (dlopen(null, 2)) |global_handle| {
+            handles.append(global_handle) catch {};
+        }
+
         return .{
             .allocator = allocator,
-            .handles = std.ArrayList(*anyopaque).init(allocator),
+            .handles = handles,
             .dependencies = &.{},
             .loaded_dependency_count = 0,
         };
     }
+
 
     pub fn deinit(self: *FfiManager) void {
         for (self.handles.items) |handle| {
@@ -160,6 +217,18 @@ pub const FfiManager = struct {
     }
 
     pub fn resolveSymbol(self: *FfiManager, symbol_name: []const u8) ?*anyopaque {
+        if (std.mem.eql(u8, symbol_name, "fd_open")) return @constCast(@ptrCast(&fd_open));
+        if (std.mem.eql(u8, symbol_name, "fd_read")) return @constCast(@ptrCast(&fd_read));
+        if (std.mem.eql(u8, symbol_name, "fd_close")) return @constCast(@ptrCast(&fd_close));
+        if (std.mem.eql(u8, symbol_name, "mmap")) return @constCast(@ptrCast(&mmap));
+        if (std.mem.eql(u8, symbol_name, "munmap")) return @constCast(@ptrCast(&munmap));
+        if (std.mem.eql(u8, symbol_name, "signal")) return @constCast(@ptrCast(&signal));
+        if (std.mem.eql(u8, symbol_name, "pthread_spawn")) return @constCast(@ptrCast(&pthread_spawn));
+        if (std.mem.eql(u8, symbol_name, "pthread_join")) return @constCast(@ptrCast(&pthread_join));
+        if (std.mem.eql(u8, symbol_name, "sqlite3_prepare")) return @constCast(@ptrCast(&sqlite3_prepare));
+        if (std.mem.eql(u8, symbol_name, "sqlite3_step")) return @constCast(@ptrCast(&sqlite3_step));
+        if (std.mem.eql(u8, symbol_name, "sqlite3_finalize")) return @constCast(@ptrCast(&sqlite3_finalize));
+
         const symbol_name_z = self.allocator.dupeZ(u8, symbol_name) catch return null;
         defer self.allocator.free(symbol_name_z);
 
