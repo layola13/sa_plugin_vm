@@ -1,0 +1,78 @@
+@import "sa_std/io/print.sai"
+
+@const RESULT_OK = utf8:"[0,0,0,0]\n"
+@const RESULT_ERR = utf8:"error\n"
+
+@fill_zero(&arr: ptr) -> void:
+L_ENTRY:
+    i_slot = stack_alloc 8
+    store i_slot+0, 0 as u64
+    jmp L_COND
+
+L_COND:
+    i = load i_slot+0 as u64
+    more = ult i, 4
+    br more -> L_BODY, L_END
+
+L_BODY:
+    slot = ptr_add arr, i
+    store slot+0, 0 as u8
+    next = add i, 1
+    store i_slot+0, next as u64
+    !slot
+    !next
+    !i
+    !more
+    jmp L_COND
+
+L_END:
+    !i
+    !more
+    !arr
+    return
+
+@main() -> i32:
+L_ENTRY:
+    buffer = alloc 4
+    store buffer+0, 1 as u8
+    store buffer+1, 2 as u8
+    store buffer+2, 3 as u8
+    store buffer+3, 4 as u8
+
+    call @fill_zero(&buffer)
+
+    b0 = load buffer+0 as u8
+    b1 = load buffer+1 as u8
+    b2 = load buffer+2 as u8
+    b3 = load buffer+3 as u8
+    ok0 = eq b0, 0
+    ok1 = eq b1, 0
+    ok2 = eq b2, 0
+    ok3 = eq b3, 0
+    pair0 = and ok0, ok1
+    pair1 = and ok2, ok3
+    ok = and pair0, pair1
+
+    !b0
+    !b1
+    !b2
+    !b3
+    !ok0
+    !ok1
+    !ok2
+    !ok3
+    !pair0
+    !pair1
+    !buffer
+
+    br ok -> L_OK, L_ERR
+
+L_OK:
+    !ok
+    call @sa_print_bytes(&RESULT_OK, 10)
+    return 0
+
+L_ERR:
+    !ok
+    call @sa_print_bytes(&RESULT_ERR, 6)
+    return 1

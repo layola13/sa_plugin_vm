@@ -1,0 +1,100 @@
+@import "sa_std/io/print.sai"
+@import "sa_std/libsa_async.sa"
+
+@const RESULT_OK = utf8:"async ok\n"
+@const RESULT_ERR = utf8:"error\n"
+@const STR_POLLING = utf8:"Polling...\n"
+@const STR_READY = utf8:"Ready!\n"
+
+EXPAND ASYNC_CTX_DEF Task
+
+@mock_poll_fn(ctx: ptr) -> i32:
+L_ENTRY:
+    calls = load ctx+Task_stage as u32
+    call @sa_print_bytes(&STR_POLLING, 11)
+    
+    next_calls = add calls, 1
+    store ctx+Task_stage, next_calls as u32
+    
+    ready = eq next_calls, 3
+    !calls
+    !next_calls
+    br ready -> L_READY, L_PENDING
+L_READY:
+    !ready
+    call @sa_print_bytes(&STR_READY, 7)
+    return 1
+L_PENDING:
+    !ready
+    call @sa_time_sleep_ms(500)
+    return 0
+
+@mock_take_fn(ctx: ptr) -> i32:
+L_ENTRY:
+    store ctx+Task_value, 99 as u64
+    return 0
+
+@async_poll_executor(ctx: ptr) -> i32:
+L_ENTRY:
+    EXPAND ASYNC_POLL_PROLOGUE ctx, Task_state
+    br async_state_Task_state -> L_STATE_1, L_INVALID
+    
+L_STATE_1:
+    !async_state_Task_state
+    EXPAND ASYNC_AWAIT_POINT_FINAL ctx, Task_state, 1, @mock_poll_fn, @mock_take_fn
+
+L_INVALID:
+    !async_state_Task_state
+    EXPAND ASYNC_INVALID_STATE
+
+@main() -> i32:
+L_ENTRY:
+    ctx = alloc Task_SIZE
+    store ctx+Task_state, 1 as u32
+    store ctx+Task_stage, 0 as u32
+    store ctx+Task_value, 0 as u64
+    
+    r1 = call @async_poll_executor(ctx)
+    r2 = call @async_poll_executor(ctx)
+    r3 = call @async_poll_executor(ctx)
+    
+    final_state = load ctx+Task_state as u32
+    final_val = load ctx+Task_value as u64
+    
+    ok1 = eq r1, 0
+    ok2 = eq r2, 0
+    ok3 = eq r3, 1
+    ok4 = eq final_state, 2
+    ok5 = eq final_val, 99
+    
+    ok12 = and ok1, ok2
+    ok34 = and ok3, ok4
+    ok14 = and ok12, ok34
+    ok = and ok14, ok5
+    
+    !r1
+    !r2
+    !r3
+    !final_state
+    !final_val
+    !ok1
+    !ok2
+    !ok3
+    !ok4
+    !ok5
+    !ok12
+    !ok34
+    !ok14
+    !ctx
+    
+    br ok -> L_OK, L_ERR
+
+L_OK:
+    !ok
+    call @sa_print_bytes(&RESULT_OK, 9)
+    return 0
+
+L_ERR:
+    !ok
+    call @sa_print_bytes(&RESULT_ERR, 6)
+    return 1

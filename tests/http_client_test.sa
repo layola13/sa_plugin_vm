@@ -1,0 +1,30 @@
+@import "sa_std/io/print.sai"
+
+@const MSG_OK = utf8:"[PASS] Dynamic VM FFI verified for http-client plugin!\n"
+@const MSG_ERR = utf8:"[FAIL] Dynamic VM FFI failed for http-client plugin\n"
+
+@extern sa_http_client_new(use_tls: u32, &out_client: ptr) -> u32
+@extern sa_http_client_free(client: ptr) -> u32
+
+@main() -> i32:
+L_ENTRY:
+    client_slot = stack_alloc 8
+    status = call @sa_http_client_new(0, &client_slot)
+    
+    ok = eq status, 0
+    br ok -> L_FREE, L_ERR
+    
+L_FREE:
+    client = load client_slot+0 as ptr
+    status2 = call @sa_http_client_free(client)
+    
+    ok2 = eq status2, 0
+    br ok2 -> L_SUCCESS, L_ERR
+    
+L_SUCCESS:
+    call @sa_print_bytes(&MSG_OK, 55)
+    return 0
+    
+L_ERR:
+    call @sa_print_bytes(&MSG_ERR, 52)
+    return 1

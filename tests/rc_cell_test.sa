@@ -1,0 +1,74 @@
+@import "sa_std/io/print.sai"
+@import "sa_std/core/cell.sa"
+@import "sa_std/core/rc.sa"
+
+@const RESULT_OK = utf8:"rc cell ok\n"
+@const RESULT_ERR = utf8:"error\n"
+
+@main() -> i32:
+L_ENTRY:
+    # 1. Test Cell
+    c = alloc Cell_SIZE
+    EXPAND CELL_NEW c
+    EXPAND CELL_SET c, 42
+    val = load c+Cell_value as i32
+    ok_cell = eq val, 42
+    !val
+    br ok_cell -> L_RC_TEST, L_FAIL
+
+L_RC_TEST:
+    !ok_cell
+    # 2. Test Rc
+    rc = alloc RcBox_SIZE
+    EXPAND RC_NEW rc, 100
+    
+    # Clone it
+    EXPAND RC_CLONE rc
+    
+    # Downgrade
+    EXPAND RC_DOWNGRADE weak, rc
+    
+    # Upgrade
+    EXPAND WEAK_UPGRADE rc3, is_alive, weak
+    
+    # Verify value and alive status
+    ok_alive = eq is_alive, 1
+    rc3_val = load rc3+RcBox_data as u64
+    ok_val = eq rc3_val, 100
+    ok_rc = and ok_alive, ok_val
+    
+    !rc3_val
+    !ok_alive
+    !ok_val
+    !weak
+    !rc3
+    
+    br ok_rc -> L_DROP_TEST, L_FAIL_RC
+
+L_DROP_TEST:
+    !ok_rc
+    # Drop one reference (strong count becomes 2)
+    EXPAND RC_DROP rc, L_CLEANUP
+    
+    # Drop second reference (strong count becomes 1)
+    EXPAND RC_DROP rc, L_CLEANUP
+    
+    # Drop final reference (strong count becomes 0, jumps to L_CLEANUP)
+    EXPAND RC_DROP rc, L_CLEANUP
+    
+    # Should not reach here
+    jmp L_FAIL_RC
+
+L_CLEANUP:
+    # Free allocated box memory
+    !rc
+    !c
+    call @sa_print_bytes(&RESULT_OK, 11)
+    return 0
+
+L_FAIL_RC:
+    !rc
+L_FAIL:
+    !c
+    call @sa_print_bytes(&RESULT_ERR, 6)
+    return 1

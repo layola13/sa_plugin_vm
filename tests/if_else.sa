@@ -1,0 +1,36 @@
+@import "sa_std/io/print.sai"
+
+@const RESULT_OK = utf8:"20\n"
+@const RESULT_ERR = utf8:"error\n"
+
+@max(a: i32, b: i32) -> i32:
+L_ENTRY:
+    choose_a = sgt a, b
+    br choose_a -> L_A, L_B
+
+L_A:
+    !choose_a
+    !b
+    return a
+
+L_B:
+    !choose_a
+    !a
+    return b
+
+@main() -> i32:
+L_ENTRY:
+    result = call @max(10, 20)
+    ok = eq result, 20
+    !result
+    br ok -> L_OK, L_ERR
+
+L_OK:
+    !ok
+    call @sa_print_bytes(&RESULT_OK, 3)
+    return 0
+
+L_ERR:
+    !ok
+    call @sa_print_bytes(&RESULT_ERR, 6)
+    return 1

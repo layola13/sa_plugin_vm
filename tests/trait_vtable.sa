@@ -1,0 +1,58 @@
+@import "sa_std/io/print.sai"
+
+@const RESULT_OK = utf8:"77\n"
+@const RESULT_ERR = utf8:"error\n"
+@const BUTTON_VT = vtable { draw = @button_draw }
+
+#def DynDraw_SIZE = 16
+#def DynDraw_DATA = +0
+#def DynDraw_VTABLE = +8
+
+#def VTable_draw = +0
+
+#def Button_SIZE = 4
+#def Button_id = +0
+
+@button_draw(&self: ptr) -> i32:
+L_ENTRY:
+    id = load self+Button_id as i32
+    !self
+    return id
+
+@render(&item: ptr) -> i32:
+L_ENTRY:
+    data_ptr = load item+DynDraw_DATA as ptr
+    vtable_ptr = load item+DynDraw_VTABLE as ptr
+    draw_fn = load vtable_ptr+VTable_draw as ptr
+    result = call_indirect draw_fn(&data_ptr)
+    !draw_fn
+    !vtable_ptr
+    !data_ptr
+    !item
+    return result
+
+@main() -> i32:
+L_ENTRY:
+    button = alloc Button_SIZE
+    store button+Button_id, 77 as i32
+
+    fat = alloc DynDraw_SIZE
+    store fat+DynDraw_DATA, button as ptr
+    store fat+DynDraw_VTABLE, &BUTTON_VT as ptr
+
+    result = call @render(&fat)
+    ok = eq result, 77
+    !result
+    !button
+    !fat
+    br ok -> L_OK, L_ERR
+
+L_OK:
+    !ok
+    call @sa_print_bytes(&RESULT_OK, 3)
+    return 0
+
+L_ERR:
+    !ok
+    call @sa_print_bytes(&RESULT_ERR, 6)
+    return 1

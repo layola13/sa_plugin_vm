@@ -1,0 +1,74 @@
+{
+  "schema": "sa.plugin/1",
+  "name": "vm",
+  "version": "0.1.0",
+  "source": {
+    "type": "local",
+    "path": "."
+  },
+  "abi": {
+    "plugin": 1,
+    "saasm": ">=0.4.0",
+    "symbols": "CLI-only"
+  },
+  "artifacts": {
+    "linux-x86_64": {
+      "path": "zig-out/lib/libvm.so"
+    }
+  },
+  "interfaces": {},
+  "skills": ["vm"],
+  "permissions": {
+    "fs": [
+      { "op": "read", "path": "$PROJECT/**" },
+      { "op": "write", "path": "$PROJECT/**" },
+      { "op": "create", "path": "$PROJECT/**" },
+      { "op": "delete", "path": "$PROJECT/**" },
+      { "op": "metadata", "path": "$PROJECT/**" },
+      { "op": "read", "path": "$SA_PLUGINS_HOME/**" },
+      { "op": "metadata", "path": "$SA_PLUGINS_HOME/**" },
+      { "op": "read", "path": "$HOME/.sa/std/**" },
+      { "op": "metadata", "path": "$HOME/.sa/std/**" },
+      { "op": "read", "path": "$SA_CACHE/**" },
+      { "op": "write", "path": "$SA_CACHE/**" },
+      { "op": "create", "path": "$SA_CACHE/**" }
+    ],
+    "net": [
+      { "url": "https://example.com", "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] },
+      { "url": "https://api.example.com", "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] },
+      { "url": "http://localhost", "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] },
+      { "url": "http://127.0.0.1", "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] },
+      { "url": "http://localhost:18395", "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] },
+      { "url": "http://127.0.0.1:18395", "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] },
+      { "url": "http://[::1]", "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] }
+    ],
+    "env": ["HOME", "SA_PLUGINS_HOME", "SA_STD_DIR", "SA_CACHE", "SA_*"],
+    "process": {
+      "spawn": true,
+      "exec": [
+        { "path": "/bin/echo", "args": ["*"] },
+        { "path": "/usr/bin/echo", "args": ["*"] }
+      ]
+    }
+  },
+  "dependencies": {
+    "http-client": {
+      "version": ">=0.1.0",
+      "abi": 1,
+      "optional": true,
+      "symbols": ["sa_http_client_new", "sa_http_client_free"]
+    },
+    "deno": {
+      "version": ">=0.1.0",
+      "abi": 1,
+      "optional": true,
+      "symbols": ["sa_deno_plugin_hostname"]
+    },
+    "node": {
+      "version": ">=0.1.0",
+      "abi": 1,
+      "optional": true,
+      "symbols": ["sa_node_plugin_os_cpus", "sa_node_plugin_timers_sleep"]
+    }
+  }
+}

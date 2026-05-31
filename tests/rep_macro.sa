@@ -1,0 +1,38 @@
+@import "sa_std/io/print.sai"
+
+@const RESULT_OK = utf8:"rep ok\n"
+@const RESULT_ERR = utf8:"error\n"
+
+@main() -> i32:
+L_ENTRY:
+    _sum_slot = stack_alloc 8
+    store _sum_slot+0, 0 as u64
+
+    [REP 3]
+    # Each iteration has its own hygienic label L_ITER and local register _step_val
+    # as well as substituting the loop index %i
+    L_ITER:
+        _step_val_%i = add %i, 1
+        _curr_sum = load _sum_slot+0 as u64
+        _next_sum = add _curr_sum, _step_val_%i
+        store _sum_slot+0, _next_sum as u64
+        !_step_val_%i
+        !_curr_sum
+        !_next_sum
+    [END_REP]
+
+    final_sum = load _sum_slot+0 as u64
+    ok = eq final_sum, 6 # 1 + 2 + 3 = 6
+    !final_sum
+    !_sum_slot
+    br ok -> L_OK, L_ERR
+
+L_OK:
+    !ok
+    call @sa_print_bytes(&RESULT_OK, 7)
+    return 0
+
+L_ERR:
+    !ok
+    call @sa_print_bytes(&RESULT_ERR, 6)
+    return 1

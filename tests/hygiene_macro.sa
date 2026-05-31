@@ -1,0 +1,35 @@
+@import "sa_std/io/print.sai"
+
+@const RESULT_OK = utf8:"hygiene ok\n"
+@const RESULT_ERR = utf8:"error\n"
+
+[MACRO] BAR %out, %x
+    _tmp = add %x, 1
+    %out = _tmp
+[END_MACRO]
+
+@main() -> i32:
+L_ENTRY:
+    EXPAND BAR _a, 5
+    EXPAND BAR _b, 10
+    
+    # Verify parameter substitution and register isolation:
+    oka = eq _a, 6
+    okb = eq _b, 11
+    ok = and oka, okb
+    
+    !_a
+    !_b
+    !oka
+    !okb
+    br ok -> L_OK, L_ERR
+
+L_OK:
+    !ok
+    call @sa_print_bytes(&RESULT_OK, 11)
+    return 0
+
+L_ERR:
+    !ok
+    call @sa_print_bytes(&RESULT_ERR, 6)
+    return 1

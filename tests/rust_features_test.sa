@@ -1,0 +1,131 @@
+@import "sa_std/io/print.sai"
+@import "sa_std/core/cell.sa"
+@import "sa_std/core/rc.sa"
+
+@const RESULT_OK = utf8:"rust features ok\n"
+@const RESULT_ERR = utf8:"error\n"
+
+#def Rectangle_SIZE = 8
+#def Rectangle_width = +0
+#def Rectangle_height = +4
+
+#def VTable_area = +0
+#def VTable_scale = +8
+
+#def ShapeDyn_SIZE = 16
+#def ShapeDyn_DATA = +0
+#def ShapeDyn_VTABLE = +8
+
+@const RECT_VT = vtable { area = @rect_area, scale = @rect_scale }
+
+@rect_area(self: ptr) -> i32:
+L_ENTRY:
+    w = load self+Rectangle_width as i32
+    h = load self+Rectangle_height as i32
+    res = mul w, h
+    !w
+    !h
+    !self
+    return res
+
+@rect_scale(self: ptr, factor: i32) -> i32:
+L_ENTRY:
+    w = load self+Rectangle_width as i32
+    new_w = mul w, factor
+    store self+Rectangle_width, new_w as i32
+    !w
+    !new_w
+    !factor
+    !self
+    return 0
+
+@main() -> i32:
+L_ENTRY:
+    # 1. Create Rectangle (5x10)
+    rect = alloc Rectangle_SIZE
+    store rect+Rectangle_width, 5 as i32
+    store rect+Rectangle_height, 10 as i32
+
+    # 2. Wrap in Rc
+    rc = alloc RcBox_SIZE
+    EXPAND RC_NEW rc, rect as u64
+
+    # 3. Create Weak pointer
+    EXPAND RC_DOWNGRADE weak, rc
+
+    # 4. Upgrade Weak to a new Rc pointer
+    EXPAND WEAK_UPGRADE rc2, is_ok, weak
+    
+    # 5. Check upgrade succeeded
+    ok_upgraded = eq is_ok, 1
+    !is_ok
+    br ok_upgraded -> L_TEST_DYN, L_FAIL
+
+L_TEST_DYN:
+    !ok_upgraded
+    
+    # 6. Retrieve Rectangle pointer
+    rect_ptr = load rc2+RcBox_data as ptr
+
+    # 7. Create Fat Dynamic Shape Pointer
+    dyn_shape = alloc ShapeDyn_SIZE
+    store dyn_shape+ShapeDyn_DATA, rect_ptr as ptr
+    store dyn_shape+ShapeDyn_VTABLE, &RECT_VT as ptr
+
+    # 8. Call shape.area() -> expect 50
+    vtable_ptr = load dyn_shape+ShapeDyn_VTABLE as ptr
+    area_fn = load vtable_ptr+VTable_area as ptr
+    area_val1 = call_indirect area_fn(rect_ptr)
+    ok_area1 = eq area_val1, 50
+    !area_val1
+    br ok_area1 -> L_SCALE, L_FAIL_DYN
+
+L_SCALE:
+    !ok_area1
+    
+    # 9. Call shape.scale(2)
+    scale_fn = load vtable_ptr+VTable_scale as ptr
+    dummy = call_indirect scale_fn(rect_ptr, 2)
+    !dummy
+
+    # 10. Call shape.area() again -> expect 100 (10x10)
+    area_val2 = call_indirect area_fn(rect_ptr)
+    ok_area2 = eq area_val2, 100
+    !area_val2
+    !area_fn
+    !scale_fn
+    !vtable_ptr
+    !dyn_shape
+    br ok_area2 -> L_CLEANUP_RC, L_FAIL_DYN
+
+L_CLEANUP_RC:
+    !ok_area2
+    # 11. Drop weak and Rc references
+    EXPAND WEAK_DROP weak, L_FREE_BOX
+    EXPAND RC_DROP rc2, L_FREE_BOX
+    EXPAND RC_DROP rc, L_FREE_BOX
+    
+    # Both strong and weak are still positive (strong=1, weak=1)
+    jmp L_FAIL
+
+L_FREE_BOX:
+    # All dropped, let's clean up
+    !weak
+    !rc2
+    !rc
+    !rect
+    call @sa_print_bytes(&RESULT_OK, 18)
+    return 0
+
+L_FAIL_DYN:
+    !area_fn
+    !scale_fn
+    !vtable_ptr
+    !dyn_shape
+    !weak
+    !rc2
+L_FAIL:
+    !rc
+    !rect
+    call @sa_print_bytes(&RESULT_ERR, 6)
+    return 1

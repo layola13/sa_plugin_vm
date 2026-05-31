@@ -1,0 +1,42 @@
+@import "sa_std/io/print.sai"
+
+@const RESULT_OK = utf8:"21\n"
+@const RESULT_ERR = utf8:"error\n"
+
+@fib(n: i32) -> i32:
+L_ENTRY:
+    base = sle n, 1
+    br base -> L_BASE, L_REC
+
+L_BASE:
+    !base
+    return n
+
+L_REC:
+    !base
+    n1 = sub n, 1
+    n2 = sub n, 2
+    a = call @fib(n1)
+    b = call @fib(n2)
+    sum = add a, b
+    !n
+    !a
+    !b
+    return sum
+
+@main() -> i32:
+L_ENTRY:
+    result = call @fib(8)
+    ok = eq result, 21
+    !result
+    br ok -> L_OK, L_ERR
+
+L_OK:
+    !ok
+    call @sa_print_bytes(&RESULT_OK, 3)
+    return 0
+
+L_ERR:
+    !ok
+    call @sa_print_bytes(&RESULT_ERR, 6)
+    return 1
