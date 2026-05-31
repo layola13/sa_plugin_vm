@@ -100,6 +100,16 @@ fn runVmCommand(allocator: std.mem.Allocator, ctx: *const plugin_api.Context, ar
     var vm_inst = vm.VM.init(vm_allocator, prog, &ffi_mgr);
     defer vm_inst.deinit();
     const code = vm_inst.run() catch |err| {
+        if (err == error.Panic) {
+            if (vm_inst.panic_code) |panic_code| {
+                if (vm_inst.panic_message) |msg| {
+                    try stderr.print("PANIC[{d}]: {s}\n", .{ panic_code, msg });
+                } else {
+                    try stderr.print("PANIC: code={d}\n", .{panic_code});
+                }
+                return 128 +% (panic_code & 0x7f);
+            }
+        }
         try stderr.print("VM Execution failed: {}\n", .{err});
         return 1;
     };

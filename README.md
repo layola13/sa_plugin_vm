@@ -158,6 +158,6 @@ sa vm run /path/to/demo/main.sa
 
 ## 5. Known Remaining Limitations
 
-- `panic` / `panic_msg` instructions terminate with `exit(1)` rather than printing a backtrace.
+- `panic` / `panic_msg` instructions print `PANIC` / `PANIC[code]` and terminate with the SA-compatible exit code `128 + (code & 0x7f)`, but they still do not print a backtrace.
 - `f32`/`f64` floating-point arithmetic is still represented as raw bits internally; floating-point comparisons are not a supported execution path yet.
 - The thread model is synchronous inside the VM. It is sufficient for the current demos and benchmarks, but it is not a host-level pthread scheduler.

@@ -10,6 +10,9 @@ pub const VM = struct {
     function_names: std.StringHashMap(usize),
     dummy_buffers: std.ArrayList(*u8),
     heap_allocs: std.ArrayList([]u64),
+    result_allocs: std.ArrayList([]u64),
+    panic_code: ?u8 = null,
+    panic_message: ?[]u8 = null,
     thread_results: std.AutoHashMap(i32, usize),
     next_thread_handle: i32,
 
@@ -22,12 +25,16 @@ pub const VM = struct {
             .function_names = std.StringHashMap(usize).init(allocator),
             .dummy_buffers = std.ArrayList(*u8).init(allocator),
             .heap_allocs = std.ArrayList([]u64).init(allocator),
+            .result_allocs = std.ArrayList([]u64).init(allocator),
+            .panic_code = null,
+            .panic_message = null,
             .thread_results = std.AutoHashMap(i32, usize).init(allocator),
             .next_thread_handle = 1,
         };
     }
 
     pub fn deinit(self: *VM) void {
+        self.clearPanicState();
         self.function_addresses.deinit();
         self.function_names.deinit();
         self.thread_results.deinit();
@@ -39,9 +46,22 @@ pub const VM = struct {
             self.allocator.free(buf);
         }
         self.heap_allocs.deinit();
+        for (self.result_allocs.items) |buf| {
+            self.allocator.free(buf);
+        }
+        self.result_allocs.deinit();
+    }
+
+    fn clearPanicState(self: *VM) void {
+        if (self.panic_message) |msg| {
+            self.allocator.free(msg);
+        }
+        self.panic_message = null;
+        self.panic_code = null;
     }
 
     pub fn run(self: *VM) !i32 {
+        self.clearPanicState();
         try self.initFunctionsAndVtables();
 
         const main_func = self.program.functions.get("main") orelse {
@@ -72,6 +92,19 @@ pub const VM = struct {
                 return idx == block.end_inst - 1;
             }
             return false;
+        }
+        return false;
+    }
+
+    fn freeTrackedResultAlloc(self: *VM, ptr: usize) bool {
+        var idx: usize = 0;
+        while (idx < self.result_allocs.items.len) : (idx += 1) {
+            const buf = self.result_allocs.items[idx];
+            if (@intFromPtr(buf.ptr) == ptr) {
+                self.allocator.free(buf);
+                _ = self.result_allocs.swapRemove(idx);
+                return true;
+            }
         }
         return false;
     }
@@ -511,17 +544,46 @@ pub const VM = struct {
                 .try_ => {
                     const addr = try self.resolveVal(&frame, inst.args[0]);
                     const tag = @as(*align(1) const u64, @ptrFromInt(addr)).*;
-                    if (tag != 0) return tag;
+                    if (tag != 0) {
+                        _ = self.freeTrackedResultAlloc(addr);
+                        return tag;
+                    }
                     (try frame.getRegPtr(inst.dest.?)).* = @as(*align(1) const u64, @ptrFromInt(addr + 8)).*;
+                    _ = self.freeTrackedResultAlloc(addr);
                     pc += 1;
                 },
-                .panic, .panic_msg => return error.Panic,
-                .consume => pc += 1,
+                .panic => {
+                    const panic_code = @as(u8, @truncate(try self.resolveVal(&frame, inst.args[0])));
+                    self.clearPanicState();
+                    self.panic_code = panic_code;
+                    return error.Panic;
+                },
+                .panic_msg => {
+                    const panic_code = @as(u8, @truncate(try self.resolveVal(&frame, inst.args[0])));
+                    const msg_ptr = try self.resolveVal(&frame, inst.args[1]);
+                    const msg_len = @as(usize, @intCast(try self.resolveVal(&frame, inst.args[2])));
+                    self.clearPanicState();
+                    self.panic_code = panic_code;
+                    if (msg_ptr != 0 and msg_len != 0) {
+                        const src = @as([*]const u8, @ptrFromInt(msg_ptr))[0..msg_len];
+                        const buf = try self.allocator.alloc(u8, msg_len);
+                        @memcpy(buf, src);
+                        self.panic_message = buf;
+                    }
+                    return error.Panic;
+                },
+                .consume => {
+                    const ptr = try self.resolveVal(&frame, inst.args[0]);
+                    _ = self.freeTrackedResultAlloc(ptr);
+                    pc += 1;
+                },
                 .return_ => {
                     const ret = if (inst.args.len > 0) try self.resolveVal(&frame, inst.args[0]) else 0;
                     if (func.returns_result and !std.mem.eql(u8, func.name, "main")) {
                         const buf = try self.allocator.alloc(u64, 3);
+                        errdefer self.allocator.free(buf);
                         buf[0] = 0; buf[1] = ret; buf[2] = 0;
+                        try self.result_allocs.append(buf);
                         return @intFromPtr(buf.ptr);
                     }
                     return ret;
