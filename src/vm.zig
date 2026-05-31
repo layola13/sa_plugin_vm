@@ -124,19 +124,15 @@ pub const VM = struct {
                 std.debug.print("Constant not found: {s}\n", .{arg.name});
                 return error.ConstantNotFound;
             },
-            .stack_addr => {
+            .stack_addr, .register => {
                 const storage = try frame.getRegPtr(arg.name);
-                return @intFromPtr(storage);
+                return @as(usize, @intCast(storage.*));
             },
             .offset_addr => {
                 const storage = try frame.getRegPtr(arg.name);
                 const base = @as(usize, @intCast(storage.*));
                 const offset_addr = @as(isize, @intCast(base)) + arg.offset;
                 return @as(usize, @bitCast(offset_addr));
-            },
-            .register => {
-                const storage = try frame.getRegPtr(arg.name);
-                return @as(usize, @intCast(storage.*));
             },
             .label => return error.LabelAsValueUnsupported,
         }
@@ -296,6 +292,9 @@ pub const VM = struct {
                     const new_val = try self.resolveVal(&frame, inst.args[2]);
                     const old_val: u64 = switch (inst.dest_type) {
                         .ptr, .i64, .u64 => @cmpxchgStrong(u64, @as(*u64, @ptrFromInt(addr)), expected, new_val, .seq_cst, .seq_cst) orelse expected,
+                        .i32, .u32 => @cmpxchgStrong(u32, @as(*u32, @ptrFromInt(addr)), @as(u32, @intCast(expected & 0xffffffff)), @as(u32, @intCast(new_val & 0xffffffff)), .seq_cst, .seq_cst) orelse @as(u32, @intCast(expected & 0xffffffff)),
+                        .i16, .u16 => @cmpxchgStrong(u16, @as(*u16, @ptrFromInt(addr)), @as(u16, @intCast(expected & 0xffff)), @as(u16, @intCast(new_val & 0xffff)), .seq_cst, .seq_cst) orelse @as(u16, @intCast(expected & 0xffff)),
+                        .i8, .u8 => @cmpxchgStrong(u8, @as(*u8, @ptrFromInt(addr)), @as(u8, @intCast(expected & 0xff)), @as(u8, @intCast(new_val & 0xff)), .seq_cst, .seq_cst) orelse @as(u8, @intCast(expected & 0xff)),
                         else => return error.UnsupportedCmpxchgType,
                     };
                     if (inst.dest) |d| {
@@ -303,6 +302,21 @@ pub const VM = struct {
                             (try frame.getRegPtr(std.mem.trim(u8, d[0..comma], " \t"))).* = old_val;
                             (try frame.getRegPtr(std.mem.trim(u8, d[comma+1..], " \t"))).* = if (old_val == expected) 1 else 0;
                         } else (try frame.getRegPtr(d)).* = old_val;
+                    }
+                    pc += 1;
+                },
+                .atomic_rmw_add => {
+                    const addr = try self.resolveVal(&frame, inst.args[0]);
+                    const val = try self.resolveVal(&frame, inst.args[1]);
+                    const old_val: u64 = switch (inst.dest_type) {
+                        .ptr, .i64, .u64 => @atomicRmw(u64, @as(*u64, @ptrFromInt(addr)), .Add, val, .seq_cst),
+                        .i32, .u32 => @atomicRmw(u32, @as(*u32, @ptrFromInt(addr)), .Add, @as(u32, @intCast(val & 0xffffffff)), .seq_cst),
+                        .i16, .u16 => @atomicRmw(u16, @as(*u16, @ptrFromInt(addr)), .Add, @as(u16, @intCast(val & 0xffff)), .seq_cst),
+                        .i8, .u8 => @atomicRmw(u8, @as(*u8, @ptrFromInt(addr)), .Add, @as(u8, @intCast(val & 0xff)), .seq_cst),
+                        else => return error.UnsupportedAtomicRmwType,
+                    };
+                    if (inst.dest) |d| {
+                        (try frame.getRegPtr(d)).* = old_val;
                     }
                     pc += 1;
                 },
@@ -350,7 +364,6 @@ pub const VM = struct {
                     }
                     return ret;
                 },
-                else => { std.debug.print("Op not impl: {s}\n", .{@tagName(inst.op)}); return error.OpNotImplemented; }
             }
         }
         return 0;
