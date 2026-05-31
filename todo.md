@@ -269,3 +269,8 @@
 ● Read(/home/vscode/projects/sa_plugins/sa_plugin_vm/tests/async_await_test.sa) (ctrl+o to expand)
 
   I will search for  libsa_async.sa  in the workspace to locate its path and content.
+## FFI Native Penetration (Lua/Python ctypes equivalence)
+- [ ] **Evaluate libffi integration:** Investigate integrating standard libffi to replace the handwritten, limited AMD64 System V ABI marshalling in src/ffi.zig. This will enable the VM to pass structs by value, use floating-point arguments, handle more than 6 parameters, and support other architectures.
+- [ ] **Expose unconstrained dlopen/dlsym:** Consider providing a standard library module that exposes raw dlopen and dlsym directly to SA bytecode, removing the current hardcoded sap.json dependency whitelist. This will allow the interpreter to act like Python's ctypes, calling arbitrary system libraries natively.
+- [ ] **Formalize memory layout mapping:** Document and implement guarantees that SA alloc produces contiguous memory blocks compatible with C-ABI structural alignment, enabling direct, zero-copy pointer passing to external system libraries.
+- [ ] **Implement Capability-based Security Model:** FFI penetration must be disabled by default. Follow SA plugin capability standards (`sap.json`) or require explicit config files/runtime flags (e.g., `--allow-ffi`, similar to `--allow-env` or `--allow-write`) to opt-in. This preserves the VM's safe sandbox by default while allowing unconstrained native access only when explicitly authorized.

@@ -94,6 +94,10 @@ pub const OpCode = enum {
     consume,
     assign,
     raw_cast,
+    bitcast,
+    sext,
+    zext,
+    trunc,
     panic,
     panic_msg,
     return_,
@@ -122,9 +126,21 @@ pub const Function = struct {
     returns_result: bool = false,
 };
 
+pub const ExternSignature = struct {
+    arg_types: []const PrimType,
+    return_type: PrimType,
+    returns_result: bool = false,
+};
+
+const ExternDecl = struct {
+    name: []const u8,
+    signature: ExternSignature,
+};
+
 pub const Program = struct {
     constants: std.StringHashMap([]const u8),
     functions: std.StringHashMap(Function),
+    externs: std.StringHashMap(ExternSignature),
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *Program) void {
@@ -155,6 +171,13 @@ pub const Program = struct {
             self.allocator.free(func.blocks);
         }
         self.functions.deinit();
+
+        var extern_it = self.externs.iterator();
+        while (extern_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.arg_types);
+        }
+        self.externs.deinit();
         self.allocator.destroy(self);
     }
 };
@@ -728,6 +751,7 @@ pub const Parser = struct {
                         'n' => { try result.append('\n'); i += 2; },
                         't' => { try result.append('\t'); i += 2; },
                         'r' => { try result.append('\r'); i += 2; },
+                        '0' => { try result.append(0); i += 2; },
                         '\\' => { try result.append('\\'); i += 2; },
                         '"' => { try result.append('"'); i += 2; },
                         'x' => {
@@ -806,6 +830,57 @@ pub const Parser = struct {
         return try self.allocator.dupe(u8, raw);
     }
 
+    fn parseSignatureType(raw: []const u8) PrimType {
+        var ty = std.mem.trim(u8, raw, " \t\r\n");
+        if (std.mem.endsWith(u8, ty, "!")) ty = std.mem.trim(u8, ty[0 .. ty.len - 1], " \t");
+        while (ty.len > 0 and (ty[0] == '&' or ty[0] == '^' or ty[0] == '*')) {
+            ty = std.mem.trim(u8, ty[1..], " \t");
+        }
+        return parseType(ty);
+    }
+
+    fn parseExternDecl(self: *Parser, line: []const u8) !ExternDecl {
+        const body = std.mem.trim(u8, line["@extern".len..], " \t");
+        const paren_start = std.mem.indexOf(u8, body, "(") orelse return error.InvalidExternSignature;
+        const paren_end = std.mem.lastIndexOf(u8, body, ")") orelse return error.InvalidExternSignature;
+        if (paren_end < paren_start) return error.InvalidExternSignature;
+
+        const name_raw = std.mem.trim(u8, body[0..paren_start], " \t");
+        if (name_raw.len == 0) return error.InvalidExternSignature;
+
+        var arg_types = std.ArrayList(PrimType).init(self.allocator);
+        errdefer arg_types.deinit();
+
+        const params_str = body[paren_start + 1 .. paren_end];
+        var param_it = std.mem.tokenizeAny(u8, params_str, ",");
+        while (param_it.next()) |param| {
+            const cleaned_param = std.mem.trim(u8, param, " \t");
+            if (cleaned_param.len == 0) continue;
+            const type_raw = if (std.mem.indexOf(u8, cleaned_param, ":")) |colon_idx|
+                cleaned_param[colon_idx + 1 ..]
+            else
+                cleaned_param;
+            try arg_types.append(parseSignatureType(type_raw));
+        }
+
+        var return_type = PrimType.void;
+        var returns_result = false;
+        if (std.mem.indexOf(u8, body[paren_end + 1 ..], "->")) |arrow_rel| {
+            const return_raw = std.mem.trim(u8, body[paren_end + 1 + arrow_rel + "->".len ..], " \t");
+            returns_result = std.mem.endsWith(u8, return_raw, "!");
+            return_type = parseSignatureType(return_raw);
+        }
+
+        return .{
+            .name = try self.allocator.dupe(u8, name_raw),
+            .signature = .{
+                .arg_types = try arg_types.toOwnedSlice(),
+                .return_type = return_type,
+                .returns_result = returns_result,
+            },
+        };
+    }
+
     pub fn parse(self: *Parser, preprocessed: [][]const u8) !*Program {
         const prog = try self.allocator.create(Program);
         errdefer self.allocator.destroy(prog);
@@ -813,6 +888,7 @@ pub const Parser = struct {
         prog.* = .{
             .constants = std.StringHashMap([]const u8).init(self.allocator),
             .functions = std.StringHashMap(Function).init(self.allocator),
+            .externs = std.StringHashMap(ExternSignature).init(self.allocator),
             .allocator = self.allocator,
         };
 
@@ -837,7 +913,17 @@ pub const Parser = struct {
             }
             // std.debug.print("Parsing line {d}: '{s}'\n", .{idx, line});
 
-            if (std.mem.startsWith(u8, line, "@") and std.mem.indexOf(u8, line, "(") != null and std.mem.indexOf(u8, line, ")") != null and std.mem.endsWith(u8, line, ":")) {
+            if (std.mem.startsWith(u8, line, "@extern")) {
+                const decl = try self.parseExternDecl(line);
+                if (prog.externs.getPtr(decl.name)) |existing| {
+                    self.allocator.free(existing.arg_types);
+                    existing.* = decl.signature;
+                    self.allocator.free(decl.name);
+                } else {
+                    try prog.externs.put(decl.name, decl.signature);
+                }
+                idx += 1;
+            } else if (std.mem.startsWith(u8, line, "@") and std.mem.indexOf(u8, line, "(") != null and std.mem.indexOf(u8, line, ")") != null and std.mem.endsWith(u8, line, ":")) {
                 if (current_func_name) |func_name| {
                     const func = Function{
                         .name = func_name,
@@ -1290,12 +1376,22 @@ pub const Parser = struct {
             dest_type = parseType(type_str);
             try args_list.append(try self.parseOperand(addr_str));
             try args_list.append(try self.parseOperand(val_str));
-        } else if (std.mem.eql(u8, first_token, "raw_cast")) {
-            op = .raw_cast;
-            const arg = token_it.next() orelse return error.MissingRawCastArg;
-            const as_token = token_it.next() orelse return error.MissingRawCastAs;
+        } else if (std.mem.eql(u8, first_token, "raw_cast") or std.mem.eql(u8, first_token, "bitcast") or std.mem.eql(u8, first_token, "sext") or std.mem.eql(u8, first_token, "zext") or std.mem.eql(u8, first_token, "trunc")) {
+            if (std.mem.eql(u8, first_token, "bitcast")) {
+                op = .bitcast;
+            } else if (std.mem.eql(u8, first_token, "sext")) {
+                op = .sext;
+            } else if (std.mem.eql(u8, first_token, "zext")) {
+                op = .zext;
+            } else if (std.mem.eql(u8, first_token, "trunc")) {
+                op = .trunc;
+            } else {
+                op = .raw_cast;
+            }
+            const arg = token_it.next() orelse return error.MissingCastArg;
+            const as_token = token_it.next() orelse return error.MissingCastAs;
             _ = as_token;
-            const type_str = token_it.next() orelse return error.MissingRawCastType;
+            const type_str = token_it.next() orelse return error.MissingCastType;
             dest_type = parseType(type_str);
             try args_list.append(try self.parseOperand(arg));
         } else if (std.mem.eql(u8, first_token, "take")) {
@@ -1390,6 +1486,9 @@ pub const Parser = struct {
         }
         if (std.mem.startsWith(u8, raw, "*")) {
             const inner = raw[1..];
+            if (self.constants.contains(inner) or std.mem.startsWith(u8, inner, "STR_") or std.mem.startsWith(u8, inner, "KEY_") or std.mem.startsWith(u8, inner, "VAL_") or std.mem.startsWith(u8, inner, "FS_") or std.mem.startsWith(u8, inner, "LIB_") or std.mem.startsWith(u8, inner, "DEMO_")) {
+                return Operand{ .kind = .constant_addr, .name = try self.allocator.dupe(u8, inner) };
+            }
             return self.parseOperand(inner);
         }
 

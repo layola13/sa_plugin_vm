@@ -9,6 +9,8 @@ pub const VM = struct {
     function_addresses: std.AutoHashMap(usize, []const u8),
     function_names: std.StringHashMap(usize),
     dummy_buffers: std.ArrayList(*u8),
+    thread_results: std.AutoHashMap(i32, usize),
+    next_thread_handle: i32,
 
     pub fn init(allocator: std.mem.Allocator, program: *parser.Program, ffi_mgr: *ffi.FfiManager) VM {
         return .{
@@ -18,12 +20,15 @@ pub const VM = struct {
             .function_addresses = std.AutoHashMap(usize, []const u8).init(allocator),
             .function_names = std.StringHashMap(usize).init(allocator),
             .dummy_buffers = std.ArrayList(*u8).init(allocator),
+            .thread_results = std.AutoHashMap(i32, usize).init(allocator),
+            .next_thread_handle = 1,
         };
     }
 
     pub fn deinit(self: *VM) void {
         self.function_addresses.deinit();
         self.function_names.deinit();
+        self.thread_results.deinit();
         for (self.dummy_buffers.items) |buf| {
             self.allocator.destroy(buf);
         }
@@ -106,11 +111,22 @@ pub const VM = struct {
             self.allocator.free(self.data);
         }
 
+        fn ensureCapacity(self: *Frame, required_len: usize) !void {
+            if (required_len <= self.data.len) return;
+            const old_len = self.data.len;
+            var new_len = if (old_len == 0) 8 else old_len;
+            while (new_len < required_len) {
+                new_len *= 2;
+            }
+            self.data = try self.allocator.realloc(self.data, new_len);
+            @memset(self.data[old_len..new_len], 0);
+        }
+
         fn getRegPtr(self: *Frame, name: []const u8) !*u64 {
             if (self.map.get(name)) |idx| return &self.data[idx];
             const idx = self.next_idx;
             self.next_idx += 8; // 64 bytes per register to allow struct overlays
-            if (self.next_idx > self.data.len) return error.StackOverflow;
+            try self.ensureCapacity(self.next_idx);
             try self.map.put(try self.allocator.dupe(u8, name), idx);
             return &self.data[idx];
         }
@@ -136,6 +152,68 @@ pub const VM = struct {
             },
             .label => return error.LabelAsValueUnsupported,
         }
+    }
+
+    fn executeThreadEntry(self: *VM, entry_ptr: usize, arg_ptr: usize) !usize {
+        if (self.function_addresses.get(entry_ptr)) |name| {
+            const target_func = self.program.functions.get(name) orelse return error.SymbolNotFound;
+            return try self.executeFunction(&target_func, &.{arg_ptr});
+        }
+        return self.ffi.callPointerLegacy(entry_ptr, &.{arg_ptr});
+    }
+
+    fn executePthreadCall(self: *VM, func_name: []const u8, args: []const usize) !usize {
+        if (std.mem.eql(u8, func_name, "pthread_spawn")) {
+            if (args.len < 2) return error.FfiArityMismatch;
+            const ret = try self.executeThreadEntry(args[0], args[1]);
+            const handle = self.next_thread_handle;
+            self.next_thread_handle += 1;
+            try self.thread_results.put(handle, ret);
+            return @as(usize, @intCast(handle));
+        }
+        if (std.mem.eql(u8, func_name, "pthread_spawn_detached")) {
+            if (args.len < 2) return error.FfiArityMismatch;
+            _ = try self.executeThreadEntry(args[0], args[1]);
+            return 0;
+        }
+        if (std.mem.eql(u8, func_name, "pthread_join")) {
+            if (args.len < 1) return error.FfiArityMismatch;
+            const handle = @as(i32, @bitCast(@as(u32, @intCast(args[0] & 0xffffffff))));
+            const ret = self.thread_results.get(handle) orelse return 1;
+            if (args.len >= 2 and args[1] != 0) {
+                @as(*align(1) u32, @ptrFromInt(args[1])).* = @as(u32, @intCast(ret & 0xffffffff));
+            }
+            return 0;
+        }
+        if (std.mem.eql(u8, func_name, "pthread_drop")) {
+            if (args.len < 1) return error.FfiArityMismatch;
+            const handle = @as(i32, @bitCast(@as(u32, @intCast(args[0] & 0xffffffff))));
+            _ = self.thread_results.remove(handle);
+            return 0;
+        }
+        return error.SymbolNotFound;
+    }
+
+    fn signExtend(value: usize, from_bits: u8) u64 {
+        const raw = @as(u64, @intCast(value));
+        if (from_bits >= 64) return raw;
+        const width = @as(u6, @intCast(from_bits));
+        const sign_width = @as(u6, @intCast(from_bits - 1));
+        const mask = (@as(u64, 1) << width) - 1;
+        const sign_bit = @as(u64, 1) << sign_width;
+        const narrowed = raw & mask;
+        return if ((narrowed & sign_bit) != 0) narrowed | ~mask else narrowed;
+    }
+
+    fn truncToType(value: usize, ty: parser.PrimType) u64 {
+        const raw = @as(u64, @intCast(value));
+        return switch (ty) {
+            .i1 => raw & 1,
+            .i8, .u8 => raw & 0xff,
+            .i16, .u16 => raw & 0xffff,
+            .i32, .u32, .f32 => raw & 0xffffffff,
+            else => raw,
+        };
     }
 
     fn executeFunction(self: *VM, func: *const parser.Function, call_args: []const usize) anyerror!usize {
@@ -228,11 +306,15 @@ pub const VM = struct {
                     } else if (self.program.functions.get(func_name)) |target_func| {
                         const ret = try self.executeFunction(&target_func, args.items);
                         if (inst.dest) |d| (try frame.getRegPtr(d)).* = ret;
+                    } else if (std.mem.eql(u8, func_name, "pthread_spawn") or std.mem.eql(u8, func_name, "pthread_spawn_detached") or std.mem.eql(u8, func_name, "pthread_join") or std.mem.eql(u8, func_name, "pthread_drop")) {
+                        const ret = try self.executePthreadCall(func_name, args.items);
+                        if (inst.dest) |d| (try frame.getRegPtr(d)).* = ret;
+                    } else if (self.program.externs.get(func_name)) |signature| {
+                        const ret = try self.ffi.callSymbol(func_name, signature, args.items);
+                        if (inst.dest) |d| (try frame.getRegPtr(d)).* = ret;
                     } else if (self.ffi.resolveSymbol(func_name)) |sym| {
-                        const f = @as(ffi.FfiFn, @ptrCast(sym));
-                        var pad = [_]usize{0} ** 9;
-                        for (args.items, 0..) |arg, i| if (i < 9) { pad[i] = arg; };
-                        const ret = f(pad[0], pad[1], pad[2], pad[3], pad[4], pad[5], pad[6], pad[7], pad[8]);
+                        _ = sym;
+                        const ret = try self.ffi.callSymbolLegacy(func_name, args.items);
                         if (inst.dest) |d| (try frame.getRegPtr(d)).* = ret;
                     } else {
                         std.debug.print("Symbol not found: {s}\n", .{func_name});
@@ -249,10 +331,7 @@ pub const VM = struct {
                         const ret = try self.executeFunction(&self.program.functions.get(name).?, args.items);
                         if (inst.dest) |d| (try frame.getRegPtr(d)).* = ret;
                     } else {
-                        const f = @as(ffi.FfiFn, @ptrFromInt(ptr));
-                        var pad = [_]usize{0} ** 9;
-                        for (args.items, 0..) |arg, i| if (i < 9) { pad[i] = arg; };
-                        const ret = f(pad[0], pad[1], pad[2], pad[3], pad[4], pad[5], pad[6], pad[7], pad[8]);
+                        const ret = self.ffi.callPointerLegacy(ptr, args.items);
                         if (inst.dest) |d| (try frame.getRegPtr(d)).* = ret;
                     }
                     pc += 1;
@@ -336,8 +415,24 @@ pub const VM = struct {
                 },
                 .br => pc = try self.findBlockInstructionIndex(func, if ((try self.resolveVal(&frame, inst.args[0])) != 0) inst.args[1].name else inst.args[2].name),
                 .jmp => pc = try self.findBlockInstructionIndex(func, inst.args[0].name),
-                .assign, .assume_safe, .assume_borrow, .raw_cast => {
+                .assign, .assume_safe, .assume_borrow, .raw_cast, .bitcast => {
                     (try frame.getRegPtr(inst.dest.?)).* = try self.resolveVal(&frame, inst.args[0]);
+                    pc += 1;
+                },
+                .sext => {
+                    const raw = try self.resolveVal(&frame, inst.args[0]);
+                    const from_bits: u8 = switch (inst.dest_type) {
+                        .i8, .u8 => 8,
+                        .i16, .u16 => 16,
+                        .i32, .u32 => 32,
+                        else => 64,
+                    };
+                    (try frame.getRegPtr(inst.dest.?)).* = signExtend(raw, from_bits);
+                    pc += 1;
+                },
+                .zext, .trunc => {
+                    const raw = try self.resolveVal(&frame, inst.args[0]);
+                    (try frame.getRegPtr(inst.dest.?)).* = truncToType(raw, inst.dest_type);
                     pc += 1;
                 },
                 .take => {

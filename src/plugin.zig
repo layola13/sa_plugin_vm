@@ -42,15 +42,32 @@ fn runVmCommand(allocator: std.mem.Allocator, ctx: *const plugin_api.Context, ar
     if (argv.len < 2) return null;
     if (!std.mem.eql(u8, argv[1], "vm")) return null;
     if (argv.len < 4 or !std.mem.eql(u8, argv[2], "run")) {
-        try stderr.print("Usage: sa vm run <file.sa>\n", .{});
+        try stderr.print("Usage: sa vm run [--allow-ffi] <file.sa>\n", .{});
         return 1;
     }
-    const file_path = argv[3];
+
+    var allow_ffi = false;
+    var file_path: ?[]const u8 = null;
+
+    var i: usize = 3;
+    while (i < argv.len) : (i += 1) {
+        if (std.mem.eql(u8, argv[i], "--allow-ffi")) {
+            allow_ffi = true;
+        } else {
+            file_path = argv[i];
+            break; // Stop parsing flags after the file path
+        }
+    }
+
+    if (file_path == null) {
+        try stderr.print("Usage: sa vm run [--allow-ffi] <file.sa>\n", .{});
+        return 1;
+    }
 
     var parser_inst = parser.Parser.init(allocator);
     defer parser_inst.deinit();
 
-    const preprocessed = parser_inst.preprocess(file_path) catch |err| {
+    const preprocessed = parser_inst.preprocess(file_path.?) catch |err| {
         try stderr.print("Preprocessing failed: {}\n", .{err});
         return 1;
     };
@@ -68,6 +85,7 @@ fn runVmCommand(allocator: std.mem.Allocator, ctx: *const plugin_api.Context, ar
     }
 
     var ffi_mgr = ffi.FfiManager.init(allocator);
+    ffi_mgr.allow_ffi = allow_ffi;
     defer ffi_mgr.deinit();
 
     ffi_mgr.loadDeclaredDependencies() catch |err| {

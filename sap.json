@@ -56,7 +56,47 @@
       "version": ">=0.1.0",
       "abi": 1,
       "optional": true,
-      "symbols": ["sa_http_client_new", "sa_http_client_free"]
+      "symbols": [
+        "sa_http_client_new",
+        "sa_http_client_req_new",
+        "sa_http_client_req_add_header",
+        "sa_http_client_req_set_body",
+        "sa_http_client_req_send",
+        "sa_http_client_resp_status",
+        "sa_http_client_resp_get_header",
+        "sa_http_client_resp_body_slice",
+        "sa_http_client_resp_body_reader",
+        "sa_http_client_resp_read_chunk",
+        "sa_http_client_resp_free",
+        "sa_http_client_body_reader_free",
+        "sa_http_client_req_free",
+        "sa_http_client_free"
+      ]
+    },
+    "http-server": {
+      "version": ">=0.1.0",
+      "abi": 1,
+      "optional": true,
+      "symbols": [
+        "sa_http_server_new",
+        "sa_http_server_start",
+        "sa_http_server_accept",
+        "sa_http_server_req_get_method",
+        "sa_http_server_req_get_path",
+        "sa_http_server_req_get_header",
+        "sa_http_server_req_get_body",
+        "sa_http_server_req_free",
+        "sa_http_server_resp_new",
+        "sa_http_server_resp_send",
+        "sa_http_server_resp_set_content_type",
+        "sa_http_server_resp_free",
+        "sa_http_server_resp_stream_new",
+        "sa_http_server_resp_stream_write",
+        "sa_http_server_resp_stream_flush",
+        "sa_http_server_resp_stream_end",
+        "sa_http_server_resp_stream_free",
+        "sa_http_server_free"
+      ]
     },
     "deno": {
       "version": ">=0.1.0",
@@ -68,7 +108,15 @@
       "version": ">=0.1.0",
       "abi": 1,
       "optional": true,
-      "symbols": ["sa_node_plugin_os_cpus", "sa_node_plugin_timers_sleep"]
+      "symbols": [
+        "sa_node_plugin_os_cpus",
+        "sa_node_plugin_timers_sleep",
+        "sa_node_plugin_dgram_create",
+        "sa_node_plugin_dgram_bind",
+        "sa_node_plugin_dgram_send",
+        "sa_node_plugin_dgram_recv",
+        "sa_node_plugin_dgram_close"
+      ]
     }
   }
 }

@@ -1,4 +1,8 @@
 const std = @import("std");
+const parser = @import("parser.zig");
+const c = @cImport({
+    @cInclude("ffi.h");
+});
 
 extern fn dlopen(filename: ?[*:0]const u8, flags: c_int) ?*anyopaque;
 extern fn dlsym(handle: ?*anyopaque, symbol: ?[*:0]const u8) ?*anyopaque;
@@ -16,6 +20,21 @@ pub const FfiFn = *const fn (
     arg7: usize,
     arg8: usize,
 ) callconv(.c) usize;
+
+const FfiValue = extern union {
+    u8_value: u8,
+    i8_value: i8,
+    u16_value: u16,
+    i16_value: i16,
+    u32_value: u32,
+    i32_value: i32,
+    u64_value: u64,
+    i64_value: i64,
+    f32_value: f32,
+    f64_value: f64,
+    ptr_value: ?*anyopaque,
+    usize_value: usize,
+};
 
 pub export fn fd_open(path: ?[*]const u8) callconv(.c) i32 {
     _ = path;
@@ -50,9 +69,18 @@ pub export fn pthread_spawn(func: ?*anyopaque, arg: ?*anyopaque) callconv(.c) i3
     _ = arg;
     return 0;
 }
-pub export fn pthread_join(id: i32) callconv(.c) i32 {
-    _ = id;
+pub export fn pthread_spawn_detached(func: ?*anyopaque, arg: ?*anyopaque) callconv(.c) i32 {
+    _ = func;
+    _ = arg;
     return 0;
+}
+pub export fn pthread_join(id: i32, out: ?*anyopaque) callconv(.c) i32 {
+    _ = id;
+    _ = out;
+    return 0;
+}
+pub export fn pthread_drop(id: i32) callconv(.c) void {
+    _ = id;
 }
 pub export fn sqlite3_prepare(db: ?*anyopaque, sql: ?[*]const u8, sql_len: i32, stmt_out: ?*anyopaque) callconv(.c) i32 {
     _ = db; _ = sql; _ = sql_len; _ = stmt_out;
@@ -67,11 +95,22 @@ pub export fn sqlite3_finalize(stmt: ?*anyopaque) callconv(.c) i32 {
     return 0;
 }
 
+pub export fn sa_time_sleep_ms(ms: u64) callconv(.c) i32 {
+    std.time.sleep(ms * std.time.ns_per_ms);
+    return 0;
+}
+
+pub export fn sa_time_sleep_ns(ns: u64) callconv(.c) i32 {
+    std.time.sleep(ns);
+    return 0;
+}
+
 pub const FfiManager = struct {
     allocator: std.mem.Allocator,
     handles: std.ArrayList(*anyopaque),
     dependencies: [][]u8,
     loaded_dependency_count: usize,
+    allow_ffi: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) FfiManager {
         var handles = std.ArrayList(*anyopaque).init(allocator);
@@ -85,6 +124,7 @@ pub const FfiManager = struct {
             .handles = handles,
             .dependencies = &.{},
             .loaded_dependency_count = 0,
+            .allow_ffi = false,
         };
     }
 
@@ -216,6 +256,108 @@ pub const FfiManager = struct {
         }
     }
 
+    fn ffiTypeFor(ty: parser.PrimType) [*c]c.ffi_type {
+        return switch (ty) {
+            .void => &c.ffi_type_void,
+            .i1, .u8 => &c.ffi_type_uint8,
+            .i8 => &c.ffi_type_sint8,
+            .u16 => &c.ffi_type_uint16,
+            .i16 => &c.ffi_type_sint16,
+            .u32 => &c.ffi_type_uint32,
+            .i32 => &c.ffi_type_sint32,
+            .u64 => &c.ffi_type_uint64,
+            .i64 => &c.ffi_type_sint64,
+            .f32 => &c.ffi_type_float,
+            .f64 => &c.ffi_type_double,
+            .ptr => &c.ffi_type_pointer,
+        };
+    }
+
+    fn writeArgValue(value: *FfiValue, ty: parser.PrimType, raw: usize) void {
+        switch (ty) {
+            .void => value.* = .{ .u64_value = 0 },
+            .i1, .u8 => value.* = .{ .u8_value = @as(u8, @intCast(raw & 0xff)) },
+            .i8 => value.* = .{ .i8_value = @as(i8, @bitCast(@as(u8, @intCast(raw & 0xff)))) },
+            .u16 => value.* = .{ .u16_value = @as(u16, @intCast(raw & 0xffff)) },
+            .i16 => value.* = .{ .i16_value = @as(i16, @bitCast(@as(u16, @intCast(raw & 0xffff)))) },
+            .u32 => value.* = .{ .u32_value = @as(u32, @intCast(raw & 0xffffffff)) },
+            .i32 => value.* = .{ .i32_value = @as(i32, @bitCast(@as(u32, @intCast(raw & 0xffffffff)))) },
+            .u64 => value.* = .{ .u64_value = @as(u64, @intCast(raw)) },
+            .i64 => value.* = .{ .i64_value = @as(i64, @bitCast(@as(u64, @intCast(raw)))) },
+            .f32 => value.* = .{ .f32_value = @as(f32, @bitCast(@as(u32, @intCast(raw & 0xffffffff)))) },
+            .f64 => value.* = .{ .f64_value = @as(f64, @bitCast(@as(u64, @intCast(raw)))) },
+            .ptr => value.* = .{ .ptr_value = if (raw == 0) null else @as(?*anyopaque, @ptrFromInt(raw)) },
+        }
+    }
+
+    fn readReturnValue(value: FfiValue, ty: parser.PrimType) usize {
+        return switch (ty) {
+            .void => 0,
+            .i1, .u8 => @as(usize, @intCast(value.u8_value)),
+            .i8 => @as(usize, @bitCast(@as(isize, @intCast(value.i8_value)))),
+            .u16 => @as(usize, @intCast(value.u16_value)),
+            .i16 => @as(usize, @bitCast(@as(isize, @intCast(value.i16_value)))),
+            .u32 => @as(usize, @intCast(value.u32_value)),
+            .i32 => @as(usize, @bitCast(@as(isize, @intCast(value.i32_value)))),
+            .u64 => @as(usize, @intCast(value.u64_value)),
+            .i64 => @as(usize, @bitCast(@as(isize, @intCast(value.i64_value)))),
+            .f32 => @as(usize, @intCast(@as(u32, @bitCast(value.f32_value)))),
+            .f64 => @as(usize, @intCast(@as(u64, @bitCast(value.f64_value)))),
+            .ptr => if (value.ptr_value) |ptr| @intFromPtr(ptr) else 0,
+        };
+    }
+
+    pub fn callSymbol(self: *FfiManager, symbol_name: []const u8, signature: parser.ExternSignature, args: []const usize) !usize {
+        const sym = self.resolveSymbol(symbol_name) orelse return error.SymbolNotFound;
+        if (args.len != signature.arg_types.len) return error.FfiArityMismatch;
+
+        var ffi_arg_types = try self.allocator.alloc([*c]c.ffi_type, args.len);
+        defer self.allocator.free(ffi_arg_types);
+
+        var ffi_arg_values = try self.allocator.alloc(FfiValue, args.len);
+        defer self.allocator.free(ffi_arg_values);
+
+        var ffi_arg_ptrs = try self.allocator.alloc(?*anyopaque, args.len);
+        defer self.allocator.free(ffi_arg_ptrs);
+
+        for (args, 0..) |arg, i| {
+            ffi_arg_types[i] = ffiTypeFor(signature.arg_types[i]);
+            writeArgValue(&ffi_arg_values[i], signature.arg_types[i], arg);
+            ffi_arg_ptrs[i] = @ptrCast(&ffi_arg_values[i]);
+        }
+
+        var cif: c.ffi_cif = undefined;
+        const status = c.ffi_prep_cif(
+            &cif,
+            c.FFI_DEFAULT_ABI,
+            @as(c_uint, @intCast(args.len)),
+            ffiTypeFor(signature.return_type),
+            ffi_arg_types.ptr,
+        );
+        if (status != c.FFI_OK) return error.FfiPrepFailed;
+
+        var ret = FfiValue{ .u64_value = 0 };
+        const ret_ptr: ?*anyopaque = if (signature.return_type == .void) null else @ptrCast(&ret);
+        const fn_ptr: ?*const fn () callconv(.c) void = @ptrCast(sym);
+        c.ffi_call(&cif, fn_ptr, ret_ptr, ffi_arg_ptrs.ptr);
+        return readReturnValue(ret, signature.return_type);
+    }
+
+    pub fn callSymbolLegacy(self: *FfiManager, symbol_name: []const u8, args: []const usize) !usize {
+        const sym = self.resolveSymbol(symbol_name) orelse return error.SymbolNotFound;
+        const f = @as(FfiFn, @ptrCast(sym));
+        var pad = [_]usize{0} ** 9;
+        for (args, 0..) |arg, i| if (i < 9) { pad[i] = arg; };
+        return f(pad[0], pad[1], pad[2], pad[3], pad[4], pad[5], pad[6], pad[7], pad[8]);
+    }
+
+    pub fn callPointerLegacy(_: *FfiManager, ptr: usize, args: []const usize) usize {
+        const f = @as(FfiFn, @ptrFromInt(ptr));
+        var pad = [_]usize{0} ** 9;
+        for (args, 0..) |arg, i| if (i < 9) { pad[i] = arg; };
+        return f(pad[0], pad[1], pad[2], pad[3], pad[4], pad[5], pad[6], pad[7], pad[8]);
+    }
+
     pub fn resolveSymbol(self: *FfiManager, symbol_name: []const u8) ?*anyopaque {
         if (std.mem.eql(u8, symbol_name, "fd_open")) return @constCast(@ptrCast(&fd_open));
         if (std.mem.eql(u8, symbol_name, "fd_read")) return @constCast(@ptrCast(&fd_read));
@@ -224,10 +366,18 @@ pub const FfiManager = struct {
         if (std.mem.eql(u8, symbol_name, "munmap")) return @constCast(@ptrCast(&munmap));
         if (std.mem.eql(u8, symbol_name, "signal")) return @constCast(@ptrCast(&signal));
         if (std.mem.eql(u8, symbol_name, "pthread_spawn")) return @constCast(@ptrCast(&pthread_spawn));
+        if (std.mem.eql(u8, symbol_name, "pthread_spawn_detached")) return @constCast(@ptrCast(&pthread_spawn_detached));
         if (std.mem.eql(u8, symbol_name, "pthread_join")) return @constCast(@ptrCast(&pthread_join));
+        if (std.mem.eql(u8, symbol_name, "pthread_drop")) return @constCast(@ptrCast(&pthread_drop));
         if (std.mem.eql(u8, symbol_name, "sqlite3_prepare")) return @constCast(@ptrCast(&sqlite3_prepare));
         if (std.mem.eql(u8, symbol_name, "sqlite3_step")) return @constCast(@ptrCast(&sqlite3_step));
         if (std.mem.eql(u8, symbol_name, "sqlite3_finalize")) return @constCast(@ptrCast(&sqlite3_finalize));
+        if (std.mem.eql(u8, symbol_name, "sa_time_sleep_ms")) return @constCast(@ptrCast(&sa_time_sleep_ms));
+        if (std.mem.eql(u8, symbol_name, "sa_time_sleep_ns")) return @constCast(@ptrCast(&sa_time_sleep_ns));
+        if (std.mem.eql(u8, symbol_name, "dlopen")) return if (self.allow_ffi) @constCast(@ptrCast(&dlopen)) else null;
+        if (std.mem.eql(u8, symbol_name, "dlsym")) return if (self.allow_ffi) @constCast(@ptrCast(&dlsym)) else null;
+        if (std.mem.eql(u8, symbol_name, "dlclose")) return if (self.allow_ffi) @constCast(@ptrCast(&dlclose)) else null;
+        if (std.mem.eql(u8, symbol_name, "dlerror")) return if (self.allow_ffi) @constCast(@ptrCast(&dlerror)) else null;
 
         const symbol_name_z = self.allocator.dupeZ(u8, symbol_name) catch return null;
         defer self.allocator.free(symbol_name_z);

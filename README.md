@@ -47,11 +47,12 @@ SA assembly utilizes `.sal` macro facades (e.g. `EXPAND DENO_HOSTNAME`) and `@im
 - **Internal Subroutine Calls**: Internal user-defined subroutine calls are executed recursively by instantiating sub-frame registers and mapping parameters dynamically.
 - **Linear Stack Safety**: Heap segments allocated via `stack_alloc` or `alloc` are tracked in a frame allocation array and deallocated in a `defer` block when the interpreted function returns.
 
-### 3. Zero-dependency Generic x86_64 FFI Bridge (`src/ffi.zig`)
+### 3. Typed FFI Bridge & Plugin Loader (`src/ffi.zig`)
 
-1. **Dynamic Scanning & Loading**: Automatically loads all installed plugins' dynamic libraries (`lib<plugin_name>.so`) using POSIX `dlopen`.
-2. **Symbol Lookup**: External symbols are resolved dynamically across all loaded handles using `dlsym`.
-3. **Generic AMD64 Argument Marshalling**: System V ABI first-6-registers calling convention with 9-slot padding.
+1. **Declared plugin loading**: Reads `sap.json` dependency names from the installed `vm` manifest and lazily `dlopen`s matching `lib<plugin_name>.so` artifacts from the installed plugin cache.
+2. **Typed extern calls**: `@extern` declarations are parsed into signatures and dispatched through libffi with explicit primitive typing for `void`, integers, floats, and pointers.
+3. **Gated raw libc FFI**: `dlopen`, `dlsym`, `dlclose`, and `dlerror` are only exposed when `sa vm run --allow-ffi` is used.
+4. **Builtin shims**: `fd_*`, `mmap`, `signal`, `pthread_*`, `sqlite3_*`, and `sa_time_*` are provided as compatibility shims for the current demos and standard library surface.
 
 ---
 
@@ -94,20 +95,17 @@ SA assembly utilizes `.sal` macro facades (e.g. `EXPAND DENO_HOSTNAME`) and `@im
 | **Macro** | `[MACRO] NAME %p1, %p2 ... [END_MACRO]` | — | Macro definition (forward refs OK) |
 | **Repeat** | `[REP N] ... [END_REP]` | — | Loop unrolling |
 
-### ❌ Not Supported (Design Limitations)
+### Still Out of Scope
 
 The VM is a **pure SA bytecode interpreter** running in a sandboxed environment. The following features require **native compilation** and are intentionally outside scope:
 
 | Category | Examples | Reason |
 |---|---|---|
-| **External C/System FFI** | `ffi_link_system_libc`, `ffi_link_static_c_lib`, `ffi_link_dynamic_c_lib`, `ffi_pkg_config_integration`, `ffi_cxx_name_mangling`, `ffi_opaque_handle_passing`, `ffi_callback_thunk`, `ffi_rust_staticlib_integration`, `ffi_objective_c_framework` | VM sandbox cannot call arbitrary system C libraries or link to external `.a`/`.so` files. Native compilation required. |
-| **Special Ecosystem Targets** | `eco_wasm_host_imports`, `eco_wasm_memory_export`, `eco_embedded_no_os`, `eco_os_kernel_module`, `eco_bpf_ebpf_bytecode`, `eco_gpu_ptx_shader`, `eco_cryptography_simd`, `eco_language_server_protocol`, `eco_sa_lang_registry_publish` | These produce non-Linux-native targets (WASM, BPF, PTX, bare-metal) that the x86_64 VM cannot execute. |
-| **OS Syscalls** | `file_descriptor_raii`, `mmap_memory_mapping`, `signal_handling_setup`, `dynamic_lib_dlopen` | Direct POSIX syscalls (`open`, `mmap`, `sigaction`, `dlopen`) are not mapped through the VM's FFI bridge. |
 | **Inline Assembly** | `inline_assembly` | Platform-specific assembly (`asm volatile`) is not interpretable. |
 | **SIMD Intrinsics** | (architecture-specific) | CPU vector intrinsics require native code generation. |
 | **Multi-binary packages** | `pkg_bin_multiple` | Multiple entry point package builds require the full SA compiler toolchain. |
 
-> **Note**: The 8 tests explicitly excluded from the test harness (`205_pkg_cyclic_dependency_reject`, `207_pkg_multiple_versions_conflict`, `226_mod_cyclic_import_detect`, `227_mod_shadowing_prevention`, `243_contract_sig_mismatch_link`, `220_pkg_lib_dynamic`, `301_http_client_saasm`, `302_http_server_saasm`) are compile-time error/rejection tests that do not produce executable output by design.
+> **Note**: The exact skip list is maintained in `run_vm_tests.sh`. Runtime smoke tests for HTTP, `dlopen`, SQLite, `pthread`, and filesystem shims are now handled by the VM itself rather than the stale whitepaper assumptions.
 
 ---
 
@@ -160,6 +158,6 @@ sa vm run /path/to/demo/main.sa
 
 ## 5. Known Remaining Limitations
 
-- `store` with signed types stores the low bits correctly, but `eq` comparisons on stored negative i32 values may need explicit type context in some edge cases.
 - `panic` / `panic_msg` instructions terminate with `exit(1)` rather than printing a backtrace.
-- `f32`/`f64` floating-point arithmetic is stored as bitcast u64 internally; floating-point comparisons (`sgt` on floats) are not supported.
+- `f32`/`f64` floating-point arithmetic is still represented as raw bits internally; floating-point comparisons are not a supported execution path yet.
+- The thread model is synchronous inside the VM. It is sufficient for the current demos and benchmarks, but it is not a host-level pthread scheduler.
