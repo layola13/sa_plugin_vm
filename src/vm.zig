@@ -303,6 +303,13 @@ pub const VM = struct {
                         if (inst.dest) |d| (try frame.getRegPtr(d)).* = 0;
                     } else if (std.mem.eql(u8, func_name, "sa_time_unix_ms")) {
                         if (inst.dest) |d| (try frame.getRegPtr(d)).* = @as(u64, @bitCast(std.time.milliTimestamp()));
+                    } else if (std.mem.eql(u8, func_name, "sa_time_unix_s")) {
+                        if (inst.dest) |d| (try frame.getRegPtr(d)).* = @as(u64, @bitCast(std.time.timestamp()));
+                    } else if (std.mem.eql(u8, func_name, "sa_time_unix_ns")) {
+                        const ns = @as(i64, @intCast(std.time.nanoTimestamp()));
+                        if (inst.dest) |d| (try frame.getRegPtr(d)).* = @as(u64, @bitCast(ns));
+                    } else if (std.mem.eql(u8, func_name, "sa_time_instant_ns")) {
+                        if (inst.dest) |d| (try frame.getRegPtr(d)).* = @as(u64, @intCast(std.time.nanoTimestamp()));
                     } else if (self.program.functions.get(func_name)) |target_func| {
                         const ret = try self.executeFunction(&target_func, args.items);
                         if (inst.dest) |d| (try frame.getRegPtr(d)).* = ret;

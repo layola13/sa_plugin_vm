@@ -301,6 +301,22 @@ pub const Parser = struct {
                 } else |_| {
                     self.allocator.free(root_path);
                 }
+                if (std.mem.startsWith(u8, import_val, "../")) {
+                    var trimmed = import_val;
+                    while (std.mem.startsWith(u8, trimmed, "../")) {
+                        trimmed = trimmed["../".len..];
+                    }
+                    if (trimmed.len > 0) {
+                        const root_trimmed = try std.fs.path.join(self.allocator, &.{ main_root, trimmed });
+                        const file_trimmed = std.fs.cwd().openFile(root_trimmed, .{});
+                        if (file_trimmed) |f| {
+                            f.close();
+                            return root_trimmed;
+                        } else |_| {
+                            self.allocator.free(root_trimmed);
+                        }
+                    }
+                }
             }
             return try std.fs.path.resolve(self.allocator, &.{ base_dir, import_val });
         }
