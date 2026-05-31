@@ -9,6 +9,7 @@ pub const VM = struct {
     function_addresses: std.AutoHashMap(usize, []const u8),
     function_names: std.StringHashMap(usize),
     dummy_buffers: std.ArrayList(*u8),
+    heap_allocs: std.ArrayList([]u64),
     thread_results: std.AutoHashMap(i32, usize),
     next_thread_handle: i32,
 
@@ -20,6 +21,7 @@ pub const VM = struct {
             .function_addresses = std.AutoHashMap(usize, []const u8).init(allocator),
             .function_names = std.StringHashMap(usize).init(allocator),
             .dummy_buffers = std.ArrayList(*u8).init(allocator),
+            .heap_allocs = std.ArrayList([]u64).init(allocator),
             .thread_results = std.AutoHashMap(i32, usize).init(allocator),
             .next_thread_handle = 1,
         };
@@ -33,6 +35,10 @@ pub const VM = struct {
             self.allocator.destroy(buf);
         }
         self.dummy_buffers.deinit();
+        for (self.heap_allocs.items) |buf| {
+            self.allocator.free(buf);
+        }
+        self.heap_allocs.deinit();
     }
 
     pub fn run(self: *VM) !i32 {
@@ -44,6 +50,30 @@ pub const VM = struct {
         };
         const main_code = try self.executeFunction(&main_func, &.{});
         return @as(i32, @bitCast(@as(u32, @intCast(main_code & 0xffffffff))));
+    }
+
+    fn findBlockForPc(self: *VM, func: *const parser.Function, pc: usize) ?parser.BasicBlock {
+        _ = self;
+        for (func.blocks) |block| {
+            if (pc >= block.start_inst and pc < block.end_inst) return block;
+        }
+        return null;
+    }
+
+    fn isTailSelfCall(self: *VM, func: *const parser.Function, pc: usize) bool {
+        const block = self.findBlockForPc(func, pc) orelse return false;
+        if (pc + 1 >= block.end_inst) return false;
+
+        var idx = pc + 1;
+        while (idx < block.end_inst) : (idx += 1) {
+            const next = func.instructions[idx];
+            if (next.op == .consume) continue;
+            if (next.op == .return_) {
+                return idx == block.end_inst - 1;
+            }
+            return false;
+        }
+        return false;
     }
 
     fn initFunctionsAndVtables(self: *VM) !void {
@@ -97,8 +127,10 @@ pub const VM = struct {
         allocator: std.mem.Allocator,
 
         fn init(allocator: std.mem.Allocator) !Frame {
+            const data = try allocator.alloc(u64, 1024);
+            @memset(data, 0);
             return .{
-                .data = try allocator.alloc(u64, 1024),
+                .data = data,
                 .map = std.StringHashMap(usize).init(allocator),
                 .allocator = allocator,
             };
@@ -109,6 +141,12 @@ pub const VM = struct {
             while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
             self.map.deinit();
             self.allocator.free(self.data);
+        }
+
+        fn reset(self: *Frame) void {
+            if (self.next_idx > 0) {
+                @memset(self.data[0..self.next_idx], 0);
+            }
         }
 
         fn ensureCapacity(self: *Frame, required_len: usize) !void {
@@ -147,8 +185,8 @@ pub const VM = struct {
             .offset_addr => {
                 const storage = try frame.getRegPtr(arg.name);
                 const base = @as(usize, @intCast(storage.*));
-                const offset_addr = @as(isize, @intCast(base)) + arg.offset;
-                return @as(usize, @bitCast(offset_addr));
+                const offset_bits: usize = @bitCast(@as(isize, arg.offset));
+                return base +% offset_bits;
             },
             .label => return error.LabelAsValueUnsupported,
         }
@@ -217,13 +255,11 @@ pub const VM = struct {
     }
 
     fn executeFunction(self: *VM, func: *const parser.Function, call_args: []const usize) anyerror!usize {
+        var current_args = try self.allocator.dupe(usize, call_args);
+        defer self.allocator.free(current_args);
+
         var frame = try Frame.init(self.allocator);
         defer frame.deinit();
-
-        for (func.params, call_args) |param_name, arg_val| {
-            const storage = try frame.getRegPtr(param_name);
-            storage.* = arg_val;
-        }
 
         var stack_allocs = std.ArrayList([]u64).init(self.allocator);
         defer {
@@ -231,16 +267,28 @@ pub const VM = struct {
             stack_allocs.deinit();
         }
 
-        var pc: usize = 0;
-        while (pc < func.instructions.len) {
-            const inst = func.instructions[pc];
-            switch (inst.op) {
+        while (true) {
+            for (func.params, current_args) |param_name, arg_val| {
+                const storage = try frame.getRegPtr(param_name);
+                storage.* = arg_val;
+            }
+
+            var pc: usize = 0;
+            var tail_restart = false;
+
+            instr_loop: while (pc < func.instructions.len) {
+                const inst = func.instructions[pc];
+                switch (inst.op) {
                 .stack_alloc, .alloc => {
                     const size = try self.resolveVal(&frame, inst.args[0]);
                     const word_count = (size + 7) / 8;
                     const buf = try self.allocator.alloc(u64, @max(1, word_count));
                     @memset(std.mem.sliceAsBytes(buf), 0);
-                    try stack_allocs.append(buf);
+                    if (inst.op == .stack_alloc) {
+                        try stack_allocs.append(buf);
+                    } else {
+                        try self.heap_allocs.append(buf);
+                    }
                     const storage = try frame.getRegPtr(inst.dest.?);
                     storage.* = @intFromPtr(buf.ptr);
                     pc += 1;
@@ -310,6 +358,13 @@ pub const VM = struct {
                         if (inst.dest) |d| (try frame.getRegPtr(d)).* = @as(u64, @bitCast(ns));
                     } else if (std.mem.eql(u8, func_name, "sa_time_instant_ns")) {
                         if (inst.dest) |d| (try frame.getRegPtr(d)).* = @as(u64, @intCast(std.time.nanoTimestamp()));
+                    } else if (std.mem.eql(u8, func_name, func.name) and self.isTailSelfCall(func, pc)) {
+                        if (inst.args.len - 1 != current_args.len) return error.FfiArityMismatch;
+                        for (inst.args[1..], 0..) |arg, arg_idx| {
+                            current_args[arg_idx] = try self.resolveVal(&frame, arg);
+                        }
+                        tail_restart = true;
+                        break :instr_loop;
                     } else if (self.program.functions.get(func_name)) |target_func| {
                         const ret = try self.executeFunction(&target_func, args.items);
                         if (inst.dest) |d| (try frame.getRegPtr(d)).* = ret;
@@ -324,8 +379,13 @@ pub const VM = struct {
                         const ret = try self.ffi.callSymbolLegacy(func_name, args.items);
                         if (inst.dest) |d| (try frame.getRegPtr(d)).* = ret;
                     } else {
-                        std.debug.print("Symbol not found: {s}\n", .{func_name});
-                        return error.SymbolNotFound;
+                        if (self.program.functions.get(func_name)) |target_func| {
+                            const ret = try self.executeFunction(&target_func, args.items);
+                            if (inst.dest) |d| (try frame.getRegPtr(d)).* = ret;
+                        } else {
+                            std.debug.print("Symbol not found: {s}\n", .{func_name});
+                            return error.SymbolNotFound;
+                        }
                     }
                     pc += 1;
                 },
@@ -466,9 +526,17 @@ pub const VM = struct {
                     }
                     return ret;
                 },
+                }
             }
+
+            if (tail_restart) {
+                frame.reset();
+                for (stack_allocs.items) |buf| self.allocator.free(buf);
+                stack_allocs.clearRetainingCapacity();
+                continue;
+            }
+            return 0;
         }
-        return 0;
     }
 
     fn findBlockInstructionIndex(self: *VM, func: *const parser.Function, label: []const u8) !usize {

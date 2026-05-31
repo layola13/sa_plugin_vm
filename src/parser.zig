@@ -188,6 +188,62 @@ const Macro = struct {
     body: [][]const u8,
 };
 
+const TokenCursor = struct {
+    tokens: []const []const u8,
+    index: usize = 0,
+
+    fn peek(self: *TokenCursor) ?[]const u8 {
+        if (self.index >= self.tokens.len) return null;
+        return self.tokens[self.index];
+    }
+
+    fn next(self: *TokenCursor) ?[]const u8 {
+        const tok = self.peek() orelse return null;
+        self.index += 1;
+        return tok;
+    }
+};
+
+fn isInlineExprOp(token: []const u8) bool {
+    return std.mem.eql(u8, token, "ptr_add") or
+        std.mem.eql(u8, token, "add") or
+        std.mem.eql(u8, token, "sub") or
+        std.mem.eql(u8, token, "mul") or
+        std.mem.eql(u8, token, "div") or
+        std.mem.eql(u8, token, "rem") or
+        std.mem.eql(u8, token, "and") or
+        std.mem.eql(u8, token, "or") or
+        std.mem.eql(u8, token, "xor") or
+        std.mem.eql(u8, token, "sdiv") or
+        std.mem.eql(u8, token, "udiv") or
+        std.mem.eql(u8, token, "srem") or
+        std.mem.eql(u8, token, "urem") or
+        std.mem.eql(u8, token, "shl") or
+        std.mem.eql(u8, token, "shr") or
+        std.mem.eql(u8, token, "gt") or
+        std.mem.eql(u8, token, "lt") or
+        std.mem.eql(u8, token, "eq") or
+        std.mem.eql(u8, token, "ne") or
+        std.mem.eql(u8, token, "sgt") or
+        std.mem.eql(u8, token, "slt") or
+        std.mem.eql(u8, token, "sge") or
+        std.mem.eql(u8, token, "sle") or
+        std.mem.eql(u8, token, "ugt") or
+        std.mem.eql(u8, token, "ult") or
+        std.mem.eql(u8, token, "uge") or
+        std.mem.eql(u8, token, "ule") or
+        std.mem.eql(u8, token, "load") or
+        std.mem.eql(u8, token, "atomic_load") or
+        std.mem.eql(u8, token, "raw_cast") or
+        std.mem.eql(u8, token, "bitcast") or
+        std.mem.eql(u8, token, "sext") or
+        std.mem.eql(u8, token, "zext") or
+        std.mem.eql(u8, token, "trunc") or
+        std.mem.eql(u8, token, "take") or
+        std.mem.eql(u8, token, "assume_safe") or
+        std.mem.eql(u8, token, "assume_borrow");
+}
+
 pub const Parser = struct {
     allocator: std.mem.Allocator,
     macros: std.StringHashMap(Macro),
@@ -195,6 +251,7 @@ pub const Parser = struct {
     def_macros: std.StringHashMap([]const u8),
     macro_counter: usize = 0,
     expansion_counter: u64 = 0,
+    expr_counter: u64 = 0,
     main_root_dir: ?[]const u8 = null,
 
     pub fn init(allocator: std.mem.Allocator) Parser {
@@ -205,6 +262,7 @@ pub const Parser = struct {
             .def_macros = std.StringHashMap([]const u8).init(allocator),
             .macro_counter = 0,
             .expansion_counter = 0,
+            .expr_counter = 0,
             .main_root_dir = null,
         };
     }
@@ -897,6 +955,93 @@ pub const Parser = struct {
         };
     }
 
+    fn tokenizeExprTokens(self: *Parser, raw: []const u8) ![][]const u8 {
+        var tokens = std.ArrayList([]const u8).init(self.allocator);
+        errdefer tokens.deinit();
+
+        var it = std.mem.tokenizeAny(u8, raw, " \t,");
+        while (it.next()) |tok| {
+            try tokens.append(tok);
+        }
+        return try tokens.toOwnedSlice();
+    }
+
+    fn makeTempName(self: *Parser) ![]const u8 {
+        const name = try std.fmt.allocPrint(self.allocator, "__sa_expr{d}", .{self.expr_counter});
+        self.expr_counter += 1;
+        return name;
+    }
+
+    fn appendInstruction(self: *Parser, out: *std.ArrayList(Instruction), op: OpCode, dest: ?[]const u8, args: []const Operand, dest_type: PrimType) !void {
+        const args_copy = try self.allocator.dupe(Operand, args);
+        errdefer self.allocator.free(args_copy);
+        try out.append(.{
+            .op = op,
+            .dest = dest,
+            .args = args_copy,
+            .dest_type = dest_type,
+        });
+    }
+
+    fn emitTempInstruction(self: *Parser, out: *std.ArrayList(Instruction), op: OpCode, args: []const Operand, dest_type: PrimType) !Operand {
+        const dest_name = try self.makeTempName();
+        errdefer self.allocator.free(dest_name);
+        try self.appendInstruction(out, op, dest_name, args, dest_type);
+        return Operand{ .kind = .register, .name = try self.allocator.dupe(u8, dest_name) };
+    }
+
+    fn parseExprOperand(self: *Parser, cursor: *TokenCursor, out: *std.ArrayList(Instruction)) !Operand {
+        const tok = cursor.next() orelse return error.EmptyOperand;
+
+        if (std.mem.eql(u8, tok, "load") or std.mem.eql(u8, tok, "atomic_load")) {
+            const addr = try self.parseExprOperand(cursor, out);
+            const as_tok = cursor.next() orelse return error.MissingLoadAs;
+            if (!std.mem.eql(u8, as_tok, "as")) return error.MissingLoadAs;
+            const type_str = cursor.next() orelse return error.MissingLoadType;
+            const op = if (std.mem.eql(u8, tok, "atomic_load")) OpCode.atomic_load else OpCode.load;
+            return try self.emitTempInstruction(out, op, &.{ addr }, parseType(type_str));
+        }
+
+        if (std.mem.eql(u8, tok, "raw_cast") or std.mem.eql(u8, tok, "bitcast") or std.mem.eql(u8, tok, "sext") or std.mem.eql(u8, tok, "zext") or std.mem.eql(u8, tok, "trunc")) {
+            const arg = try self.parseExprOperand(cursor, out);
+            const as_tok = cursor.next() orelse return error.MissingCastAs;
+            if (!std.mem.eql(u8, as_tok, "as")) return error.MissingCastAs;
+            const type_str = cursor.next() orelse return error.MissingCastType;
+            const op = if (std.mem.eql(u8, tok, "bitcast")) OpCode.bitcast else if (std.mem.eql(u8, tok, "sext")) OpCode.sext else if (std.mem.eql(u8, tok, "zext")) OpCode.zext else if (std.mem.eql(u8, tok, "trunc")) OpCode.trunc else OpCode.raw_cast;
+            return try self.emitTempInstruction(out, op, &.{ arg }, parseType(type_str));
+        }
+
+        if (std.mem.eql(u8, tok, "take")) {
+            const arg = try self.parseExprOperand(cursor, out);
+            return try self.emitTempInstruction(out, .take, &.{ arg }, .void);
+        }
+
+        if (std.mem.eql(u8, tok, "assume_safe")) {
+            const arg = try self.parseExprOperand(cursor, out);
+            return try self.emitTempInstruction(out, .assume_safe, &.{ arg }, .void);
+        }
+
+        if (std.mem.eql(u8, tok, "assume_borrow")) {
+            const arg = try self.parseExprOperand(cursor, out);
+            return try self.emitTempInstruction(out, .assume_borrow, &.{ arg }, .void);
+        }
+
+        if (std.mem.eql(u8, tok, "stack_alloc") or std.mem.eql(u8, tok, "alloc")) {
+            const size = try self.parseExprOperand(cursor, out);
+            const op = if (std.mem.eql(u8, tok, "stack_alloc")) OpCode.stack_alloc else OpCode.alloc;
+            return try self.emitTempInstruction(out, op, &.{ size }, .void);
+        }
+
+        if (isInlineExprOp(tok)) {
+            const left = try self.parseExprOperand(cursor, out);
+            const right = try self.parseExprOperand(cursor, out);
+            const op = if (std.mem.eql(u8, tok, "ptr_add")) OpCode.ptr_add else if (std.mem.eql(u8, tok, "add")) OpCode.add else if (std.mem.eql(u8, tok, "sub")) OpCode.sub else if (std.mem.eql(u8, tok, "mul")) OpCode.mul else if (std.mem.eql(u8, tok, "div")) OpCode.div else if (std.mem.eql(u8, tok, "rem")) OpCode.rem else if (std.mem.eql(u8, tok, "and")) OpCode.and_ else if (std.mem.eql(u8, tok, "or")) OpCode.or_ else if (std.mem.eql(u8, tok, "xor")) OpCode.xor_ else if (std.mem.eql(u8, tok, "sdiv")) OpCode.sdiv else if (std.mem.eql(u8, tok, "udiv")) OpCode.udiv else if (std.mem.eql(u8, tok, "srem")) OpCode.srem else if (std.mem.eql(u8, tok, "urem")) OpCode.urem else if (std.mem.eql(u8, tok, "shl")) OpCode.shl else if (std.mem.eql(u8, tok, "shr")) OpCode.shr else if (std.mem.eql(u8, tok, "gt")) OpCode.gt else if (std.mem.eql(u8, tok, "lt")) OpCode.lt else if (std.mem.eql(u8, tok, "sgt")) OpCode.sgt else if (std.mem.eql(u8, tok, "slt")) OpCode.slt else if (std.mem.eql(u8, tok, "sge")) OpCode.sge else if (std.mem.eql(u8, tok, "sle")) OpCode.sle else if (std.mem.eql(u8, tok, "ugt")) OpCode.ugt else if (std.mem.eql(u8, tok, "ult")) OpCode.ult else if (std.mem.eql(u8, tok, "uge")) OpCode.uge else if (std.mem.eql(u8, tok, "ule")) OpCode.ule else if (std.mem.eql(u8, tok, "eq")) OpCode.eq else OpCode.ne;
+            return try self.emitTempInstruction(out, op, &.{ left, right }, .void);
+        }
+
+        return try self.parseOperand(tok);
+    }
+
     pub fn parse(self: *Parser, preprocessed: [][]const u8) !*Program {
         const prog = try self.allocator.create(Program);
         errdefer self.allocator.destroy(prog);
@@ -1013,11 +1158,10 @@ pub const Parser = struct {
                         idx += 1;
                         continue;
                     }
-                    const inst = self.parseInstruction(line) catch |err| {
+                    self.parseInstruction(line, &current_instructions) catch |err| {
                         std.debug.print("Failed to parse instruction at line {d}: '{s}', error: {}\n", .{ idx + 1, line, err });
                         return err;
                     };
-                    try current_instructions.append(inst);
                 }
                 idx += 1;
             }
@@ -1057,7 +1201,7 @@ pub const Parser = struct {
         return true;
     }
 
-    fn parseInstruction(self: *Parser, line: []const u8) !Instruction {
+    fn parseInstruction(self: *Parser, line: []const u8, out: *std.ArrayList(Instruction)) !void {
         var op = OpCode.consume;
         var dest: ?[]const u8 = null;
         var dest_type = PrimType.void;
@@ -1069,7 +1213,8 @@ pub const Parser = struct {
             if (reg.len == 0) return error.EmptyRegisterInConsume;
             var args = try self.allocator.alloc(Operand, 1);
             args[0] = Operand{ .kind = .register, .name = try self.allocator.dupe(u8, reg) };
-            return Instruction{ .op = op, .args = args };
+            try out.append(.{ .op = op, .args = args });
+            return;
         }
 
         // Check for assignment: reg = op args...
@@ -1086,6 +1231,104 @@ pub const Parser = struct {
         errdefer {
             for (args_list.items) |a| self.allocator.free(a.name);
             args_list.deinit();
+        }
+
+        if (isInlineExprOp(first_token) or std.mem.eql(u8, first_token, "stack_alloc") or std.mem.eql(u8, first_token, "alloc") or std.mem.eql(u8, first_token, "store") or std.mem.eql(u8, first_token, "atomic_store") or std.mem.eql(u8, first_token, "cmpxchg") or std.mem.eql(u8, first_token, "atomic_rmw_add") or std.mem.eql(u8, first_token, "raw_cast") or std.mem.eql(u8, first_token, "bitcast") or std.mem.eql(u8, first_token, "sext") or std.mem.eql(u8, first_token, "zext") or std.mem.eql(u8, first_token, "trunc") or std.mem.eql(u8, first_token, "take") or std.mem.eql(u8, first_token, "assume_safe") or std.mem.eql(u8, first_token, "assume_borrow")) {
+            const expr_tokens = try self.tokenizeExprTokens(args_raw);
+            defer self.allocator.free(expr_tokens);
+            var cursor = TokenCursor{ .tokens = expr_tokens };
+            _ = cursor.next() orelse return error.EmptyInstruction;
+
+            if (std.mem.eql(u8, first_token, "stack_alloc") or std.mem.eql(u8, first_token, "alloc")) {
+                op = if (std.mem.eql(u8, first_token, "stack_alloc")) .stack_alloc else .alloc;
+                try args_list.append(try self.parseExprOperand(&cursor, out));
+            } else if (std.mem.eql(u8, first_token, "load") or std.mem.eql(u8, first_token, "atomic_load")) {
+                op = if (std.mem.eql(u8, first_token, "atomic_load")) .atomic_load else .load;
+                try args_list.append(try self.parseExprOperand(&cursor, out));
+                const as_token = cursor.next() orelse return error.MissingLoadAs;
+                if (!std.mem.eql(u8, as_token, "as")) return error.MissingLoadAs;
+                const type_str = cursor.next() orelse return error.MissingLoadType;
+                dest_type = parseType(type_str);
+            } else if (std.mem.eql(u8, first_token, "store")) {
+                op = .store;
+                if (std.mem.indexOf(u8, args_raw, "into") != null) {
+                    try args_list.append(try self.parseExprOperand(&cursor, out));
+                    const into_token = cursor.next() orelse return error.MissingStoreInto;
+                    if (!std.mem.eql(u8, into_token, "into")) return error.MissingStoreInto;
+                    try args_list.append(try self.parseExprOperand(&cursor, out));
+                } else {
+                    const ptr = try self.parseExprOperand(&cursor, out);
+                    try args_list.append(try self.parseExprOperand(&cursor, out));
+                    const as_token = cursor.next() orelse return error.InvalidStoreSyntax;
+                    if (!std.mem.eql(u8, as_token, "as")) return error.InvalidStoreSyntax;
+                    const type_str = cursor.next() orelse return error.InvalidStoreSyntax;
+                    dest_type = parseType(type_str);
+                    try args_list.append(ptr);
+                }
+            } else if (std.mem.eql(u8, first_token, "atomic_store")) {
+                op = .atomic_store;
+                try args_list.append(try self.parseExprOperand(&cursor, out));
+                try args_list.append(try self.parseExprOperand(&cursor, out));
+                const as_token = cursor.next() orelse return error.InvalidStoreSyntax;
+                if (!std.mem.eql(u8, as_token, "as")) return error.InvalidStoreSyntax;
+                const type_str = cursor.next() orelse return error.InvalidStoreSyntax;
+                dest_type = parseType(type_str);
+            } else if (std.mem.eql(u8, first_token, "cmpxchg")) {
+                op = .cmpxchg;
+                try args_list.append(try self.parseExprOperand(&cursor, out));
+                try args_list.append(try self.parseExprOperand(&cursor, out));
+                try args_list.append(try self.parseExprOperand(&cursor, out));
+                const as_token = cursor.next() orelse return error.InvalidCmpxchgSyntax;
+                if (!std.mem.eql(u8, as_token, "as")) return error.InvalidCmpxchgSyntax;
+                const type_str = cursor.next() orelse return error.InvalidCmpxchgSyntax;
+                dest_type = parseType(type_str);
+            } else if (std.mem.eql(u8, first_token, "atomic_rmw_add")) {
+                op = .atomic_rmw_add;
+                try args_list.append(try self.parseExprOperand(&cursor, out));
+                try args_list.append(try self.parseExprOperand(&cursor, out));
+                const as_token = cursor.next() orelse return error.InvalidAtomicRmwSyntax;
+                if (!std.mem.eql(u8, as_token, "as")) return error.InvalidAtomicRmwSyntax;
+                const type_str = cursor.next() orelse return error.InvalidAtomicRmwSyntax;
+                dest_type = parseType(type_str);
+            } else if (std.mem.eql(u8, first_token, "raw_cast") or std.mem.eql(u8, first_token, "bitcast") or std.mem.eql(u8, first_token, "sext") or std.mem.eql(u8, first_token, "zext") or std.mem.eql(u8, first_token, "trunc")) {
+                if (std.mem.eql(u8, first_token, "bitcast")) {
+                    op = .bitcast;
+                } else if (std.mem.eql(u8, first_token, "sext")) {
+                    op = .sext;
+                } else if (std.mem.eql(u8, first_token, "zext")) {
+                    op = .zext;
+                } else if (std.mem.eql(u8, first_token, "trunc")) {
+                    op = .trunc;
+                } else {
+                    op = .raw_cast;
+                }
+                try args_list.append(try self.parseExprOperand(&cursor, out));
+                const as_token = cursor.next() orelse return error.MissingCastAs;
+                if (!std.mem.eql(u8, as_token, "as")) return error.MissingCastAs;
+                const type_str = cursor.next() orelse return error.MissingCastType;
+                dest_type = parseType(type_str);
+            } else if (std.mem.eql(u8, first_token, "take")) {
+                op = .take;
+                try args_list.append(try self.parseExprOperand(&cursor, out));
+            } else if (std.mem.eql(u8, first_token, "assume_safe")) {
+                op = .assume_safe;
+                try args_list.append(try self.parseExprOperand(&cursor, out));
+            } else if (std.mem.eql(u8, first_token, "assume_borrow")) {
+                op = .assume_borrow;
+                try args_list.append(try self.parseExprOperand(&cursor, out));
+            } else {
+                op = if (std.mem.eql(u8, first_token, "ptr_add")) .ptr_add else if (std.mem.eql(u8, first_token, "add")) .add else if (std.mem.eql(u8, first_token, "sub")) .sub else if (std.mem.eql(u8, first_token, "mul")) .mul else if (std.mem.eql(u8, first_token, "div")) .div else if (std.mem.eql(u8, first_token, "rem")) .rem else if (std.mem.eql(u8, first_token, "and")) .and_ else if (std.mem.eql(u8, first_token, "or")) .or_ else if (std.mem.eql(u8, first_token, "xor")) .xor_ else if (std.mem.eql(u8, first_token, "sgt")) .sgt else if (std.mem.eql(u8, first_token, "slt")) .slt else if (std.mem.eql(u8, first_token, "sge")) .sge else if (std.mem.eql(u8, first_token, "sle")) .sle else if (std.mem.eql(u8, first_token, "ugt")) .ugt else if (std.mem.eql(u8, first_token, "ult")) .ult else if (std.mem.eql(u8, first_token, "uge")) .uge else if (std.mem.eql(u8, first_token, "ule")) .ule else if (std.mem.eql(u8, first_token, "eq")) .eq else if (std.mem.eql(u8, first_token, "ne")) .ne else if (std.mem.eql(u8, first_token, "sdiv")) .sdiv else if (std.mem.eql(u8, first_token, "udiv")) .udiv else if (std.mem.eql(u8, first_token, "srem")) .srem else .urem;
+                try args_list.append(try self.parseExprOperand(&cursor, out));
+                try args_list.append(try self.parseExprOperand(&cursor, out));
+            }
+
+            try out.append(.{
+                .op = op,
+                .dest = dest,
+                .args = try args_list.toOwnedSlice(),
+                .dest_type = dest_type,
+            });
+            return;
         }
 
         if (std.mem.eql(u8, first_token, "stack_alloc")) {
@@ -1487,12 +1730,12 @@ pub const Parser = struct {
             }
         }
 
-        return Instruction{
+        try out.append(.{
             .op = op,
             .dest = dest,
             .args = try args_list.toOwnedSlice(),
             .dest_type = dest_type,
-        };
+        });
     }
 
     fn parseOperand(self: *Parser, raw_in: []const u8) !Operand {

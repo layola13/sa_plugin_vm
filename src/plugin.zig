@@ -64,17 +64,17 @@ fn runVmCommand(allocator: std.mem.Allocator, ctx: *const plugin_api.Context, ar
         return 1;
     }
 
-    var parser_inst = parser.Parser.init(allocator);
+    var parser_arena = std.heap.ArenaAllocator.init(allocator);
+    defer parser_arena.deinit();
+    const parse_allocator = parser_arena.allocator();
+
+    var parser_inst = parser.Parser.init(parse_allocator);
     defer parser_inst.deinit();
 
     const preprocessed = parser_inst.preprocess(file_path.?) catch |err| {
         try stderr.print("Preprocessing failed: {}\n", .{err});
         return 1;
     };
-    defer {
-        for (preprocessed) |l| allocator.free(l);
-        allocator.free(preprocessed);
-    }
 
     const prog = parser_inst.parse(preprocessed) catch |err| {
         try stderr.print("Parsing failed: {}\n", .{err});
@@ -84,7 +84,7 @@ fn runVmCommand(allocator: std.mem.Allocator, ctx: *const plugin_api.Context, ar
         prog.deinit();
     }
 
-    var ffi_mgr = ffi.FfiManager.init(allocator);
+    var ffi_mgr = ffi.FfiManager.init(parse_allocator);
     ffi_mgr.allow_ffi = allow_ffi;
     defer ffi_mgr.deinit();
 
@@ -93,14 +93,19 @@ fn runVmCommand(allocator: std.mem.Allocator, ctx: *const plugin_api.Context, ar
         return 1;
     };
 
-    var vm_inst = vm.VM.init(allocator, prog, &ffi_mgr);
+    var vm_gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = vm_gpa.deinit();
+    const vm_allocator = vm_gpa.allocator();
+
+    var vm_inst = vm.VM.init(vm_allocator, prog, &ffi_mgr);
     defer vm_inst.deinit();
     const code = vm_inst.run() catch |err| {
         try stderr.print("VM Execution failed: {}\n", .{err});
         return 1;
     };
 
-    return @as(u8, @intCast(code));
+    const code_u32: u32 = @bitCast(code);
+    return @truncate(code_u32);
 }
 
 fn runVmCommandAbi(ctx: *const plugin_api.Context, argv: [*]const [*:0]const u8, argv_len: usize, stdout: plugin_api.HostStream, stderr: plugin_api.HostStream, out_code: *u8) callconv(.c) u32 {
