@@ -49,6 +49,7 @@ pub const VM = struct {
     function_call_targets: std.StringHashMap([]ResolvedCall),
     call_cache: std.AutoHashMap(CallCacheKey, usize),
     memory_epoch: u64,
+    frame_pool: std.ArrayList([]u64),
     dummy_buffers: std.ArrayList(*u8),
     heap_allocs: std.ArrayList([]u64),
     result_allocs: std.ArrayList([]u64),
@@ -75,6 +76,7 @@ pub const VM = struct {
             .function_call_targets = std.StringHashMap([]ResolvedCall).init(allocator),
             .call_cache = std.AutoHashMap(CallCacheKey, usize).init(allocator),
             .memory_epoch = 1,
+            .frame_pool = std.ArrayList([]u64).init(allocator),
             .dummy_buffers = std.ArrayList(*u8).init(allocator),
             .heap_allocs = std.ArrayList([]u64).init(allocator),
             .result_allocs = std.ArrayList([]u64).init(allocator),
@@ -110,6 +112,10 @@ pub const VM = struct {
         }
         self.function_call_targets.deinit();
         self.call_cache.deinit();
+        for (self.frame_pool.items) |buf| {
+            self.allocator.free(buf);
+        }
+        self.frame_pool.deinit();
         self.thread_results.deinit();
         for (self.dummy_buffers.items) |buf| {
             self.allocator.destroy(buf);
@@ -478,6 +484,36 @@ pub const VM = struct {
         }
     };
 
+    fn acquireFrame(self: *VM, allocator: std.mem.Allocator, slot_count: usize, pooled: bool) !Frame {
+        const needed = @max(slot_count, 1);
+        if (pooled) {
+            var idx = self.frame_pool.items.len;
+            while (idx > 0) {
+                idx -= 1;
+                const buf = self.frame_pool.items[idx];
+                if (buf.len >= needed) {
+                    _ = self.frame_pool.swapRemove(idx);
+                    @memset(buf, 0);
+                    return Frame{ .data = buf, .allocator = allocator };
+                }
+            }
+        }
+        return Frame.init(allocator, needed);
+    }
+
+    fn releaseFrame(self: *VM, frame: *Frame, pooled: bool) void {
+        if (pooled) {
+            self.frame_pool.append(frame.data) catch {
+                frame.deinit();
+                frame.data = &.{};
+                return;
+            };
+            frame.data = &.{};
+            return;
+        }
+        frame.deinit();
+    }
+
     inline fn resolveVal(self: *VM, frame: *Frame, arg: parser.Operand) usize {
         _ = self;
         switch (arg.kind) {
@@ -641,8 +677,8 @@ pub const VM = struct {
         defer if (current_args_owned and !needs_arena) self.allocator.free(current_args);
 
         const slot_count = self.function_slot_counts.get(func.name) orelse (func.params.len + 64);
-        var frame = try Frame.init(local_alloc, slot_count);
-        defer frame.deinit();
+        var frame = try self.acquireFrame(local_alloc, slot_count, !needs_arena);
+        defer self.releaseFrame(&frame, !needs_arena);
         const call_targets = self.function_call_targets.get(func.name) orelse return error.SymbolNotFound;
 
         while (true) {
@@ -722,7 +758,7 @@ pub const VM = struct {
                         if (inst.is_tail_call) {
                             if (inst.args.len - 1 != current_args.len) return error.FfiArityMismatch;
                             for (inst.args[1..], 0..) |arg, ai| {
-                                current_args[ai] = self.resolveVal(&frame, arg);
+                                current_args[ai] = self.resolveScalarVal(&frame, arg);
                             }
                             tail_restart = true;
                             break :instr_loop;
@@ -971,7 +1007,7 @@ pub const VM = struct {
             }
 
             if (tail_restart) {
-                frame.reset();
+                if (needs_arena) frame.reset();
                 continue;
             }
             return 0;
