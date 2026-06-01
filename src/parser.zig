@@ -116,6 +116,8 @@ pub const Instruction = struct {
     dest_type: PrimType = .void,
     /// Resolved destination register slot (binding pass).
     dest_slot: u32 = std.math.maxInt(u32),
+    /// Resolved first source register slot for direct register-copy quickening.
+    src_slot: u32 = std.math.maxInt(u32),
     /// Second destination slot for cmpxchg "reg1, reg2" style dests.
     dest_slot2: u32 = std.math.maxInt(u32),
     /// Pre-computed tail-self-call flag (binding pass).

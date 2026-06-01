@@ -300,6 +300,10 @@ pub const VM = struct {
                         inst.is_tail_call = self.isTailSelfCallAt(func, pc);
                     }
                 }
+                if ((inst.op == .assign or inst.op == .assume_safe or inst.op == .assume_borrow or inst.op == .raw_cast or inst.op == .bitcast) and inst.args.len > 0) {
+                    const src = inst.args[0];
+                    if (src.kind == .register or src.kind == .stack_addr) inst.src_slot = src.slot_idx;
+                }
             }
             try self.function_call_targets.put(func_name, call_targets);
             try self.function_cacheable.put(func_name, !self.functionHasExternalSideEffect(func));
@@ -928,7 +932,9 @@ pub const VM = struct {
                     },
                     .jmp => pc = inst.args[0].pc_target,
                     .assign, .assume_safe, .assume_borrow, .raw_cast, .bitcast => {
-                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = self.resolveVal(&frame, inst.args[0]);
+                        if (inst.dest_slot != INVALID_SLOT) {
+                            frame.data[inst.dest_slot] = if (inst.src_slot != INVALID_SLOT) frame.data[inst.src_slot] else self.resolveVal(&frame, inst.args[0]);
+                        }
                         pc += 1;
                     },
                     .sext => {
