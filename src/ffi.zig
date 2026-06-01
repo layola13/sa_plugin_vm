@@ -307,8 +307,9 @@ pub const FfiManager = struct {
         };
     }
 
-    pub fn callSymbol(self: *FfiManager, symbol_name: []const u8, signature: parser.ExternSignature, args: []const usize) !usize {
-        const sym = self.resolveSymbol(symbol_name) orelse return error.SymbolNotFound;
+    /// Call an FFI function using a pre-resolved symbol pointer (skips resolveSymbol).
+    /// Used by the VM binding pass to avoid repeated dlsym lookups on the hot path.
+    pub fn callSymbolWithPtr(self: *FfiManager, sym: *anyopaque, signature: parser.ExternSignature, args: []const usize) !usize {
         if (args.len != signature.arg_types.len) return error.FfiArityMismatch;
 
         var ffi_arg_types = try self.allocator.alloc([*c]c.ffi_type, args.len);
@@ -341,6 +342,11 @@ pub const FfiManager = struct {
         const fn_ptr: ?*const fn () callconv(.c) void = @ptrCast(sym);
         c.ffi_call(&cif, fn_ptr, ret_ptr, ffi_arg_ptrs.ptr);
         return readReturnValue(ret, signature.return_type);
+    }
+
+    pub fn callSymbol(self: *FfiManager, symbol_name: []const u8, signature: parser.ExternSignature, args: []const usize) !usize {
+        const sym = self.resolveSymbol(symbol_name) orelse return error.SymbolNotFound;
+        return self.callSymbolWithPtr(sym, signature, args);
     }
 
     pub fn callSymbolLegacy(self: *FfiManager, symbol_name: []const u8, args: []const usize) !usize {

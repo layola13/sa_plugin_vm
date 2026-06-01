@@ -47,6 +47,10 @@ pub const Operand = struct {
     name: []const u8,
     imm_val: u64 = 0,
     offset: i32 = 0,
+    /// Resolved register slot index (populated during VM binding pass).
+    slot_idx: u32 = std.math.maxInt(u32),
+    /// Resolved branch/jmp target pc (populated during VM binding pass).
+    pc_target: usize = 0,
 };
 
 pub const OpCode = enum {
@@ -108,8 +112,14 @@ pub const OpCode = enum {
 pub const Instruction = struct {
     op: OpCode,
     dest: ?[]const u8 = null,
-    args: []const Operand,
+    args: []Operand,
     dest_type: PrimType = .void,
+    /// Resolved destination register slot (binding pass).
+    dest_slot: u32 = std.math.maxInt(u32),
+    /// Second destination slot for cmpxchg "reg1, reg2" style dests.
+    dest_slot2: u32 = std.math.maxInt(u32),
+    /// Pre-computed tail-self-call flag (binding pass).
+    is_tail_call: bool = false,
 };
 
 pub const BasicBlock = struct {
@@ -121,7 +131,7 @@ pub const BasicBlock = struct {
 pub const Function = struct {
     name: []const u8,
     params: []const []const u8,
-    instructions: []const Instruction,
+    instructions: []Instruction,
     blocks: []const BasicBlock,
     returns_result: bool = false,
 };

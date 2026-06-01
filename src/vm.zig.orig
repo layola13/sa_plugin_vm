@@ -19,10 +19,6 @@ const ResolvedCall = union(enum) {
     pthread_spawn_detached,
     pthread_join,
     pthread_drop,
-    fast_linear_search_loop,
-    fast_search_loop,
-    fast_binary_search_u64,
-    fast_search_rec,
     unresolved,
 };
 
@@ -47,7 +43,6 @@ pub const VM = struct {
     panic_message: ?[]u8 = null,
     thread_results: std.AutoHashMap(i32, usize),
     next_thread_handle: i32,
-    run_arena: ?std.heap.ArenaAllocator = null,
 
     pub fn init(allocator: std.mem.Allocator, program: *parser.Program, ffi_mgr: *ffi.FfiManager) VM {
         return .{
@@ -178,7 +173,6 @@ pub const VM = struct {
         if (std.mem.eql(u8, call_name, "pthread_join")) return .pthread_join;
         if (std.mem.eql(u8, call_name, "pthread_drop")) return .pthread_drop;
         if (self.function_ptrs.get(call_name)) |target_func| {
-            if (self.resolveFastAlgorithmCall(call_name, target_func)) |fast_target| return fast_target;
             return ResolvedCall{ .interpreted = target_func };
         }
         if (self.program.externs.getPtr(call_name)) |sig| {
@@ -190,37 +184,6 @@ pub const VM = struct {
             return ResolvedCall{ .ffi_legacy = sym };
         }
         return .unresolved;
-    }
-
-    fn resolveFastAlgorithmCall(self: *VM, call_name: []const u8, func: *const parser.Function) ?ResolvedCall {
-        _ = self;
-        if (std.mem.eql(u8, call_name, "linear_search_loop") and func.params.len == 3 and functionHasLoad(func)) {
-            return .fast_linear_search_loop;
-        }
-        if (std.mem.eql(u8, call_name, "search_loop") and func.params.len == 4 and functionHasCall(func, "linear_search_loop")) {
-            return .fast_search_loop;
-        }
-        if (std.mem.eql(u8, call_name, "sa_binary_search_u64") and func.params.len == 2 and functionHasCall(func, "binary_search_rec")) {
-            return .fast_binary_search_u64;
-        }
-        if (std.mem.eql(u8, call_name, "search_rec") and func.params.len == 3 and functionHasCall(func, "sa_binary_search_u64") and functionHasCall(func, "search_rec")) {
-            return .fast_search_rec;
-        }
-        return null;
-    }
-
-    fn functionHasCall(func: *const parser.Function, target_name: []const u8) bool {
-        for (func.instructions) |inst| {
-            if (inst.op == .call and inst.args.len > 0 and std.mem.eql(u8, inst.args[0].name, target_name)) return true;
-        }
-        return false;
-    }
-
-    fn functionHasLoad(func: *const parser.Function) bool {
-        for (func.instructions) |inst| {
-            if (inst.op == .load or inst.op == .atomic_load) return true;
-        }
-        return false;
     }
 
     /// Binding pass: resolve register slot indices, branch pc targets, and call
@@ -254,11 +217,6 @@ pub const VM = struct {
                     switch (arg.kind) {
                         .register, .stack_addr, .offset_addr => {
                             arg.slot_idx = @intCast(reg_map.get(arg.name) orelse INVALID_SLOT);
-                        },
-                        .constant_addr => {
-                            if (self.program.constants.get(arg.name)) |val| {
-                                arg.imm_val = @intFromPtr(val.ptr);
-                            }
                         },
                         .label => {
                             if (self.label_targets.get(func_name)) |lmap| {
@@ -365,11 +323,11 @@ pub const VM = struct {
                     };
                     try methods_list.append(func_ptr);
                 }
-                const vtable_bytes = try self.program.allocator.alloc(u8, methods_list.items.len * @sizeOf(usize));
-                @memcpy(vtable_bytes, std.mem.sliceAsBytes(methods_list.items));
+                const vtable_mem = try self.allocator.alloc(usize, methods_list.items.len);
+                @memcpy(vtable_mem, methods_list.items);
                 methods_list.deinit();
-                self.program.allocator.free(val_str);
-                entry.value_ptr.* = vtable_bytes;
+                self.allocator.free(val_str);
+                entry.value_ptr.* = std.mem.sliceAsBytes(vtable_mem);
             }
         }
 
@@ -394,7 +352,7 @@ pub const VM = struct {
         var owned_len: usize = 0;
 
         for (operands) |arg| {
-            const value = self.resolveVal(frame, arg);
+            const value = try self.resolveVal(frame, arg);
             if (owned) |buf| {
                 var buf_mut = buf;
                 if (owned_len == owned_cap) {
@@ -452,18 +410,29 @@ pub const VM = struct {
         }
     };
 
-    inline fn resolveVal(self: *VM, frame: *Frame, arg: parser.Operand) usize {
-        _ = self;
+    fn resolveVal(self: *VM, frame: *Frame, arg: parser.Operand) !usize {
         switch (arg.kind) {
             .immediate => return @as(usize, @intCast(arg.imm_val)),
-            .constant_addr => return @as(usize, @intCast(arg.imm_val)),
-            .stack_addr, .register => return @as(usize, @intCast(frame.data[arg.slot_idx])),
-            .offset_addr => {
-                const base = @as(usize, @intCast(frame.data[arg.slot_idx]));
-                const offset_bits: usize = @bitCast(@as(isize, arg.offset));
-                return base +% offset_bits;
+            .constant_addr => {
+                if (self.program.constants.get(arg.name)) |val| return @intFromPtr(val.ptr);
+                std.debug.print("Constant not found: {s}\n", .{arg.name});
+                return error.ConstantNotFound;
             },
-            .label => return arg.pc_target,
+            .stack_addr, .register => {
+                if (arg.slot_idx != INVALID_SLOT) return @as(usize, @intCast(frame.data[arg.slot_idx]));
+                std.debug.print("Unresolved register slot: {s}\n", .{arg.name});
+                return error.UnresolvedRegister;
+            },
+            .offset_addr => {
+                if (arg.slot_idx != INVALID_SLOT) {
+                    const base = @as(usize, @intCast(frame.data[arg.slot_idx]));
+                    const offset_bits: usize = @bitCast(@as(isize, arg.offset));
+                    return base +% offset_bits;
+                }
+                std.debug.print("Unresolved offset register slot: {s}\n", .{arg.name});
+                return error.UnresolvedRegister;
+            },
+            .label => return error.LabelAsValueUnsupported,
         }
     }
 
@@ -505,50 +474,6 @@ pub const VM = struct {
             return 0;
         }
         return error.SymbolNotFound;
-    }
-
-    fn fastBinarySearchU64(slice_ptr: usize, target: usize) usize {
-        const data = @as(*align(1) const u64, @ptrFromInt(slice_ptr)).*;
-        const len = @as(*align(1) const u64, @ptrFromInt(slice_ptr + 8)).*;
-        var low: usize = 0;
-        var high: usize = @as(usize, @intCast(len));
-        while (low < high) {
-            const mid = low + ((high - low) / 2);
-            const val = @as(*align(1) const u64, @ptrFromInt(data + mid * 8)).*;
-            if (val == target) return mid;
-            if (val < target) {
-                low = mid + 1;
-            } else {
-                high = mid;
-            }
-        }
-        return @as(usize, @bitCast(@as(isize, -1)));
-    }
-
-    fn fastLinearSearchLoop(data: usize, n: usize, target: usize) usize {
-        var idx: usize = 0;
-        while (idx < n) : (idx += 1) {
-            const val = @as(*align(1) const u64, @ptrFromInt(data + idx * 8)).*;
-            if (val == target) return 1;
-        }
-        return 0;
-    }
-
-    fn fastSearchLoop(data: usize, n: usize, count: usize, target: usize) usize {
-        var sum: usize = 0;
-        var idx: usize = 0;
-        while (idx < count) : (idx += 1) {
-            sum +%= fastLinearSearchLoop(data, n, target);
-        }
-        return sum;
-    }
-
-    fn fastSearchRec(slice_ptr: usize, start: usize, n: usize) usize {
-        var idx = start;
-        while (idx < n) : (idx += 1) {
-            _ = fastBinarySearchU64(slice_ptr, idx);
-        }
-        return 0;
     }
 
     /// Runtime fallback for calls that couldn't be resolved at binding time.
@@ -620,7 +545,7 @@ pub const VM = struct {
                 const inst = &func.instructions[pc];
                 switch (inst.op) {
                 .stack_alloc, .alloc => {
-                    const size = self.resolveVal(&frame, inst.args[0]);
+                    const size = try self.resolveVal(&frame, inst.args[0]);
                     const word_count = (size + 7) / 8;
                     const buf = if (inst.op == .stack_alloc)
                         try local_alloc.alloc(u64, @max(1, word_count))
@@ -634,14 +559,14 @@ pub const VM = struct {
                     pc += 1;
                 },
                 .ptr_add => {
-                    const ptr_val = self.resolveVal(&frame, inst.args[0]);
-                    const offset_val = self.resolveVal(&frame, inst.args[1]);
+                    const ptr_val = try self.resolveVal(&frame, inst.args[0]);
+                    const offset_val = try self.resolveVal(&frame, inst.args[1]);
                     if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ptr_val +% offset_val;
                     pc += 1;
                 },
                 .add, .sub, .mul, .div, .rem, .sdiv, .udiv, .srem, .urem, .shl, .shr => {
-                    const arg1 = self.resolveVal(&frame, inst.args[0]);
-                    const arg2 = self.resolveVal(&frame, inst.args[1]);
+                    const arg1 = try self.resolveVal(&frame, inst.args[0]);
+                    const arg2 = try self.resolveVal(&frame, inst.args[1]);
                     const result: u64 = switch (inst.op) {
                         .add => arg1 +% arg2,
                         .sub => arg1 -% arg2,
@@ -666,8 +591,8 @@ pub const VM = struct {
                     pc += 1;
                 },
                 .and_, .or_, .xor_ => {
-                    const arg1 = self.resolveVal(&frame, inst.args[0]);
-                    const arg2 = self.resolveVal(&frame, inst.args[1]);
+                    const arg1 = try self.resolveVal(&frame, inst.args[0]);
+                    const arg2 = try self.resolveVal(&frame, inst.args[1]);
                     const result: u64 = switch (inst.op) {
                         .and_ => arg1 & arg2,
                         .or_ => arg1 | arg2,
@@ -682,7 +607,7 @@ pub const VM = struct {
                     if (inst.is_tail_call) {
                         if (inst.args.len - 1 != current_args.len) return error.FfiArityMismatch;
                         for (inst.args[1..], 0..) |arg, ai| {
-                            current_args[ai] = self.resolveVal(&frame, arg);
+                            current_args[ai] = try self.resolveVal(&frame, arg);
                         }
                         tail_restart = true;
                         break :instr_loop;
@@ -738,26 +663,6 @@ pub const VM = struct {
                             const ret = try self.executePthreadCall("pthread_drop", args.items);
                             if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
                         },
-                        .fast_linear_search_loop => {
-                            if (args.items.len < 3) return error.FfiArityMismatch;
-                            const ret = fastLinearSearchLoop(args.items[0], args.items[1], args.items[2]);
-                            if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                        },
-                        .fast_search_loop => {
-                            if (args.items.len < 4) return error.FfiArityMismatch;
-                            const ret = fastSearchLoop(args.items[0], args.items[1], args.items[2], args.items[3]);
-                            if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                        },
-                        .fast_binary_search_u64 => {
-                            if (args.items.len < 2) return error.FfiArityMismatch;
-                            const ret = fastBinarySearchU64(args.items[0], args.items[1]);
-                            if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                        },
-                        .fast_search_rec => {
-                            if (args.items.len < 3) return error.FfiArityMismatch;
-                            const ret = fastSearchRec(args.items[0], args.items[1], args.items[2]);
-                            if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                        },
                         .unresolved => {
                             const ret = try self.callUnresolved(inst.args[0].name, args.items);
                             if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
@@ -766,7 +671,7 @@ pub const VM = struct {
                     pc += 1;
                 },
                 .call_indirect => {
-                    const ptr = self.resolveVal(&frame, inst.args[0]);
+                    const ptr = try self.resolveVal(&frame, inst.args[0]);
                     var args_buf: [16]usize = undefined;
                     var args = try self.collectCallArgs(&frame, inst.args[1..], args_buf[0..]);
                     defer args.deinit(self.allocator);
@@ -781,7 +686,7 @@ pub const VM = struct {
                     pc += 1;
                 },
                 .load, .atomic_load => {
-                    const addr = self.resolveVal(&frame, inst.args[0]);
+                    const addr = try self.resolveVal(&frame, inst.args[0]);
                     const val: u64 = switch (inst.dest_type) {
                         .ptr, .i64, .u64 => @as(*align(1) const u64, @ptrFromInt(addr)).*,
                         .i32 => @as(u64, @bitCast(@as(i64, @as(*align(1) const i32, @ptrFromInt(addr)).*))),
@@ -798,8 +703,8 @@ pub const VM = struct {
                     pc += 1;
                 },
                 .store, .atomic_store => {
-                    const val = self.resolveVal(&frame, inst.args[0]);
-                    const addr = self.resolveVal(&frame, inst.args[1]);
+                    const val = try self.resolveVal(&frame, inst.args[0]);
+                    const addr = try self.resolveVal(&frame, inst.args[1]);
                     switch (inst.dest_type) {
                         .ptr, .i64, .u64 => @as(*align(1) u64, @ptrFromInt(addr)).* = val,
                         .i32, .u32 => @as(*align(1) u32, @ptrFromInt(addr)).* = @as(u32, @intCast(val & 0xffffffff)),
@@ -810,9 +715,9 @@ pub const VM = struct {
                     pc += 1;
                 },
                 .cmpxchg => {
-                    const addr = self.resolveVal(&frame, inst.args[0]);
-                    const expected = self.resolveVal(&frame, inst.args[1]);
-                    const new_val = self.resolveVal(&frame, inst.args[2]);
+                    const addr = try self.resolveVal(&frame, inst.args[0]);
+                    const expected = try self.resolveVal(&frame, inst.args[1]);
+                    const new_val = try self.resolveVal(&frame, inst.args[2]);
                     const old_val: u64 = switch (inst.dest_type) {
                         .ptr, .i64, .u64 => @cmpxchgStrong(u64, @as(*u64, @ptrFromInt(addr)), expected, new_val, .seq_cst, .seq_cst) orelse expected,
                         .i32, .u32 => @cmpxchgStrong(u32, @as(*u32, @ptrFromInt(addr)), @as(u32, @intCast(expected & 0xffffffff)), @as(u32, @intCast(new_val & 0xffffffff)), .seq_cst, .seq_cst) orelse @as(u32, @intCast(expected & 0xffffffff)),
@@ -825,8 +730,8 @@ pub const VM = struct {
                     pc += 1;
                 },
                 .atomic_rmw_add => {
-                    const addr = self.resolveVal(&frame, inst.args[0]);
-                    const val = self.resolveVal(&frame, inst.args[1]);
+                    const addr = try self.resolveVal(&frame, inst.args[0]);
+                    const val = try self.resolveVal(&frame, inst.args[1]);
                     const old_val: u64 = switch (inst.dest_type) {
                         .ptr, .i64, .u64 => @atomicRmw(u64, @as(*u64, @ptrFromInt(addr)), .Add, val, .seq_cst),
                         .i32, .u32 => @atomicRmw(u32, @as(*u32, @ptrFromInt(addr)), .Add, @as(u32, @intCast(val & 0xffffffff)), .seq_cst),
@@ -838,8 +743,8 @@ pub const VM = struct {
                     pc += 1;
                 },
                 .eq, .ne, .sgt, .ugt, .gt, .slt, .ult, .lt, .sge, .uge, .sle, .ule => {
-                    const v1 = self.resolveVal(&frame, inst.args[0]);
-                    const v2 = self.resolveVal(&frame, inst.args[1]);
+                    const v1 = try self.resolveVal(&frame, inst.args[0]);
+                    const v2 = try self.resolveVal(&frame, inst.args[1]);
                     const is_true = switch (inst.op) {
                         .eq => v1 == v2, .ne => v1 != v2,
                         .sgt, .gt => @as(i64, @bitCast(v1)) > @as(i64, @bitCast(v2)), .ugt => v1 > v2,
@@ -852,16 +757,16 @@ pub const VM = struct {
                     pc += 1;
                 },
                 .br => {
-                    const cond = self.resolveVal(&frame, inst.args[0]);
+                    const cond = try self.resolveVal(&frame, inst.args[0]);
                     pc = if (cond != 0) inst.args[1].pc_target else inst.args[2].pc_target;
                 },
                 .jmp => pc = inst.args[0].pc_target,
                 .assign, .assume_safe, .assume_borrow, .raw_cast, .bitcast => {
-                    if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = self.resolveVal(&frame, inst.args[0]);
+                    if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = try self.resolveVal(&frame, inst.args[0]);
                     pc += 1;
                 },
                 .sext => {
-                    const raw = self.resolveVal(&frame, inst.args[0]);
+                    const raw = try self.resolveVal(&frame, inst.args[0]);
                     const from_bits: u8 = switch (inst.dest_type) {
                         .i8, .u8 => 8,
                         .i16, .u16 => 16,
@@ -872,18 +777,18 @@ pub const VM = struct {
                     pc += 1;
                 },
                 .zext, .trunc => {
-                    const raw = self.resolveVal(&frame, inst.args[0]);
+                    const raw = try self.resolveVal(&frame, inst.args[0]);
                     if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = truncToType(raw, inst.dest_type);
                     pc += 1;
                 },
                 .take => {
-                    const ptr = @as(*align(1) usize, @ptrFromInt(self.resolveVal(&frame, inst.args[0])));
+                    const ptr = @as(*align(1) usize, @ptrFromInt(try self.resolveVal(&frame, inst.args[0])));
                     if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ptr.*;
                     ptr.* = 0;
                     pc += 1;
                 },
                 .try_ => {
-                    const addr = self.resolveVal(&frame, inst.args[0]);
+                    const addr = try self.resolveVal(&frame, inst.args[0]);
                     const tag = @as(*align(1) const u64, @ptrFromInt(addr)).*;
                     if (tag != 0) {
                         _ = self.freeTrackedResultAlloc(addr);
@@ -894,15 +799,15 @@ pub const VM = struct {
                     pc += 1;
                 },
                 .panic => {
-                    const panic_code = @as(u8, @truncate(self.resolveVal(&frame, inst.args[0])));
+                    const panic_code = @as(u8, @truncate(try self.resolveVal(&frame, inst.args[0])));
                     self.clearPanicState();
                     self.panic_code = panic_code;
                     return error.Panic;
                 },
                 .panic_msg => {
-                    const panic_code = @as(u8, @truncate(self.resolveVal(&frame, inst.args[0])));
-                    const msg_ptr = self.resolveVal(&frame, inst.args[1]);
-                    const msg_len = @as(usize, @intCast(self.resolveVal(&frame, inst.args[2])));
+                    const panic_code = @as(u8, @truncate(try self.resolveVal(&frame, inst.args[0])));
+                    const msg_ptr = try self.resolveVal(&frame, inst.args[1]);
+                    const msg_len = @as(usize, @intCast(try self.resolveVal(&frame, inst.args[2])));
                     self.clearPanicState();
                     self.panic_code = panic_code;
                     if (msg_ptr != 0 and msg_len != 0) {
@@ -914,12 +819,12 @@ pub const VM = struct {
                     return error.Panic;
                 },
                 .consume => {
-                    const ptr = self.resolveVal(&frame, inst.args[0]);
+                    const ptr = try self.resolveVal(&frame, inst.args[0]);
                     _ = self.freeTrackedResultAlloc(ptr);
                     pc += 1;
                 },
                 .return_ => {
-                    const ret = if (inst.args.len > 0) self.resolveVal(&frame, inst.args[0]) else 0;
+                    const ret = if (inst.args.len > 0) try self.resolveVal(&frame, inst.args[0]) else 0;
                     if (func.returns_result and !std.mem.eql(u8, func.name, "main")) {
                         const buf = try self.allocator.alloc(u64, 3);
                         errdefer self.allocator.free(buf);

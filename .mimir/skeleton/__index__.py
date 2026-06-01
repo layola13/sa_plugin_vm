@@ -6,21 +6,21 @@
 from __future__ import annotations
 
 # ── 1. Global Overview ─────────────────────────────────────────
-SNAPSHOT_COUNT = 1
-TOTAL_MEMORY_COUNT = 10
-GLOBAL_TOP_TOPICS = ['goal', 'work', 'blocked']
-GLOBAL_TOP_FILES = ['original/user-triggered', 'projects/sci/docs', '继续按照todo.md']
+SNAPSHOT_COUNT = 2
+TOTAL_MEMORY_COUNT = 18
+GLOBAL_TOP_TOPICS = ['goal', 'work', 'blocked', 'crash', 'parser']
+GLOBAL_TOP_FILES = ['original/user-triggered', 'projects/sci/docs', '继续按照todo.md', 'TheAlgorithms/Sa', 'src/vm.zig']
 GLOBAL_TASK_TOPICS = []
 
 # ── 2. Snapshot Routing ────────────────────────────────────────
-SNAPSHOTS = ['snapshot_20260531_212634_stop']
-LATEST_SNAPSHOT = 'snapshot_20260531_212634_stop'
-SNAPSHOT_SUMMARIES = [{'name': 'snapshot_20260531_212634_stop', 'summary_module': None, 'nodes_module': 'snapshot_20260531_212634_stop.nodes', 'edges_module': 'snapshot_20260531_212634_stop.edges', 'memory_count': 10, 'memory_types': ['decision', 'emotional', 'milestone'], 'task_description': '', 'task_topics': [], 'top_topics': ['goal', 'work', 'blocked'], 'top_files': ['original/user-triggered', 'projects/sci/docs', '继续按照todo.md'], 'mtime': 1780233994}]
+SNAPSHOTS = ['snapshot_20260531_212634_stop', 'snapshot_20260601_102952_stop']
+LATEST_SNAPSHOT = 'snapshot_20260601_102952_stop'
+SNAPSHOT_SUMMARIES = [{'name': 'snapshot_20260531_212634_stop', 'summary_module': None, 'nodes_module': 'snapshot_20260531_212634_stop.nodes', 'edges_module': 'snapshot_20260531_212634_stop.edges', 'memory_count': 10, 'memory_types': ['decision', 'emotional', 'milestone'], 'task_description': '', 'task_topics': [], 'top_topics': ['goal', 'work', 'blocked'], 'top_files': ['original/user-triggered', 'projects/sci/docs', '继续按照todo.md'], 'mtime': 1780233994}, {'name': 'snapshot_20260601_102952_stop', 'summary_module': None, 'nodes_module': 'snapshot_20260601_102952_stop.nodes', 'edges_module': 'snapshot_20260601_102952_stop.edges', 'memory_count': 8, 'memory_types': ['decision', 'milestone', 'problem'], 'task_description': '', 'task_topics': [], 'top_topics': ['goal', 'crash', 'parser'], 'top_files': ['original/user-triggered', 'TheAlgorithms/Sa', 'src/vm.zig'], 'mtime': 1780280992}]
 
 # ── 3. Session Routing ─────────────────────────────────────────
 SESSIONS = ['019e7de4-cac7-7433-9902-52b395a95b76']
 LATEST_SESSION = '019e7de4-cac7-7433-9902-52b395a95b76'
-SESSION_SUMMARIES = [{'session_id': '019e7de4-cac7-7433-9902-52b395a95b76', 'summary_module': 'sessions.019e7de4-cac7-7433-9902-52b395a95b76', 'snapshots': ['snapshot_20260531_212634_stop'], 'latest_snapshot': 'snapshot_20260531_212634_stop', 'latest_task_description': '<goal_context>', 'latest_task_topics': ['goal_context', 'turn_aborted', 'projects'], 'updated_at': '2026-05-31T13:26:34Z'}]
+SESSION_SUMMARIES = [{'session_id': '019e7de4-cac7-7433-9902-52b395a95b76', 'summary_module': 'sessions.019e7de4-cac7-7433-9902-52b395a95b76', 'snapshots': ['snapshot_20260531_212634_stop', 'snapshot_20260601_102952_stop'], 'latest_snapshot': 'snapshot_20260601_102952_stop', 'latest_task_description': '<goal_context>', 'latest_task_topics': ['goal_context', 'turn_aborted', 'sa_vm'], 'updated_at': '2026-06-01T02:29:52Z'}]
 
 def available_snapshots() -> list[str]:
     return list(SNAPSHOTS)
