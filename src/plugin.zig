@@ -89,10 +89,12 @@ fn runVmCommand(allocator: std.mem.Allocator, ctx: *const plugin_api.Context, ar
     ffi_mgr.allow_ffi = allow_ffi;
     defer ffi_mgr.deinit();
 
-    ffi_mgr.loadDeclaredDependencies() catch |err| {
-        try stderr.print("Loading plugins failed: {}\n", .{err});
-        return 1;
-    };
+    if (allow_ffi or prog.externs.count() != 0) {
+        ffi_mgr.loadDeclaredDependencies() catch |err| {
+            try stderr.print("Loading plugins failed: {}\n", .{err});
+            return 1;
+        };
+    }
 
     var vm_inst = vm.VM.init(std.heap.c_allocator, prog, &ffi_mgr);
     defer vm_inst.deinit();
