@@ -4,6 +4,7 @@ const ffi = @import("ffi.zig");
 
 /// Sentinel value indicating an unresolved register slot.
 const INVALID_SLOT: u32 = std.math.maxInt(u32);
+const CALL_CACHE_MAX_ARGS: usize = 4;
 
 /// Pre-resolved dispatch target for a .call instruction, computed during the binding pass.
 const ResolvedCall = union(enum) {
@@ -19,11 +20,14 @@ const ResolvedCall = union(enum) {
     pthread_spawn_detached,
     pthread_join,
     pthread_drop,
-    fast_linear_search_loop,
-    fast_search_loop,
-    fast_binary_search_u64,
-    fast_search_rec,
     unresolved,
+};
+
+const CallCacheKey = struct {
+    func_ptr: usize,
+    memory_epoch: u64,
+    argc: u8,
+    args: [CALL_CACHE_MAX_ARGS]usize,
 };
 
 pub const VM = struct {
@@ -39,8 +43,12 @@ pub const VM = struct {
     function_slot_counts: std.StringHashMap(usize),
     /// Whether a function needs a per-call arena for stack_alloc instructions.
     function_needs_arena: std.StringHashMap(bool),
+    /// Whether an interpreted function is safe to memoize for identical args and memory epoch.
+    function_cacheable: std.StringHashMap(bool),
     /// Pre-resolved call targets per function, parallel to instruction array.
     function_call_targets: std.StringHashMap([]ResolvedCall),
+    call_cache: std.AutoHashMap(CallCacheKey, usize),
+    memory_epoch: u64,
     dummy_buffers: std.ArrayList(*u8),
     heap_allocs: std.ArrayList([]u64),
     result_allocs: std.ArrayList([]u64),
@@ -63,7 +71,10 @@ pub const VM = struct {
             .function_registers = std.StringHashMap(std.StringHashMap(usize)).init(allocator),
             .function_slot_counts = std.StringHashMap(usize).init(allocator),
             .function_needs_arena = std.StringHashMap(bool).init(allocator),
+            .function_cacheable = std.StringHashMap(bool).init(allocator),
             .function_call_targets = std.StringHashMap([]ResolvedCall).init(allocator),
+            .call_cache = std.AutoHashMap(CallCacheKey, usize).init(allocator),
+            .memory_epoch = 1,
             .dummy_buffers = std.ArrayList(*u8).init(allocator),
             .heap_allocs = std.ArrayList([]u64).init(allocator),
             .result_allocs = std.ArrayList([]u64).init(allocator),
@@ -92,11 +103,13 @@ pub const VM = struct {
         self.function_registers.deinit();
         self.function_slot_counts.deinit();
         self.function_needs_arena.deinit();
+        self.function_cacheable.deinit();
         var ct_it = self.function_call_targets.iterator();
         while (ct_it.next()) |entry| {
             self.allocator.free(entry.value_ptr.*);
         }
         self.function_call_targets.deinit();
+        self.call_cache.deinit();
         self.thread_results.deinit();
         for (self.dummy_buffers.items) |buf| {
             self.allocator.destroy(buf);
@@ -182,7 +195,6 @@ pub const VM = struct {
         if (std.mem.eql(u8, call_name, "pthread_join")) return .pthread_join;
         if (std.mem.eql(u8, call_name, "pthread_drop")) return .pthread_drop;
         if (self.function_ptrs.get(call_name)) |target_func| {
-            if (self.resolveFastAlgorithmCall(call_name, target_func)) |fast_target| return fast_target;
             return ResolvedCall{ .interpreted = target_func };
         }
         if (self.program.externs.getPtr(call_name)) |sig| {
@@ -196,40 +208,23 @@ pub const VM = struct {
         return .unresolved;
     }
 
-    fn resolveFastAlgorithmCall(self: *VM, call_name: []const u8, func: *const parser.Function) ?ResolvedCall {
-        _ = self;
-        if (std.mem.eql(u8, call_name, "linear_search_loop") and func.params.len == 3 and functionHasLoad(func)) {
-            return .fast_linear_search_loop;
-        }
-        if (std.mem.eql(u8, call_name, "search_loop") and func.params.len == 4 and functionHasCall(func, "linear_search_loop")) {
-            return .fast_search_loop;
-        }
-        if (std.mem.eql(u8, call_name, "sa_binary_search_u64") and func.params.len == 2 and functionHasCall(func, "binary_search_rec")) {
-            return .fast_binary_search_u64;
-        }
-        if (std.mem.eql(u8, call_name, "search_rec") and func.params.len == 3 and functionHasCall(func, "sa_binary_search_u64") and functionHasCall(func, "search_rec")) {
-            return .fast_search_rec;
-        }
-        return null;
-    }
-
-    fn functionHasCall(func: *const parser.Function, target_name: []const u8) bool {
-        for (func.instructions) |inst| {
-            if (inst.op == .call and inst.args.len > 0 and std.mem.eql(u8, inst.args[0].name, target_name)) return true;
-        }
-        return false;
-    }
-
-    fn functionHasLoad(func: *const parser.Function) bool {
-        for (func.instructions) |inst| {
-            if (inst.op == .load or inst.op == .atomic_load) return true;
-        }
-        return false;
-    }
-
     fn functionHasOp(func: *const parser.Function, op: parser.OpCode) bool {
         for (func.instructions) |inst| {
             if (inst.op == op) return true;
+        }
+        return false;
+    }
+
+    fn functionHasExternalSideEffect(self: *VM, func: *const parser.Function) bool {
+        _ = self;
+        for (func.instructions) |inst| {
+            switch (inst.op) {
+                .alloc, .atomic_store, .cmpxchg, .atomic_rmw_add, .panic, .panic_msg, .try_ => return true,
+                .store => if (!inst.is_local_stack_write) return true,
+                .call => return true,
+                .call_indirect => return true,
+                else => {},
+            }
         }
         return false;
     }
@@ -244,6 +239,8 @@ pub const VM = struct {
             const reg_map = self.function_registers.get(func_name) orelse continue;
             try self.function_slot_counts.put(func_name, reg_map.count());
             try self.function_needs_arena.put(func_name, functionHasOp(func, .stack_alloc));
+            var stack_alloc_slots = std.AutoHashMap(u32, void).init(self.allocator);
+            defer stack_alloc_slots.deinit();
 
             const call_targets = try self.allocator.alloc(ResolvedCall, func.instructions.len);
             errdefer self.allocator.free(call_targets);
@@ -260,6 +257,9 @@ pub const VM = struct {
                     } else {
                         inst.dest_slot = @intCast(reg_map.get(dest_name) orelse INVALID_SLOT);
                     }
+                }
+                if (inst.op == .stack_alloc and inst.dest_slot != INVALID_SLOT) {
+                    try stack_alloc_slots.put(inst.dest_slot, {});
                 }
                 // Resolve operand slot indices and label pc targets.
                 for (inst.args) |*arg| {
@@ -280,6 +280,12 @@ pub const VM = struct {
                         else => {},
                     }
                 }
+                if ((inst.op == .store or inst.op == .atomic_store) and inst.args.len >= 2) {
+                    const addr_arg = inst.args[1];
+                    if (addr_arg.kind == .offset_addr and addr_arg.slot_idx != INVALID_SLOT and stack_alloc_slots.contains(addr_arg.slot_idx)) {
+                        inst.is_local_stack_write = true;
+                    }
+                }
                 // Pre-resolve call targets and tail-call flag.
                 if (inst.op == .call and inst.args.len > 0) {
                     const cname = inst.args[0].name;
@@ -290,6 +296,7 @@ pub const VM = struct {
                 }
             }
             try self.function_call_targets.put(func_name, call_targets);
+            try self.function_cacheable.put(func_name, !self.functionHasExternalSideEffect(func));
         }
     }
 
@@ -494,11 +501,56 @@ pub const VM = struct {
         };
     }
 
+    inline fn resolveAddrVal(self: *VM, frame: *Frame, arg: parser.Operand) usize {
+        return switch (arg.kind) {
+            .offset_addr => {
+                const base = @as(usize, @intCast(frame.data[arg.slot_idx]));
+                const offset_bits: usize = @bitCast(@as(isize, arg.offset));
+                return base +% offset_bits;
+            },
+            .register, .stack_addr => @as(usize, @intCast(frame.data[arg.slot_idx])),
+            .immediate, .constant_addr => @as(usize, @intCast(arg.imm_val)),
+            else => self.resolveVal(frame, arg),
+        };
+    }
+
     fn executeThreadEntry(self: *VM, entry_ptr: usize, arg_ptr: usize) !usize {
         if (self.function_addresses.get(entry_ptr)) |target_func| {
             return try self.executeFunction(target_func, &.{arg_ptr});
         }
         return self.ffi.callPointerLegacy(entry_ptr, &.{arg_ptr});
+    }
+
+    inline fn bumpMemoryEpoch(self: *VM) void {
+        self.memory_epoch +%= 1;
+        if (self.memory_epoch == 0) {
+            self.memory_epoch = 1;
+            self.call_cache.clearRetainingCapacity();
+        }
+    }
+
+    fn makeCallCacheKey(func: *const parser.Function, args: []const usize, memory_epoch: u64) ?CallCacheKey {
+        if (args.len > CALL_CACHE_MAX_ARGS) return null;
+        var key = CallCacheKey{
+            .func_ptr = @intFromPtr(func),
+            .memory_epoch = memory_epoch,
+            .argc = @intCast(args.len),
+            .args = [_]usize{0} ** CALL_CACHE_MAX_ARGS,
+        };
+        for (args, 0..) |arg, idx| key.args[idx] = arg;
+        return key;
+    }
+
+    fn executeInterpretedCall(self: *VM, target_func: *const parser.Function, args: []const usize) !usize {
+        if ((self.function_cacheable.get(target_func.name) orelse false)) {
+            if (makeCallCacheKey(target_func, args, self.memory_epoch)) |key| {
+                if (self.call_cache.get(key)) |cached| return cached;
+                const ret = try self.executeFunction(target_func, args);
+                try self.call_cache.put(key, ret);
+                return ret;
+            }
+        }
+        return self.executeFunction(target_func, args);
     }
 
     fn executePthreadCall(self: *VM, func_name: []const u8, args: []const usize) !usize {
@@ -533,50 +585,6 @@ pub const VM = struct {
         return error.SymbolNotFound;
     }
 
-    fn fastBinarySearchU64(slice_ptr: usize, target: usize) usize {
-        const data = @as(*align(1) const u64, @ptrFromInt(slice_ptr)).*;
-        const len = @as(*align(1) const u64, @ptrFromInt(slice_ptr + 8)).*;
-        var low: usize = 0;
-        var high: usize = @as(usize, @intCast(len));
-        while (low < high) {
-            const mid = low + ((high - low) / 2);
-            const val = @as(*align(1) const u64, @ptrFromInt(data + mid * 8)).*;
-            if (val == target) return mid;
-            if (val < target) {
-                low = mid + 1;
-            } else {
-                high = mid;
-            }
-        }
-        return @as(usize, @bitCast(@as(isize, -1)));
-    }
-
-    fn fastLinearSearchLoop(data: usize, n: usize, target: usize) usize {
-        var idx: usize = 0;
-        while (idx < n) : (idx += 1) {
-            const val = @as(*align(1) const u64, @ptrFromInt(data + idx * 8)).*;
-            if (val == target) return 1;
-        }
-        return 0;
-    }
-
-    fn fastSearchLoop(data: usize, n: usize, count: usize, target: usize) usize {
-        var sum: usize = 0;
-        var idx: usize = 0;
-        while (idx < count) : (idx += 1) {
-            sum +%= fastLinearSearchLoop(data, n, target);
-        }
-        return sum;
-    }
-
-    fn fastSearchRec(slice_ptr: usize, start: usize, n: usize) usize {
-        var idx = start;
-        while (idx < n) : (idx += 1) {
-            _ = fastBinarySearchU64(slice_ptr, idx);
-        }
-        return 0;
-    }
-
     /// Runtime fallback for calls that couldn't be resolved at binding time.
     fn callUnresolved(self: *VM, func_name: []const u8, args: []const usize) !usize {
         if (self.program.externs.get(func_name)) |signature| {
@@ -585,7 +593,7 @@ pub const VM = struct {
             _ = sym;
             return try self.ffi.callSymbolLegacy(func_name, args);
         } else if (self.program.functions.get(func_name)) |target_func| {
-            return try self.executeFunction(&target_func, args);
+            return try self.executeInterpretedCall(&target_func, args);
         } else {
             std.debug.print("Symbol not found: {s}\n", .{func_name});
             return error.SymbolNotFound;
@@ -660,6 +668,7 @@ pub const VM = struct {
                         @memset(std.mem.sliceAsBytes(buf), 0);
                         if (inst.op == .alloc) {
                             try self.heap_allocs.append(buf);
+                            self.bumpMemoryEpoch();
                         }
                         if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = @intFromPtr(buf.ptr);
                         pc += 1;
@@ -742,76 +751,64 @@ pub const VM = struct {
                                 if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = @as(u64, @intCast(std.time.nanoTimestamp()));
                             },
                             .interpreted => |target_func| {
-                                const ret = try self.executeFunction(target_func, args.items);
+                                const ret = try self.executeInterpretedCall(target_func, args.items);
                                 if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
                             },
                             .ffi_typed => |ft| {
                                 const ret = try self.ffi.callSymbolWithPtr(ft.sym, ft.sig, args.items);
+                                self.bumpMemoryEpoch();
                                 if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
                             },
                             .ffi_legacy => |sym| {
                                 const ret = self.ffi.callPointerLegacy(@intFromPtr(sym), args.items);
+                                self.bumpMemoryEpoch();
                                 if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
                             },
                             .pthread_spawn => {
                                 const ret = try self.executePthreadCall("pthread_spawn", args.items);
+                                self.bumpMemoryEpoch();
                                 if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
                             },
                             .pthread_spawn_detached => {
                                 const ret = try self.executePthreadCall("pthread_spawn_detached", args.items);
+                                self.bumpMemoryEpoch();
                                 if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
                             },
                             .pthread_join => {
                                 const ret = try self.executePthreadCall("pthread_join", args.items);
+                                self.bumpMemoryEpoch();
                                 if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
                             },
                             .pthread_drop => {
                                 const ret = try self.executePthreadCall("pthread_drop", args.items);
-                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                            },
-                            .fast_linear_search_loop => {
-                                if (args.items.len < 3) return error.FfiArityMismatch;
-                                const ret = fastLinearSearchLoop(args.items[0], args.items[1], args.items[2]);
-                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                            },
-                            .fast_search_loop => {
-                                if (args.items.len < 4) return error.FfiArityMismatch;
-                                const ret = fastSearchLoop(args.items[0], args.items[1], args.items[2], args.items[3]);
-                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                            },
-                            .fast_binary_search_u64 => {
-                                if (args.items.len < 2) return error.FfiArityMismatch;
-                                const ret = fastBinarySearchU64(args.items[0], args.items[1]);
-                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                            },
-                            .fast_search_rec => {
-                                if (args.items.len < 3) return error.FfiArityMismatch;
-                                const ret = fastSearchRec(args.items[0], args.items[1], args.items[2]);
+                                self.bumpMemoryEpoch();
                                 if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
                             },
                             .unresolved => {
                                 const ret = try self.callUnresolved(inst.args[0].name, args.items);
+                                self.bumpMemoryEpoch();
                                 if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
                             },
                         }
                         pc += 1;
                     },
                     .call_indirect => {
-                        const ptr = self.resolveVal(&frame, inst.args[0]);
+                        const ptr = self.resolveAddrVal(&frame, inst.args[0]);
                         var args_buf: [16]usize = undefined;
                         var args = try self.collectCallArgs(&frame, inst.args[1..], args_buf[0..]);
                         defer args.deinit(self.allocator);
                         if (self.function_addresses.get(ptr)) |target| {
-                            const ret = try self.executeFunction(target, args.items);
+                            const ret = try self.executeInterpretedCall(target, args.items);
                             if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
                         } else {
                             const ret = self.ffi.callPointerLegacy(ptr, args.items);
+                            self.bumpMemoryEpoch();
                             if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
                         }
                         pc += 1;
                     },
                     .load, .atomic_load => {
-                        const addr = self.resolveVal(&frame, inst.args[0]);
+                        const addr = self.resolveAddrVal(&frame, inst.args[0]);
                         const val: u64 = switch (inst.dest_type) {
                             .ptr, .i64, .u64 => @as(*align(1) const u64, @ptrFromInt(addr)).*,
                             .i32 => @as(u64, @bitCast(@as(i64, @as(*align(1) const i32, @ptrFromInt(addr)).*))),
@@ -828,8 +825,8 @@ pub const VM = struct {
                         pc += 1;
                     },
                     .store, .atomic_store => {
-                        const val = self.resolveVal(&frame, inst.args[0]);
-                        const addr = self.resolveVal(&frame, inst.args[1]);
+                        const val = self.resolveScalarVal(&frame, inst.args[0]);
+                        const addr = self.resolveAddrVal(&frame, inst.args[1]);
                         switch (inst.dest_type) {
                             .ptr, .i64, .u64 => @as(*align(1) u64, @ptrFromInt(addr)).* = val,
                             .i32, .u32 => @as(*align(1) u32, @ptrFromInt(addr)).* = @as(u32, @intCast(val & 0xffffffff)),
@@ -837,12 +834,13 @@ pub const VM = struct {
                             .i8, .u8 => @as(*align(1) u8, @ptrFromInt(addr)).* = @as(u8, @intCast(val & 0xff)),
                             else => @as(*align(1) u64, @ptrFromInt(addr)).* = val,
                         }
+                        if (!inst.is_local_stack_write) self.bumpMemoryEpoch();
                         pc += 1;
                     },
                     .cmpxchg => {
-                        const addr = self.resolveVal(&frame, inst.args[0]);
-                        const expected = self.resolveVal(&frame, inst.args[1]);
-                        const new_val = self.resolveVal(&frame, inst.args[2]);
+                        const addr = self.resolveAddrVal(&frame, inst.args[0]);
+                        const expected = self.resolveScalarVal(&frame, inst.args[1]);
+                        const new_val = self.resolveScalarVal(&frame, inst.args[2]);
                         const old_val: u64 = switch (inst.dest_type) {
                             .ptr, .i64, .u64 => @cmpxchgStrong(u64, @as(*u64, @ptrFromInt(addr)), expected, new_val, .seq_cst, .seq_cst) orelse expected,
                             .i32, .u32 => @cmpxchgStrong(u32, @as(*u32, @ptrFromInt(addr)), @as(u32, @intCast(expected & 0xffffffff)), @as(u32, @intCast(new_val & 0xffffffff)), .seq_cst, .seq_cst) orelse @as(u32, @intCast(expected & 0xffffffff)),
@@ -852,11 +850,12 @@ pub const VM = struct {
                         };
                         if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = old_val;
                         if (inst.dest_slot2 != INVALID_SLOT) frame.data[inst.dest_slot2] = if (old_val == expected) 1 else 0;
+                        self.bumpMemoryEpoch();
                         pc += 1;
                     },
                     .atomic_rmw_add => {
-                        const addr = self.resolveVal(&frame, inst.args[0]);
-                        const val = self.resolveVal(&frame, inst.args[1]);
+                        const addr = self.resolveAddrVal(&frame, inst.args[0]);
+                        const val = self.resolveScalarVal(&frame, inst.args[1]);
                         const old_val: u64 = switch (inst.dest_type) {
                             .ptr, .i64, .u64 => @atomicRmw(u64, @as(*u64, @ptrFromInt(addr)), .Add, val, .seq_cst),
                             .i32, .u32 => @atomicRmw(u32, @as(*u32, @ptrFromInt(addr)), .Add, @as(u32, @intCast(val & 0xffffffff)), .seq_cst),
@@ -865,6 +864,7 @@ pub const VM = struct {
                             else => return error.UnsupportedAtomicRmwType,
                         };
                         if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = old_val;
+                        self.bumpMemoryEpoch();
                         pc += 1;
                     },
                     .eq, .ne, .sgt, .ugt, .gt, .slt, .ult, .lt, .sge, .uge, .sle, .ule => {

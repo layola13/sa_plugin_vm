@@ -120,6 +120,8 @@ pub const Instruction = struct {
     dest_slot2: u32 = std.math.maxInt(u32),
     /// Pre-computed tail-self-call flag (binding pass).
     is_tail_call: bool = false,
+    /// True when a memory-write instruction only touches this function's stack_alloc storage.
+    is_local_stack_write: bool = false,
 };
 
 pub const BasicBlock = struct {
