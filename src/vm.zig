@@ -8,6 +8,9 @@ pub const VM = struct {
     ffi: *ffi.FfiManager,
     function_addresses: std.AutoHashMap(usize, []const u8),
     function_names: std.StringHashMap(usize),
+    function_ptrs: std.StringHashMap(*const parser.Function),
+    label_targets: std.StringHashMap(std.StringHashMap(usize)),
+    function_registers: std.StringHashMap(std.StringHashMap(usize)),
     dummy_buffers: std.ArrayList(*u8),
     heap_allocs: std.ArrayList([]u64),
     result_allocs: std.ArrayList([]u64),
@@ -23,6 +26,9 @@ pub const VM = struct {
             .ffi = ffi_mgr,
             .function_addresses = std.AutoHashMap(usize, []const u8).init(allocator),
             .function_names = std.StringHashMap(usize).init(allocator),
+            .function_ptrs = std.StringHashMap(*const parser.Function).init(allocator),
+            .label_targets = std.StringHashMap(std.StringHashMap(usize)).init(allocator),
+            .function_registers = std.StringHashMap(std.StringHashMap(usize)).init(allocator),
             .dummy_buffers = std.ArrayList(*u8).init(allocator),
             .heap_allocs = std.ArrayList([]u64).init(allocator),
             .result_allocs = std.ArrayList([]u64).init(allocator),
@@ -35,8 +41,19 @@ pub const VM = struct {
 
     pub fn deinit(self: *VM) void {
         self.clearPanicState();
+        var label_it = self.label_targets.iterator();
+        while (label_it.next()) |entry| {
+            entry.value_ptr.*.deinit();
+        }
+        self.label_targets.deinit();
         self.function_addresses.deinit();
         self.function_names.deinit();
+        self.function_ptrs.deinit();
+        var reg_it = self.function_registers.iterator();
+        while (reg_it.next()) |entry| {
+            entry.value_ptr.*.deinit();
+        }
+        self.function_registers.deinit();
         self.thread_results.deinit();
         for (self.dummy_buffers.items) |buf| {
             self.allocator.destroy(buf);
@@ -113,12 +130,48 @@ pub const VM = struct {
         var func_it = self.program.functions.iterator();
         while (func_it.next()) |entry| {
             const func_name = entry.key_ptr.*;
+            const func_ptr = self.program.functions.getPtr(func_name) orelse return error.SymbolNotFound;
+            try self.function_ptrs.put(func_name, func_ptr);
             const dummy = try self.allocator.create(u8);
             dummy.* = 0;
             try self.dummy_buffers.append(dummy);
             const addr = @intFromPtr(dummy);
             try self.function_addresses.put(addr, func_name);
             try self.function_names.put(func_name, addr);
+
+            var label_map = std.StringHashMap(usize).init(self.allocator);
+            errdefer label_map.deinit();
+            for (entry.value_ptr.blocks) |block| {
+                try label_map.put(block.label, block.start_inst);
+            }
+            try self.label_targets.put(func_name, label_map);
+
+            var reg_map = std.StringHashMap(usize).init(self.allocator);
+            errdefer reg_map.deinit();
+            var reg_idx: usize = 0;
+            for (entry.value_ptr.params) |param| {
+                if (!reg_map.contains(param)) {
+                    try reg_map.put(param, reg_idx);
+                    reg_idx += 1;
+                }
+            }
+            for (entry.value_ptr.instructions) |inst| {
+                if (inst.dest) |dest| {
+                    if (!reg_map.contains(dest)) {
+                        try reg_map.put(dest, reg_idx);
+                        reg_idx += 1;
+                    }
+                }
+                for (inst.args) |arg| {
+                    if (arg.kind == .register or arg.kind == .stack_addr or arg.kind == .offset_addr) {
+                        if (!reg_map.contains(arg.name)) {
+                            try reg_map.put(arg.name, reg_idx);
+                            reg_idx += 1;
+                        }
+                    }
+                }
+            }
+            try self.function_registers.put(func_name, reg_map);
         }
 
         var const_it = self.program.constants.iterator();
@@ -153,20 +206,85 @@ pub const VM = struct {
         }
     }
 
+    const CallArgs = struct {
+        items: []const usize,
+        owned: ?[]usize = null,
+
+        fn deinit(self: *CallArgs, allocator: std.mem.Allocator) void {
+            if (self.owned) |buf| allocator.free(buf);
+            self.* = .{ .items = &.{}, .owned = null };
+        }
+    };
+
+    fn collectCallArgs(self: *VM, frame: *Frame, operands: []const parser.Operand) !CallArgs {
+        var fixed: [16]usize = undefined;
+        var count: usize = 0;
+        var owned: ?[]usize = null;
+        var owned_cap: usize = 0;
+        var owned_len: usize = 0;
+
+        for (operands) |arg| {
+            const value = try self.resolveVal(frame, arg);
+            if (owned) |buf| {
+                var buf_mut = buf;
+                if (owned_len == owned_cap) {
+                    const next_cap = @max(owned_len * 2, 16);
+                    const next = try self.allocator.realloc(buf_mut, next_cap);
+                    owned = next;
+                    owned_cap = next_cap;
+                    buf_mut = next;
+                }
+                buf_mut[owned_len] = value;
+                owned_len += 1;
+                continue;
+            }
+            if (count < fixed.len) {
+                fixed[count] = value;
+                count += 1;
+                continue;
+            }
+            var buf = try self.allocator.alloc(usize, 16);
+            @memcpy(buf[0..count], fixed[0..count]);
+            buf[count] = value;
+            owned = buf;
+            owned_cap = buf.len;
+            owned_len = count + 1;
+        }
+
+        if (owned) |buf| {
+            return .{ .items = buf[0..owned_len], .owned = buf };
+        }
+        return .{ .items = fixed[0..count] };
+    }
+
+    fn getLabelIndex(self: *VM, func_name: []const u8, label: []const u8) !usize {
+        const label_map = self.label_targets.get(func_name) orelse return error.LabelNotFound;
+        return label_map.get(label) orelse error.LabelNotFound;
+    }
+
     const Frame = struct {
         data: []u64,
         map: std.StringHashMap(usize),
         next_idx: usize = 0,
         allocator: std.mem.Allocator,
 
-        fn init(allocator: std.mem.Allocator) !Frame {
-            const data = try allocator.alloc(u64, 1024);
+        fn init(allocator: std.mem.Allocator, reg_map: ?std.StringHashMap(usize)) !Frame {
+            const initial_len = if (reg_map) |map| @max(map.count(), 8) else 1024;
+            const data = try allocator.alloc(u64, initial_len);
             @memset(data, 0);
-            return .{
+            var frame = Frame{
                 .data = data,
                 .map = std.StringHashMap(usize).init(allocator),
                 .allocator = allocator,
             };
+            if (reg_map) |map| {
+                var it = map.iterator();
+                while (it.next()) |entry| {
+                    try frame.map.put(entry.key_ptr.*, entry.value_ptr.*);
+                }
+                frame.next_idx = map.count();
+            }
+            return frame;
         }
 
         fn deinit(self: *Frame) void {
@@ -227,8 +345,8 @@ pub const VM = struct {
 
     fn executeThreadEntry(self: *VM, entry_ptr: usize, arg_ptr: usize) !usize {
         if (self.function_addresses.get(entry_ptr)) |name| {
-            const target_func = self.program.functions.get(name) orelse return error.SymbolNotFound;
-            return try self.executeFunction(&target_func, &.{arg_ptr});
+            const target_func = self.function_ptrs.get(name) orelse return error.SymbolNotFound;
+            return try self.executeFunction(target_func, &.{arg_ptr});
         }
         return self.ffi.callPointerLegacy(entry_ptr, &.{arg_ptr});
     }
@@ -291,7 +409,8 @@ pub const VM = struct {
         var current_args = try self.allocator.dupe(usize, call_args);
         defer self.allocator.free(current_args);
 
-        var frame = try Frame.init(self.allocator);
+        const reg_map = self.function_registers.get(func.name);
+        var frame = try Frame.init(self.allocator, reg_map);
         defer frame.deinit();
 
         var stack_allocs = std.ArrayList([]u64).init(self.allocator);
@@ -375,9 +494,8 @@ pub const VM = struct {
                 },
                 .call => {
                     const func_name = inst.args[0].name;
-                    var args = std.ArrayList(usize).init(self.allocator);
-                    defer args.deinit();
-                    for (inst.args[1..]) |arg| try args.append(try self.resolveVal(&frame, arg));
+                    var args = try self.collectCallArgs(&frame, inst.args[1..]);
+                    defer args.deinit(self.allocator);
                     if (std.mem.eql(u8, func_name, "sa_print_bytes")) {
                         const slice = @as([*]const u8, @ptrFromInt(args.items[0]))[0..args.items[1]];
                         _ = std.posix.write(std.posix.STDOUT_FILENO, slice) catch {};
@@ -398,8 +516,8 @@ pub const VM = struct {
                         }
                         tail_restart = true;
                         break :instr_loop;
-                    } else if (self.program.functions.get(func_name)) |target_func| {
-                        const ret = try self.executeFunction(&target_func, args.items);
+                    } else if (self.function_ptrs.get(func_name)) |target_func| {
+                        const ret = try self.executeFunction(target_func, args.items);
                         if (inst.dest) |d| (try frame.getRegPtr(d)).* = ret;
                     } else if (std.mem.eql(u8, func_name, "pthread_spawn") or std.mem.eql(u8, func_name, "pthread_spawn_detached") or std.mem.eql(u8, func_name, "pthread_join") or std.mem.eql(u8, func_name, "pthread_drop")) {
                         const ret = try self.executePthreadCall(func_name, args.items);
@@ -424,11 +542,10 @@ pub const VM = struct {
                 },
                 .call_indirect => {
                     const ptr = try self.resolveVal(&frame, inst.args[0]);
-                    var args = std.ArrayList(usize).init(self.allocator);
-                    defer args.deinit();
-                    for (inst.args[1..]) |arg| try args.append(try self.resolveVal(&frame, arg));
+                    var args = try self.collectCallArgs(&frame, inst.args[1..]);
+                    defer args.deinit(self.allocator);
                     if (self.function_addresses.get(ptr)) |name| {
-                        const ret = try self.executeFunction(&self.program.functions.get(name).?, args.items);
+                        const ret = try self.executeFunction(self.function_ptrs.get(name) orelse return error.SymbolNotFound, args.items);
                         if (inst.dest) |d| (try frame.getRegPtr(d)).* = ret;
                     } else {
                         const ret = self.ffi.callPointerLegacy(ptr, args.items);
@@ -513,8 +630,8 @@ pub const VM = struct {
                     (try frame.getRegPtr(inst.dest.?)).* = if (is_true) 1 else 0;
                     pc += 1;
                 },
-                .br => pc = try self.findBlockInstructionIndex(func, if ((try self.resolveVal(&frame, inst.args[0])) != 0) inst.args[1].name else inst.args[2].name),
-                .jmp => pc = try self.findBlockInstructionIndex(func, inst.args[0].name),
+                .br => pc = try self.getLabelIndex(func.name, if ((try self.resolveVal(&frame, inst.args[0])) != 0) inst.args[1].name else inst.args[2].name),
+                .jmp => pc = try self.getLabelIndex(func.name, inst.args[0].name),
                 .assign, .assume_safe, .assume_borrow, .raw_cast, .bitcast => {
                     (try frame.getRegPtr(inst.dest.?)).* = try self.resolveVal(&frame, inst.args[0]);
                     pc += 1;
@@ -601,9 +718,4 @@ pub const VM = struct {
         }
     }
 
-    fn findBlockInstructionIndex(self: *VM, func: *const parser.Function, label: []const u8) !usize {
-        _ = self;
-        for (func.blocks) |block| if (std.mem.eql(u8, block.label, label)) return block.start_inst;
-        return error.LabelNotFound;
-    }
 };
