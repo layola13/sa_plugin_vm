@@ -37,6 +37,8 @@ pub const VM = struct {
     function_registers: std.StringHashMap(std.StringHashMap(usize)),
     /// Number of register slots per function (populated by binding pass).
     function_slot_counts: std.StringHashMap(usize),
+    /// Whether a function needs a per-call arena for stack_alloc instructions.
+    function_needs_arena: std.StringHashMap(bool),
     /// Pre-resolved call targets per function, parallel to instruction array.
     function_call_targets: std.StringHashMap([]ResolvedCall),
     dummy_buffers: std.ArrayList(*u8),
@@ -60,6 +62,7 @@ pub const VM = struct {
             .label_targets = std.StringHashMap(std.StringHashMap(usize)).init(allocator),
             .function_registers = std.StringHashMap(std.StringHashMap(usize)).init(allocator),
             .function_slot_counts = std.StringHashMap(usize).init(allocator),
+            .function_needs_arena = std.StringHashMap(bool).init(allocator),
             .function_call_targets = std.StringHashMap([]ResolvedCall).init(allocator),
             .dummy_buffers = std.ArrayList(*u8).init(allocator),
             .heap_allocs = std.ArrayList([]u64).init(allocator),
@@ -88,6 +91,7 @@ pub const VM = struct {
         }
         self.function_registers.deinit();
         self.function_slot_counts.deinit();
+        self.function_needs_arena.deinit();
         var ct_it = self.function_call_targets.iterator();
         while (ct_it.next()) |entry| {
             self.allocator.free(entry.value_ptr.*);
@@ -223,6 +227,13 @@ pub const VM = struct {
         return false;
     }
 
+    fn functionHasOp(func: *const parser.Function, op: parser.OpCode) bool {
+        for (func.instructions) |inst| {
+            if (inst.op == op) return true;
+        }
+        return false;
+    }
+
     /// Binding pass: resolve register slot indices, branch pc targets, and call
     /// targets for every instruction in every function. Runs once after init.
     fn bindingPass(self: *VM) !void {
@@ -232,6 +243,7 @@ pub const VM = struct {
             const func = entry.value_ptr;
             const reg_map = self.function_registers.get(func_name) orelse continue;
             try self.function_slot_counts.put(func_name, reg_map.count());
+            try self.function_needs_arena.put(func_name, functionHasOp(func, .stack_alloc));
 
             const call_targets = try self.allocator.alloc(ResolvedCall, func.instructions.len);
             errdefer self.allocator.free(call_targets);
@@ -595,18 +607,22 @@ pub const VM = struct {
     }
 
     fn executeFunction(self: *VM, func: *const parser.Function, call_args: []const usize) anyerror!usize {
+        const needs_arena = self.function_needs_arena.get(func.name) orelse true;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const local_alloc = arena.allocator();
+        defer if (needs_arena) arena.deinit();
+        const local_alloc = if (needs_arena) arena.allocator() else self.allocator;
 
         var current_args_buf: [16]usize = undefined;
+        var current_args_owned = false;
         var current_args: []usize = undefined;
         if (call_args.len <= current_args_buf.len) {
             @memcpy(current_args_buf[0..call_args.len], call_args);
             current_args = current_args_buf[0..call_args.len];
         } else {
             current_args = try local_alloc.dupe(usize, call_args);
+            current_args_owned = true;
         }
+        defer if (current_args_owned and !needs_arena) self.allocator.free(current_args);
 
         const slot_count = self.function_slot_counts.get(func.name) orelse (func.params.len + 64);
         var frame = try Frame.init(local_alloc, slot_count);
