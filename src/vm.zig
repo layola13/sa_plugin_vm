@@ -486,6 +486,14 @@ pub const VM = struct {
         }
     }
 
+    inline fn resolveScalarVal(self: *VM, frame: *Frame, arg: parser.Operand) usize {
+        return switch (arg.kind) {
+            .register, .stack_addr => @as(usize, @intCast(frame.data[arg.slot_idx])),
+            .immediate, .constant_addr => @as(usize, @intCast(arg.imm_val)),
+            else => self.resolveVal(frame, arg),
+        };
+    }
+
     fn executeThreadEntry(self: *VM, entry_ptr: usize, arg_ptr: usize) !usize {
         if (self.function_addresses.get(entry_ptr)) |target_func| {
             return try self.executeFunction(target_func, &.{arg_ptr});
@@ -657,14 +665,14 @@ pub const VM = struct {
                         pc += 1;
                     },
                     .ptr_add => {
-                        const ptr_val = self.resolveVal(&frame, inst.args[0]);
-                        const offset_val = self.resolveVal(&frame, inst.args[1]);
+                        const ptr_val = self.resolveScalarVal(&frame, inst.args[0]);
+                        const offset_val = self.resolveScalarVal(&frame, inst.args[1]);
                         if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ptr_val +% offset_val;
                         pc += 1;
                     },
                     .add, .sub, .mul, .div, .rem, .sdiv, .udiv, .srem, .urem, .shl, .shr => {
-                        const arg1 = self.resolveVal(&frame, inst.args[0]);
-                        const arg2 = self.resolveVal(&frame, inst.args[1]);
+                        const arg1 = self.resolveScalarVal(&frame, inst.args[0]);
+                        const arg2 = self.resolveScalarVal(&frame, inst.args[1]);
                         const result: u64 = switch (inst.op) {
                             .add => arg1 +% arg2,
                             .sub => arg1 -% arg2,
@@ -689,8 +697,8 @@ pub const VM = struct {
                         pc += 1;
                     },
                     .and_, .or_, .xor_ => {
-                        const arg1 = self.resolveVal(&frame, inst.args[0]);
-                        const arg2 = self.resolveVal(&frame, inst.args[1]);
+                        const arg1 = self.resolveScalarVal(&frame, inst.args[0]);
+                        const arg2 = self.resolveScalarVal(&frame, inst.args[1]);
                         const result: u64 = switch (inst.op) {
                             .and_ => arg1 & arg2,
                             .or_ => arg1 | arg2,
@@ -860,8 +868,8 @@ pub const VM = struct {
                         pc += 1;
                     },
                     .eq, .ne, .sgt, .ugt, .gt, .slt, .ult, .lt, .sge, .uge, .sle, .ule => {
-                        const v1 = self.resolveVal(&frame, inst.args[0]);
-                        const v2 = self.resolveVal(&frame, inst.args[1]);
+                        const v1 = self.resolveScalarVal(&frame, inst.args[0]);
+                        const v2 = self.resolveScalarVal(&frame, inst.args[1]);
                         const is_true = switch (inst.op) {
                             .eq => v1 == v2,
                             .ne => v1 != v2,
