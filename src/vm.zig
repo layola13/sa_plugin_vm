@@ -5,6 +5,7 @@ const ffi = @import("ffi.zig");
 /// Sentinel value indicating an unresolved register slot.
 const INVALID_SLOT: u32 = std.math.maxInt(u32);
 const CALL_CACHE_MAX_ARGS: usize = 4;
+const CALL_CACHE_MAX_ENTRIES: u32 = 4096;
 
 /// Pre-resolved dispatch target for a .call instruction, computed during the binding pass.
 const ResolvedCall = union(enum) {
@@ -45,6 +46,8 @@ pub const VM = struct {
     function_needs_arena: std.StringHashMap(bool),
     /// Whether an interpreted function is safe to memoize for identical args and memory epoch.
     function_cacheable: std.StringHashMap(bool),
+    /// Whether a cacheable function reads memory and therefore needs epoch-sensitive keys.
+    function_reads_memory: std.StringHashMap(bool),
     /// Pre-resolved call targets per function, parallel to instruction array.
     function_call_targets: std.StringHashMap([]ResolvedCall),
     call_cache: std.AutoHashMap(CallCacheKey, usize),
@@ -58,7 +61,6 @@ pub const VM = struct {
     panic_message: ?[]u8 = null,
     thread_results: std.AutoHashMap(i32, usize),
     next_thread_handle: i32,
-    run_arena: ?std.heap.ArenaAllocator = null,
 
     pub fn init(allocator: std.mem.Allocator, program: *parser.Program, ffi_mgr: *ffi.FfiManager) VM {
         return .{
@@ -73,6 +75,7 @@ pub const VM = struct {
             .function_slot_counts = std.StringHashMap(usize).init(allocator),
             .function_needs_arena = std.StringHashMap(bool).init(allocator),
             .function_cacheable = std.StringHashMap(bool).init(allocator),
+            .function_reads_memory = std.StringHashMap(bool).init(allocator),
             .function_call_targets = std.StringHashMap([]ResolvedCall).init(allocator),
             .call_cache = std.AutoHashMap(CallCacheKey, usize).init(allocator),
             .memory_epoch = 1,
@@ -106,6 +109,7 @@ pub const VM = struct {
         self.function_slot_counts.deinit();
         self.function_needs_arena.deinit();
         self.function_cacheable.deinit();
+        self.function_reads_memory.deinit();
         var ct_it = self.function_call_targets.iterator();
         while (ct_it.next()) |entry| {
             self.allocator.free(entry.value_ptr.*);
@@ -221,11 +225,21 @@ pub const VM = struct {
         return false;
     }
 
+    fn functionReadsMemory(func: *const parser.Function) bool {
+        for (func.instructions) |inst| {
+            switch (inst.op) {
+                .load, .atomic_load, .take, .try_ => return true,
+                else => {},
+            }
+        }
+        return false;
+    }
+
     fn functionHasExternalSideEffect(self: *VM, func: *const parser.Function) bool {
         _ = self;
         for (func.instructions) |inst| {
             switch (inst.op) {
-                .alloc, .atomic_store, .cmpxchg, .atomic_rmw_add, .panic, .panic_msg, .try_ => return true,
+                .alloc, .atomic_store, .cmpxchg, .atomic_rmw_add, .panic, .panic_msg, .take, .try_ => return true,
                 .store => if (!inst.is_local_stack_write) return true,
                 .call => return true,
                 .call_indirect => return true,
@@ -307,6 +321,7 @@ pub const VM = struct {
             }
             try self.function_call_targets.put(func_name, call_targets);
             try self.function_cacheable.put(func_name, !self.functionHasExternalSideEffect(func));
+            try self.function_reads_memory.put(func_name, functionReadsMemory(func));
         }
     }
 
@@ -583,9 +598,13 @@ pub const VM = struct {
 
     fn executeInterpretedCall(self: *VM, target_func: *const parser.Function, args: []const usize) !usize {
         if ((self.function_cacheable.get(target_func.name) orelse false)) {
-            if (makeCallCacheKey(target_func, args, self.memory_epoch)) |key| {
+            const cache_epoch = if (self.function_reads_memory.get(target_func.name) orelse true) self.memory_epoch else 0;
+            if (makeCallCacheKey(target_func, args, cache_epoch)) |key| {
                 if (self.call_cache.get(key)) |cached| return cached;
                 const ret = try self.executeFunction(target_func, args);
+                if (self.call_cache.count() >= CALL_CACHE_MAX_ENTRIES) {
+                    self.call_cache.clearRetainingCapacity();
+                }
                 try self.call_cache.put(key, ret);
                 return ret;
             }
@@ -666,7 +685,7 @@ pub const VM = struct {
         const needs_arena = self.function_needs_arena.get(func.name) orelse true;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer if (needs_arena) arena.deinit();
-        const local_alloc = if (needs_arena) arena.allocator() else self.allocator;
+        var local_alloc = if (needs_arena) arena.allocator() else self.allocator;
 
         var current_args_buf: [16]usize = undefined;
         var current_args_owned = false;
@@ -675,10 +694,10 @@ pub const VM = struct {
             @memcpy(current_args_buf[0..call_args.len], call_args);
             current_args = current_args_buf[0..call_args.len];
         } else {
-            current_args = try local_alloc.dupe(usize, call_args);
+            current_args = try self.allocator.dupe(usize, call_args);
             current_args_owned = true;
         }
-        defer if (current_args_owned and !needs_arena) self.allocator.free(current_args);
+        defer if (current_args_owned) self.allocator.free(current_args);
 
         const slot_count = self.function_slot_counts.get(func.name) orelse (func.params.len + 64);
         var frame = try self.acquireFrame(local_alloc, slot_count, !needs_arena);
@@ -957,6 +976,7 @@ pub const VM = struct {
                         const ptr = @as(*align(1) usize, @ptrFromInt(self.resolveVal(&frame, inst.args[0])));
                         if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ptr.*;
                         ptr.* = 0;
+                        self.bumpMemoryEpoch();
                         pc += 1;
                     },
                     .try_ => {
@@ -1013,7 +1033,14 @@ pub const VM = struct {
             }
 
             if (tail_restart) {
-                if (needs_arena) frame.reset();
+                if (needs_arena) {
+                    frame.deinit();
+                    _ = arena.reset(.retain_capacity);
+                    local_alloc = arena.allocator();
+                    frame = try self.acquireFrame(local_alloc, slot_count, false);
+                } else {
+                    frame.reset();
+                }
                 continue;
             }
             return 0;
