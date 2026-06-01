@@ -109,22 +109,27 @@ pub const FfiManager = struct {
     handles: std.ArrayList(*anyopaque),
     dependencies: [][]u8,
     loaded_dependency_count: usize,
+    global_loaded: bool,
     allow_ffi: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) FfiManager {
-        var handles = std.ArrayList(*anyopaque).init(allocator);
-        // Load the global namespace (the sa binary itself and its dependencies)
-        if (dlopen(null, 2)) |global_handle| {
-            handles.append(global_handle) catch {};
-        }
-
         return .{
             .allocator = allocator,
-            .handles = handles,
+            .handles = std.ArrayList(*anyopaque).init(allocator),
             .dependencies = &.{},
             .loaded_dependency_count = 0,
+            .global_loaded = false,
             .allow_ffi = false,
         };
+    }
+
+    fn ensureGlobalNamespace(self: *FfiManager) void {
+        if (self.global_loaded) return;
+        self.global_loaded = true;
+        // Load the global namespace (the sa binary itself and its dependencies) lazily.
+        if (dlopen(null, 2)) |global_handle| {
+            self.handles.append(global_handle) catch {};
+        }
     }
 
 
@@ -387,6 +392,7 @@ pub const FfiManager = struct {
         const symbol_name_z = self.allocator.dupeZ(u8, symbol_name) catch return null;
         defer self.allocator.free(symbol_name_z);
 
+        self.ensureGlobalNamespace();
         for (self.handles.items) |handle| {
             if (dlsym(handle, symbol_name_z)) |sym| {
                 return sym;
