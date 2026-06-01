@@ -627,7 +627,7 @@ pub const VM = struct {
         const slot_count = self.function_slot_counts.get(func.name) orelse (func.params.len + 64);
         var frame = try Frame.init(local_alloc, slot_count);
         defer frame.deinit();
-        const call_targets = self.function_call_targets.get(func.name);
+        const call_targets = self.function_call_targets.get(func.name) orelse return error.SymbolNotFound;
 
         while (true) {
 
@@ -713,7 +713,7 @@ pub const VM = struct {
                         var args_buf: [16]usize = undefined;
                         var args = try self.collectCallArgs(&frame, inst.args[1..], args_buf[0..]);
                         defer args.deinit(self.allocator);
-                        const call_target = if (call_targets) |ct| ct[pc] else ResolvedCall.unresolved;
+                        const call_target = call_targets[pc];
                         switch (call_target) {
                             .builtin_print => {
                                 const slice = @as([*]const u8, @ptrFromInt(args.items[0]))[0..args.items[1]];
