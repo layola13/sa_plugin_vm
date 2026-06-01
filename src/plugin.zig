@@ -37,6 +37,7 @@ fn cArgvToSlice(argv: []const [*:0]const u8, allocator: std.mem.Allocator) ![]co
 }
 
 fn runVmCommand(allocator: std.mem.Allocator, ctx: *const plugin_api.Context, argv: []const []const u8, stdout: std.io.AnyWriter, stderr: std.io.AnyWriter) anyerror!?u8 {
+    _ = allocator;
     _ = stdout;
     _ = ctx;
     if (argv.len < 2) return null;
@@ -64,7 +65,7 @@ fn runVmCommand(allocator: std.mem.Allocator, ctx: *const plugin_api.Context, ar
         return 1;
     }
 
-    var parser_arena = std.heap.ArenaAllocator.init(allocator);
+    var parser_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer parser_arena.deinit();
     const parse_allocator = parser_arena.allocator();
 
