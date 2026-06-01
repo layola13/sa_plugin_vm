@@ -202,6 +202,10 @@ const TokenCursor = struct {
         self.index += 1;
         return tok;
     }
+
+    fn remaining(self: *TokenCursor) usize {
+        return self.tokens.len - @min(self.index, self.tokens.len);
+    }
 };
 
 fn isInlineExprOp(token: []const u8) bool {
@@ -242,6 +246,33 @@ fn isInlineExprOp(token: []const u8) bool {
         std.mem.eql(u8, token, "take") or
         std.mem.eql(u8, token, "assume_safe") or
         std.mem.eql(u8, token, "assume_borrow");
+}
+
+fn isExprTerminator(token: []const u8) bool {
+    return std.mem.eql(u8, token, "as") or
+        std.mem.eql(u8, token, "into");
+}
+
+fn canStartInlineExpr(token: []const u8, cursor: *TokenCursor) bool {
+    const next = cursor.peek() orelse return false;
+    if (isExprTerminator(next)) return false;
+
+    const min_remaining: usize =
+        if (std.mem.eql(u8, token, "load") or std.mem.eql(u8, token, "atomic_load") or
+            std.mem.eql(u8, token, "raw_cast") or std.mem.eql(u8, token, "bitcast") or
+            std.mem.eql(u8, token, "sext") or std.mem.eql(u8, token, "zext") or
+            std.mem.eql(u8, token, "trunc"))
+            3
+        else if (std.mem.eql(u8, token, "take") or std.mem.eql(u8, token, "assume_safe") or
+            std.mem.eql(u8, token, "assume_borrow") or std.mem.eql(u8, token, "stack_alloc") or
+            std.mem.eql(u8, token, "alloc"))
+            1
+        else if (isInlineExprOp(token))
+            2
+        else
+            return false;
+
+    return cursor.remaining() >= min_remaining;
 }
 
 pub const Parser = struct {
@@ -993,6 +1024,10 @@ pub const Parser = struct {
     fn parseExprOperand(self: *Parser, cursor: *TokenCursor, out: *std.ArrayList(Instruction)) !Operand {
         const tok = cursor.next() orelse return error.EmptyOperand;
 
+        if (!canStartInlineExpr(tok, cursor)) {
+            return try self.parseOperand(tok);
+        }
+
         if (std.mem.eql(u8, tok, "load") or std.mem.eql(u8, tok, "atomic_load")) {
             const addr = try self.parseExprOperand(cursor, out);
             const as_tok = cursor.next() orelse return error.MissingLoadAs;
@@ -1214,6 +1249,11 @@ pub const Parser = struct {
             var args = try self.allocator.alloc(Operand, 1);
             args[0] = Operand{ .kind = .register, .name = try self.allocator.dupe(u8, reg) };
             try out.append(.{ .op = op, .args = args });
+            return;
+        }
+
+        if (std.mem.startsWith(u8, line, "$") and std.mem.endsWith(u8, line, "$")) {
+            // Native escape blocks are preserved as no-op markers in the VM.
             return;
         }
 
