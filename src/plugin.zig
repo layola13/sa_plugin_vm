@@ -93,11 +93,7 @@ fn runVmCommand(allocator: std.mem.Allocator, ctx: *const plugin_api.Context, ar
         return 1;
     };
 
-    var vm_gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = vm_gpa.deinit();
-    const vm_allocator = vm_gpa.allocator();
-
-    var vm_inst = vm.VM.init(vm_allocator, prog, &ffi_mgr);
+    var vm_inst = vm.VM.init(std.heap.c_allocator, prog, &ffi_mgr);
     defer vm_inst.deinit();
     const code = vm_inst.run() catch |err| {
         if (err == error.Panic) {

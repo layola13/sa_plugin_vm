@@ -30,7 +30,7 @@ pub const VM = struct {
     program: *parser.Program,
     allocator: std.mem.Allocator,
     ffi: *ffi.FfiManager,
-    function_addresses: std.AutoHashMap(usize, []const u8),
+    function_addresses: std.AutoHashMap(usize, *const parser.Function),
     function_names: std.StringHashMap(usize),
     function_ptrs: std.StringHashMap(*const parser.Function),
     label_targets: std.StringHashMap(std.StringHashMap(usize)),
@@ -54,7 +54,7 @@ pub const VM = struct {
             .allocator = allocator,
             .program = program,
             .ffi = ffi_mgr,
-            .function_addresses = std.AutoHashMap(usize, []const u8).init(allocator),
+            .function_addresses = std.AutoHashMap(usize, *const parser.Function).init(allocator),
             .function_names = std.StringHashMap(usize).init(allocator),
             .function_ptrs = std.StringHashMap(*const parser.Function).init(allocator),
             .label_targets = std.StringHashMap(std.StringHashMap(usize)).init(allocator),
@@ -291,7 +291,7 @@ pub const VM = struct {
             dummy.* = 0;
             try self.dummy_buffers.append(dummy);
             const addr = @intFromPtr(dummy);
-            try self.function_addresses.put(addr, func_name);
+            try self.function_addresses.put(addr, func_ptr);
             try self.function_names.put(func_name, addr);
 
             var label_map = std.StringHashMap(usize).init(self.allocator);
@@ -388,6 +388,13 @@ pub const VM = struct {
     };
 
     fn collectCallArgs(self: *VM, frame: *Frame, operands: []const parser.Operand, inline_buf: []usize) !CallArgs {
+        if (operands.len <= inline_buf.len) {
+            for (operands, 0..) |arg, idx| {
+                inline_buf[idx] = self.resolveVal(frame, arg);
+            }
+            return .{ .items = inline_buf[0..operands.len] };
+        }
+
         var count: usize = 0;
         var owned: ?[]usize = null;
         var owned_cap: usize = 0;
@@ -468,8 +475,7 @@ pub const VM = struct {
     }
 
     fn executeThreadEntry(self: *VM, entry_ptr: usize, arg_ptr: usize) !usize {
-        if (self.function_addresses.get(entry_ptr)) |name| {
-            const target_func = self.function_ptrs.get(name) orelse return error.SymbolNotFound;
+        if (self.function_addresses.get(entry_ptr)) |target_func| {
             return try self.executeFunction(target_func, &.{arg_ptr});
         }
         return self.ffi.callPointerLegacy(entry_ptr, &.{arg_ptr});
@@ -608,6 +614,7 @@ pub const VM = struct {
         const call_targets = self.function_call_targets.get(func.name);
 
         while (true) {
+
             // Params are at slots 0..N-1 (registered first, in order).
             for (current_args, 0..) |arg_val, i| {
                 frame.data[i] = arg_val;
@@ -619,317 +626,323 @@ pub const VM = struct {
             instr_loop: while (pc < func.instructions.len) {
                 const inst = &func.instructions[pc];
                 switch (inst.op) {
-                .stack_alloc, .alloc => {
-                    const size = self.resolveVal(&frame, inst.args[0]);
-                    const word_count = (size + 7) / 8;
-                    const buf = if (inst.op == .stack_alloc)
-                        try local_alloc.alloc(u64, @max(1, word_count))
-                    else
-                        try self.allocator.alloc(u64, @max(1, word_count));
-                    @memset(std.mem.sliceAsBytes(buf), 0);
-                    if (inst.op == .alloc) {
-                        try self.heap_allocs.append(buf);
-                    }
-                    if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = @intFromPtr(buf.ptr);
-                    pc += 1;
-                },
-                .ptr_add => {
-                    const ptr_val = self.resolveVal(&frame, inst.args[0]);
-                    const offset_val = self.resolveVal(&frame, inst.args[1]);
-                    if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ptr_val +% offset_val;
-                    pc += 1;
-                },
-                .add, .sub, .mul, .div, .rem, .sdiv, .udiv, .srem, .urem, .shl, .shr => {
-                    const arg1 = self.resolveVal(&frame, inst.args[0]);
-                    const arg2 = self.resolveVal(&frame, inst.args[1]);
-                    const result: u64 = switch (inst.op) {
-                        .add => arg1 +% arg2,
-                        .sub => arg1 -% arg2,
-                        .mul => arg1 *% arg2,
-                        .div, .udiv => if (arg2 != 0) arg1 / arg2 else 0,
-                        .sdiv => sdiv: {
-                            const s1 = @as(i64, @bitCast(arg1));
-                            const s2 = @as(i64, @bitCast(arg2));
-                            break :sdiv @as(u64, @bitCast(if (s2 != 0) @divTrunc(s1, s2) else @as(i64, 0)));
-                        },
-                        .srem => srem: {
-                            const s1 = @as(i64, @bitCast(arg1));
-                            const s2 = @as(i64, @bitCast(arg2));
-                            break :srem @as(u64, @bitCast(if (s2 != 0) @rem(s1, s2) else @as(i64, 0)));
-                        },
-                        .urem, .rem => if (arg2 != 0) arg1 % arg2 else 0,
-                        .shl => arg1 << @intCast(arg2 & 63),
-                        .shr => arg1 >> @intCast(arg2 & 63),
-                        else => unreachable,
-                    };
-                    if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = result;
-                    pc += 1;
-                },
-                .and_, .or_, .xor_ => {
-                    const arg1 = self.resolveVal(&frame, inst.args[0]);
-                    const arg2 = self.resolveVal(&frame, inst.args[1]);
-                    const result: u64 = switch (inst.op) {
-                        .and_ => arg1 & arg2,
-                        .or_ => arg1 | arg2,
-                        .xor_ => arg1 ^ arg2,
-                        else => unreachable,
-                    };
-                    if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = result;
-                    pc += 1;
-                },
-                .call => {
-                    // Fast path: pre-computed tail self-call — no arg collection needed.
-                    if (inst.is_tail_call) {
-                        if (inst.args.len - 1 != current_args.len) return error.FfiArityMismatch;
-                        for (inst.args[1..], 0..) |arg, ai| {
-                            current_args[ai] = self.resolveVal(&frame, arg);
+                    .stack_alloc, .alloc => {
+                        const size = self.resolveVal(&frame, inst.args[0]);
+                        const word_count = (size + 7) / 8;
+                        const buf = if (inst.op == .stack_alloc)
+                            try local_alloc.alloc(u64, @max(1, word_count))
+                        else
+                            try self.allocator.alloc(u64, @max(1, word_count));
+                        @memset(std.mem.sliceAsBytes(buf), 0);
+                        if (inst.op == .alloc) {
+                            try self.heap_allocs.append(buf);
                         }
-                        tail_restart = true;
-                        break :instr_loop;
-                    }
-                    var args_buf: [16]usize = undefined;
-                    var args = try self.collectCallArgs(&frame, inst.args[1..], args_buf[0..]);
-                    defer args.deinit(self.allocator);
-                    const call_target = if (call_targets) |ct| ct[pc] else ResolvedCall.unresolved;
-                    switch (call_target) {
-                        .builtin_print => {
-                            const slice = @as([*]const u8, @ptrFromInt(args.items[0]))[0..args.items[1]];
-                            _ = std.posix.write(std.posix.STDOUT_FILENO, slice) catch {};
-                            if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = 0;
-                        },
-                        .builtin_time_ms => {
-                            if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = @as(u64, @bitCast(std.time.milliTimestamp()));
-                        },
-                        .builtin_time_s => {
-                            if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = @as(u64, @bitCast(std.time.timestamp()));
-                        },
-                        .builtin_time_ns => {
-                            const ns = @as(i64, @intCast(std.time.nanoTimestamp()));
-                            if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = @as(u64, @bitCast(ns));
-                        },
-                        .builtin_time_instant_ns => {
-                            if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = @as(u64, @intCast(std.time.nanoTimestamp()));
-                        },
-                        .interpreted => |target_func| {
-                            const ret = try self.executeFunction(target_func, args.items);
+                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = @intFromPtr(buf.ptr);
+                        pc += 1;
+                    },
+                    .ptr_add => {
+                        const ptr_val = self.resolveVal(&frame, inst.args[0]);
+                        const offset_val = self.resolveVal(&frame, inst.args[1]);
+                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ptr_val +% offset_val;
+                        pc += 1;
+                    },
+                    .add, .sub, .mul, .div, .rem, .sdiv, .udiv, .srem, .urem, .shl, .shr => {
+                        const arg1 = self.resolveVal(&frame, inst.args[0]);
+                        const arg2 = self.resolveVal(&frame, inst.args[1]);
+                        const result: u64 = switch (inst.op) {
+                            .add => arg1 +% arg2,
+                            .sub => arg1 -% arg2,
+                            .mul => arg1 *% arg2,
+                            .div, .udiv => if (arg2 != 0) arg1 / arg2 else 0,
+                            .sdiv => sdiv: {
+                                const s1 = @as(i64, @bitCast(arg1));
+                                const s2 = @as(i64, @bitCast(arg2));
+                                break :sdiv @as(u64, @bitCast(if (s2 != 0) @divTrunc(s1, s2) else @as(i64, 0)));
+                            },
+                            .srem => srem: {
+                                const s1 = @as(i64, @bitCast(arg1));
+                                const s2 = @as(i64, @bitCast(arg2));
+                                break :srem @as(u64, @bitCast(if (s2 != 0) @rem(s1, s2) else @as(i64, 0)));
+                            },
+                            .urem, .rem => if (arg2 != 0) arg1 % arg2 else 0,
+                            .shl => arg1 << @intCast(arg2 & 63),
+                            .shr => arg1 >> @intCast(arg2 & 63),
+                            else => unreachable,
+                        };
+                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = result;
+                        pc += 1;
+                    },
+                    .and_, .or_, .xor_ => {
+                        const arg1 = self.resolveVal(&frame, inst.args[0]);
+                        const arg2 = self.resolveVal(&frame, inst.args[1]);
+                        const result: u64 = switch (inst.op) {
+                            .and_ => arg1 & arg2,
+                            .or_ => arg1 | arg2,
+                            .xor_ => arg1 ^ arg2,
+                            else => unreachable,
+                        };
+                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = result;
+                        pc += 1;
+                    },
+                    .call => {
+                        // Fast path: pre-computed tail self-call — no arg collection needed.
+                        if (inst.is_tail_call) {
+                            if (inst.args.len - 1 != current_args.len) return error.FfiArityMismatch;
+                            for (inst.args[1..], 0..) |arg, ai| {
+                                current_args[ai] = self.resolveVal(&frame, arg);
+                            }
+                            tail_restart = true;
+                            break :instr_loop;
+                        }
+                        var args_buf: [16]usize = undefined;
+                        var args = try self.collectCallArgs(&frame, inst.args[1..], args_buf[0..]);
+                        defer args.deinit(self.allocator);
+                        const call_target = if (call_targets) |ct| ct[pc] else ResolvedCall.unresolved;
+                        switch (call_target) {
+                            .builtin_print => {
+                                const slice = @as([*]const u8, @ptrFromInt(args.items[0]))[0..args.items[1]];
+                                _ = std.posix.write(std.posix.STDOUT_FILENO, slice) catch {};
+                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = 0;
+                            },
+                            .builtin_time_ms => {
+                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = @as(u64, @bitCast(std.time.milliTimestamp()));
+                            },
+                            .builtin_time_s => {
+                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = @as(u64, @bitCast(std.time.timestamp()));
+                            },
+                            .builtin_time_ns => {
+                                const ns = @as(i64, @intCast(std.time.nanoTimestamp()));
+                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = @as(u64, @bitCast(ns));
+                            },
+                            .builtin_time_instant_ns => {
+                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = @as(u64, @intCast(std.time.nanoTimestamp()));
+                            },
+                            .interpreted => |target_func| {
+                                const ret = try self.executeFunction(target_func, args.items);
+                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
+                            },
+                            .ffi_typed => |ft| {
+                                const ret = try self.ffi.callSymbolWithPtr(ft.sym, ft.sig, args.items);
+                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
+                            },
+                            .ffi_legacy => |sym| {
+                                const ret = self.ffi.callPointerLegacy(@intFromPtr(sym), args.items);
+                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
+                            },
+                            .pthread_spawn => {
+                                const ret = try self.executePthreadCall("pthread_spawn", args.items);
+                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
+                            },
+                            .pthread_spawn_detached => {
+                                const ret = try self.executePthreadCall("pthread_spawn_detached", args.items);
+                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
+                            },
+                            .pthread_join => {
+                                const ret = try self.executePthreadCall("pthread_join", args.items);
+                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
+                            },
+                            .pthread_drop => {
+                                const ret = try self.executePthreadCall("pthread_drop", args.items);
+                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
+                            },
+                            .fast_linear_search_loop => {
+                                if (args.items.len < 3) return error.FfiArityMismatch;
+                                const ret = fastLinearSearchLoop(args.items[0], args.items[1], args.items[2]);
+                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
+                            },
+                            .fast_search_loop => {
+                                if (args.items.len < 4) return error.FfiArityMismatch;
+                                const ret = fastSearchLoop(args.items[0], args.items[1], args.items[2], args.items[3]);
+                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
+                            },
+                            .fast_binary_search_u64 => {
+                                if (args.items.len < 2) return error.FfiArityMismatch;
+                                const ret = fastBinarySearchU64(args.items[0], args.items[1]);
+                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
+                            },
+                            .fast_search_rec => {
+                                if (args.items.len < 3) return error.FfiArityMismatch;
+                                const ret = fastSearchRec(args.items[0], args.items[1], args.items[2]);
+                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
+                            },
+                            .unresolved => {
+                                const ret = try self.callUnresolved(inst.args[0].name, args.items);
+                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
+                            },
+                        }
+                        pc += 1;
+                    },
+                    .call_indirect => {
+                        const ptr = self.resolveVal(&frame, inst.args[0]);
+                        var args_buf: [16]usize = undefined;
+                        var args = try self.collectCallArgs(&frame, inst.args[1..], args_buf[0..]);
+                        defer args.deinit(self.allocator);
+                        if (self.function_addresses.get(ptr)) |target| {
+                            const ret = try self.executeFunction(target, args.items);
                             if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                        },
-                        .ffi_typed => |ft| {
-                            const ret = try self.ffi.callSymbolWithPtr(ft.sym, ft.sig, args.items);
+                        } else {
+                            const ret = self.ffi.callPointerLegacy(ptr, args.items);
                             if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                        },
-                        .ffi_legacy => |sym| {
-                            const ret = self.ffi.callPointerLegacy(@intFromPtr(sym), args.items);
-                            if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                        },
-                        .pthread_spawn => {
-                            const ret = try self.executePthreadCall("pthread_spawn", args.items);
-                            if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                        },
-                        .pthread_spawn_detached => {
-                            const ret = try self.executePthreadCall("pthread_spawn_detached", args.items);
-                            if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                        },
-                        .pthread_join => {
-                            const ret = try self.executePthreadCall("pthread_join", args.items);
-                            if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                        },
-                        .pthread_drop => {
-                            const ret = try self.executePthreadCall("pthread_drop", args.items);
-                            if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                        },
-                        .fast_linear_search_loop => {
-                            if (args.items.len < 3) return error.FfiArityMismatch;
-                            const ret = fastLinearSearchLoop(args.items[0], args.items[1], args.items[2]);
-                            if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                        },
-                        .fast_search_loop => {
-                            if (args.items.len < 4) return error.FfiArityMismatch;
-                            const ret = fastSearchLoop(args.items[0], args.items[1], args.items[2], args.items[3]);
-                            if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                        },
-                        .fast_binary_search_u64 => {
-                            if (args.items.len < 2) return error.FfiArityMismatch;
-                            const ret = fastBinarySearchU64(args.items[0], args.items[1]);
-                            if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                        },
-                        .fast_search_rec => {
-                            if (args.items.len < 3) return error.FfiArityMismatch;
-                            const ret = fastSearchRec(args.items[0], args.items[1], args.items[2]);
-                            if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                        },
-                        .unresolved => {
-                            const ret = try self.callUnresolved(inst.args[0].name, args.items);
-                            if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                        },
-                    }
-                    pc += 1;
-                },
-                .call_indirect => {
-                    const ptr = self.resolveVal(&frame, inst.args[0]);
-                    var args_buf: [16]usize = undefined;
-                    var args = try self.collectCallArgs(&frame, inst.args[1..], args_buf[0..]);
-                    defer args.deinit(self.allocator);
-                    if (self.function_addresses.get(ptr)) |name| {
-                        const target = self.function_ptrs.get(name) orelse return error.SymbolNotFound;
-                        const ret = try self.executeFunction(target, args.items);
-                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                    } else {
-                        const ret = self.ffi.callPointerLegacy(ptr, args.items);
-                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                    }
-                    pc += 1;
-                },
-                .load, .atomic_load => {
-                    const addr = self.resolveVal(&frame, inst.args[0]);
-                    const val: u64 = switch (inst.dest_type) {
-                        .ptr, .i64, .u64 => @as(*align(1) const u64, @ptrFromInt(addr)).*,
-                        .i32 => @as(u64, @bitCast(@as(i64, @as(*align(1) const i32, @ptrFromInt(addr)).*))),
-                        .u32 => @as(u64, @intCast(@as(*align(1) const u32, @ptrFromInt(addr)).*)),
-                        .i16 => @as(u64, @bitCast(@as(i64, @as(*align(1) const i16, @ptrFromInt(addr)).*))),
-                        .u16 => @as(u64, @intCast(@as(*align(1) const u16, @ptrFromInt(addr)).*)),
-                        .i8 => @as(u64, @bitCast(@as(i64, @as(*align(1) const i8, @ptrFromInt(addr)).*))),
-                        .u8 => @as(u64, @intCast(@as(*align(1) const u8, @ptrFromInt(addr)).*)),
-                        .f64 => @bitCast(@as(*align(1) const f64, @ptrFromInt(addr)).*),
-                        .f32 => @as(u64, @intCast(@as(u32, @bitCast(@as(*align(1) const f32, @ptrFromInt(addr)).*)))),
-                        else => return error.UnsupportedLoadType,
-                    };
-                    if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = val;
-                    pc += 1;
-                },
-                .store, .atomic_store => {
-                    const val = self.resolveVal(&frame, inst.args[0]);
-                    const addr = self.resolveVal(&frame, inst.args[1]);
-                    switch (inst.dest_type) {
-                        .ptr, .i64, .u64 => @as(*align(1) u64, @ptrFromInt(addr)).* = val,
-                        .i32, .u32 => @as(*align(1) u32, @ptrFromInt(addr)).* = @as(u32, @intCast(val & 0xffffffff)),
-                        .i16, .u16 => @as(*align(1) u16, @ptrFromInt(addr)).* = @as(u16, @intCast(val & 0xffff)),
-                        .i8, .u8 => @as(*align(1) u8, @ptrFromInt(addr)).* = @as(u8, @intCast(val & 0xff)),
-                        else => @as(*align(1) u64, @ptrFromInt(addr)).* = val,
-                    }
-                    pc += 1;
-                },
-                .cmpxchg => {
-                    const addr = self.resolveVal(&frame, inst.args[0]);
-                    const expected = self.resolveVal(&frame, inst.args[1]);
-                    const new_val = self.resolveVal(&frame, inst.args[2]);
-                    const old_val: u64 = switch (inst.dest_type) {
-                        .ptr, .i64, .u64 => @cmpxchgStrong(u64, @as(*u64, @ptrFromInt(addr)), expected, new_val, .seq_cst, .seq_cst) orelse expected,
-                        .i32, .u32 => @cmpxchgStrong(u32, @as(*u32, @ptrFromInt(addr)), @as(u32, @intCast(expected & 0xffffffff)), @as(u32, @intCast(new_val & 0xffffffff)), .seq_cst, .seq_cst) orelse @as(u32, @intCast(expected & 0xffffffff)),
-                        .i16, .u16 => @cmpxchgStrong(u16, @as(*u16, @ptrFromInt(addr)), @as(u16, @intCast(expected & 0xffff)), @as(u16, @intCast(new_val & 0xffff)), .seq_cst, .seq_cst) orelse @as(u16, @intCast(expected & 0xffff)),
-                        .i8, .u8 => @cmpxchgStrong(u8, @as(*u8, @ptrFromInt(addr)), @as(u8, @intCast(expected & 0xff)), @as(u8, @intCast(new_val & 0xff)), .seq_cst, .seq_cst) orelse @as(u8, @intCast(expected & 0xff)),
-                        else => return error.UnsupportedCmpxchgType,
-                    };
-                    if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = old_val;
-                    if (inst.dest_slot2 != INVALID_SLOT) frame.data[inst.dest_slot2] = if (old_val == expected) 1 else 0;
-                    pc += 1;
-                },
-                .atomic_rmw_add => {
-                    const addr = self.resolveVal(&frame, inst.args[0]);
-                    const val = self.resolveVal(&frame, inst.args[1]);
-                    const old_val: u64 = switch (inst.dest_type) {
-                        .ptr, .i64, .u64 => @atomicRmw(u64, @as(*u64, @ptrFromInt(addr)), .Add, val, .seq_cst),
-                        .i32, .u32 => @atomicRmw(u32, @as(*u32, @ptrFromInt(addr)), .Add, @as(u32, @intCast(val & 0xffffffff)), .seq_cst),
-                        .i16, .u16 => @atomicRmw(u16, @as(*u16, @ptrFromInt(addr)), .Add, @as(u16, @intCast(val & 0xffff)), .seq_cst),
-                        .i8, .u8 => @atomicRmw(u8, @as(*u8, @ptrFromInt(addr)), .Add, @as(u8, @intCast(val & 0xff)), .seq_cst),
-                        else => return error.UnsupportedAtomicRmwType,
-                    };
-                    if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = old_val;
-                    pc += 1;
-                },
-                .eq, .ne, .sgt, .ugt, .gt, .slt, .ult, .lt, .sge, .uge, .sle, .ule => {
-                    const v1 = self.resolveVal(&frame, inst.args[0]);
-                    const v2 = self.resolveVal(&frame, inst.args[1]);
-                    const is_true = switch (inst.op) {
-                        .eq => v1 == v2, .ne => v1 != v2,
-                        .sgt, .gt => @as(i64, @bitCast(v1)) > @as(i64, @bitCast(v2)), .ugt => v1 > v2,
-                        .slt, .lt => @as(i64, @bitCast(v1)) < @as(i64, @bitCast(v2)), .ult => v1 < v2,
-                        .sge => @as(i64, @bitCast(v1)) >= @as(i64, @bitCast(v2)), .uge => v1 >= v2,
-                        .sle => @as(i64, @bitCast(v1)) <= @as(i64, @bitCast(v2)), .ule => v1 <= v2,
-                        else => unreachable,
-                    };
-                    if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = if (is_true) 1 else 0;
-                    pc += 1;
-                },
-                .br => {
-                    const cond = self.resolveVal(&frame, inst.args[0]);
-                    pc = if (cond != 0) inst.args[1].pc_target else inst.args[2].pc_target;
-                },
-                .jmp => pc = inst.args[0].pc_target,
-                .assign, .assume_safe, .assume_borrow, .raw_cast, .bitcast => {
-                    if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = self.resolveVal(&frame, inst.args[0]);
-                    pc += 1;
-                },
-                .sext => {
-                    const raw = self.resolveVal(&frame, inst.args[0]);
-                    const from_bits: u8 = switch (inst.dest_type) {
-                        .i8, .u8 => 8,
-                        .i16, .u16 => 16,
-                        .i32, .u32 => 32,
-                        else => 64,
-                    };
-                    if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = signExtend(raw, from_bits);
-                    pc += 1;
-                },
-                .zext, .trunc => {
-                    const raw = self.resolveVal(&frame, inst.args[0]);
-                    if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = truncToType(raw, inst.dest_type);
-                    pc += 1;
-                },
-                .take => {
-                    const ptr = @as(*align(1) usize, @ptrFromInt(self.resolveVal(&frame, inst.args[0])));
-                    if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ptr.*;
-                    ptr.* = 0;
-                    pc += 1;
-                },
-                .try_ => {
-                    const addr = self.resolveVal(&frame, inst.args[0]);
-                    const tag = @as(*align(1) const u64, @ptrFromInt(addr)).*;
-                    if (tag != 0) {
+                        }
+                        pc += 1;
+                    },
+                    .load, .atomic_load => {
+                        const addr = self.resolveVal(&frame, inst.args[0]);
+                        const val: u64 = switch (inst.dest_type) {
+                            .ptr, .i64, .u64 => @as(*align(1) const u64, @ptrFromInt(addr)).*,
+                            .i32 => @as(u64, @bitCast(@as(i64, @as(*align(1) const i32, @ptrFromInt(addr)).*))),
+                            .u32 => @as(u64, @intCast(@as(*align(1) const u32, @ptrFromInt(addr)).*)),
+                            .i16 => @as(u64, @bitCast(@as(i64, @as(*align(1) const i16, @ptrFromInt(addr)).*))),
+                            .u16 => @as(u64, @intCast(@as(*align(1) const u16, @ptrFromInt(addr)).*)),
+                            .i8 => @as(u64, @bitCast(@as(i64, @as(*align(1) const i8, @ptrFromInt(addr)).*))),
+                            .u8 => @as(u64, @intCast(@as(*align(1) const u8, @ptrFromInt(addr)).*)),
+                            .f64 => @bitCast(@as(*align(1) const f64, @ptrFromInt(addr)).*),
+                            .f32 => @as(u64, @intCast(@as(u32, @bitCast(@as(*align(1) const f32, @ptrFromInt(addr)).*)))),
+                            else => return error.UnsupportedLoadType,
+                        };
+                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = val;
+                        pc += 1;
+                    },
+                    .store, .atomic_store => {
+                        const val = self.resolveVal(&frame, inst.args[0]);
+                        const addr = self.resolveVal(&frame, inst.args[1]);
+                        switch (inst.dest_type) {
+                            .ptr, .i64, .u64 => @as(*align(1) u64, @ptrFromInt(addr)).* = val,
+                            .i32, .u32 => @as(*align(1) u32, @ptrFromInt(addr)).* = @as(u32, @intCast(val & 0xffffffff)),
+                            .i16, .u16 => @as(*align(1) u16, @ptrFromInt(addr)).* = @as(u16, @intCast(val & 0xffff)),
+                            .i8, .u8 => @as(*align(1) u8, @ptrFromInt(addr)).* = @as(u8, @intCast(val & 0xff)),
+                            else => @as(*align(1) u64, @ptrFromInt(addr)).* = val,
+                        }
+                        pc += 1;
+                    },
+                    .cmpxchg => {
+                        const addr = self.resolveVal(&frame, inst.args[0]);
+                        const expected = self.resolveVal(&frame, inst.args[1]);
+                        const new_val = self.resolveVal(&frame, inst.args[2]);
+                        const old_val: u64 = switch (inst.dest_type) {
+                            .ptr, .i64, .u64 => @cmpxchgStrong(u64, @as(*u64, @ptrFromInt(addr)), expected, new_val, .seq_cst, .seq_cst) orelse expected,
+                            .i32, .u32 => @cmpxchgStrong(u32, @as(*u32, @ptrFromInt(addr)), @as(u32, @intCast(expected & 0xffffffff)), @as(u32, @intCast(new_val & 0xffffffff)), .seq_cst, .seq_cst) orelse @as(u32, @intCast(expected & 0xffffffff)),
+                            .i16, .u16 => @cmpxchgStrong(u16, @as(*u16, @ptrFromInt(addr)), @as(u16, @intCast(expected & 0xffff)), @as(u16, @intCast(new_val & 0xffff)), .seq_cst, .seq_cst) orelse @as(u16, @intCast(expected & 0xffff)),
+                            .i8, .u8 => @cmpxchgStrong(u8, @as(*u8, @ptrFromInt(addr)), @as(u8, @intCast(expected & 0xff)), @as(u8, @intCast(new_val & 0xff)), .seq_cst, .seq_cst) orelse @as(u8, @intCast(expected & 0xff)),
+                            else => return error.UnsupportedCmpxchgType,
+                        };
+                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = old_val;
+                        if (inst.dest_slot2 != INVALID_SLOT) frame.data[inst.dest_slot2] = if (old_val == expected) 1 else 0;
+                        pc += 1;
+                    },
+                    .atomic_rmw_add => {
+                        const addr = self.resolveVal(&frame, inst.args[0]);
+                        const val = self.resolveVal(&frame, inst.args[1]);
+                        const old_val: u64 = switch (inst.dest_type) {
+                            .ptr, .i64, .u64 => @atomicRmw(u64, @as(*u64, @ptrFromInt(addr)), .Add, val, .seq_cst),
+                            .i32, .u32 => @atomicRmw(u32, @as(*u32, @ptrFromInt(addr)), .Add, @as(u32, @intCast(val & 0xffffffff)), .seq_cst),
+                            .i16, .u16 => @atomicRmw(u16, @as(*u16, @ptrFromInt(addr)), .Add, @as(u16, @intCast(val & 0xffff)), .seq_cst),
+                            .i8, .u8 => @atomicRmw(u8, @as(*u8, @ptrFromInt(addr)), .Add, @as(u8, @intCast(val & 0xff)), .seq_cst),
+                            else => return error.UnsupportedAtomicRmwType,
+                        };
+                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = old_val;
+                        pc += 1;
+                    },
+                    .eq, .ne, .sgt, .ugt, .gt, .slt, .ult, .lt, .sge, .uge, .sle, .ule => {
+                        const v1 = self.resolveVal(&frame, inst.args[0]);
+                        const v2 = self.resolveVal(&frame, inst.args[1]);
+                        const is_true = switch (inst.op) {
+                            .eq => v1 == v2,
+                            .ne => v1 != v2,
+                            .sgt, .gt => @as(i64, @bitCast(v1)) > @as(i64, @bitCast(v2)),
+                            .ugt => v1 > v2,
+                            .slt, .lt => @as(i64, @bitCast(v1)) < @as(i64, @bitCast(v2)),
+                            .ult => v1 < v2,
+                            .sge => @as(i64, @bitCast(v1)) >= @as(i64, @bitCast(v2)),
+                            .uge => v1 >= v2,
+                            .sle => @as(i64, @bitCast(v1)) <= @as(i64, @bitCast(v2)),
+                            .ule => v1 <= v2,
+                            else => unreachable,
+                        };
+                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = if (is_true) 1 else 0;
+                        pc += 1;
+                    },
+                    .br => {
+                        const cond = self.resolveVal(&frame, inst.args[0]);
+                        pc = if (cond != 0) inst.args[1].pc_target else inst.args[2].pc_target;
+                    },
+                    .jmp => pc = inst.args[0].pc_target,
+                    .assign, .assume_safe, .assume_borrow, .raw_cast, .bitcast => {
+                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = self.resolveVal(&frame, inst.args[0]);
+                        pc += 1;
+                    },
+                    .sext => {
+                        const raw = self.resolveVal(&frame, inst.args[0]);
+                        const from_bits: u8 = switch (inst.dest_type) {
+                            .i8, .u8 => 8,
+                            .i16, .u16 => 16,
+                            .i32, .u32 => 32,
+                            else => 64,
+                        };
+                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = signExtend(raw, from_bits);
+                        pc += 1;
+                    },
+                    .zext, .trunc => {
+                        const raw = self.resolveVal(&frame, inst.args[0]);
+                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = truncToType(raw, inst.dest_type);
+                        pc += 1;
+                    },
+                    .take => {
+                        const ptr = @as(*align(1) usize, @ptrFromInt(self.resolveVal(&frame, inst.args[0])));
+                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ptr.*;
+                        ptr.* = 0;
+                        pc += 1;
+                    },
+                    .try_ => {
+                        const addr = self.resolveVal(&frame, inst.args[0]);
+                        const tag = @as(*align(1) const u64, @ptrFromInt(addr)).*;
+                        if (tag != 0) {
+                            _ = self.freeTrackedResultAlloc(addr);
+                            return tag;
+                        }
+                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = @as(*align(1) const u64, @ptrFromInt(addr + 8)).*;
                         _ = self.freeTrackedResultAlloc(addr);
-                        return tag;
-                    }
-                    if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = @as(*align(1) const u64, @ptrFromInt(addr + 8)).*;
-                    _ = self.freeTrackedResultAlloc(addr);
-                    pc += 1;
-                },
-                .panic => {
-                    const panic_code = @as(u8, @truncate(self.resolveVal(&frame, inst.args[0])));
-                    self.clearPanicState();
-                    self.panic_code = panic_code;
-                    return error.Panic;
-                },
-                .panic_msg => {
-                    const panic_code = @as(u8, @truncate(self.resolveVal(&frame, inst.args[0])));
-                    const msg_ptr = self.resolveVal(&frame, inst.args[1]);
-                    const msg_len = @as(usize, @intCast(self.resolveVal(&frame, inst.args[2])));
-                    self.clearPanicState();
-                    self.panic_code = panic_code;
-                    if (msg_ptr != 0 and msg_len != 0) {
-                        const src = @as([*]const u8, @ptrFromInt(msg_ptr))[0..msg_len];
-                        const buf = try self.allocator.alloc(u8, msg_len);
-                        @memcpy(buf, src);
-                        self.panic_message = buf;
-                    }
-                    return error.Panic;
-                },
-                .consume => {
-                    const ptr = self.resolveVal(&frame, inst.args[0]);
-                    _ = self.freeTrackedResultAlloc(ptr);
-                    pc += 1;
-                },
-                .return_ => {
-                    const ret = if (inst.args.len > 0) self.resolveVal(&frame, inst.args[0]) else 0;
-                    if (func.returns_result and !std.mem.eql(u8, func.name, "main")) {
-                        const buf = try self.allocator.alloc(u64, 3);
-                        errdefer self.allocator.free(buf);
-                        buf[0] = 0; buf[1] = ret; buf[2] = 0;
-                        try self.result_allocs.append(buf);
-                        try self.result_alloc_index.put(@intFromPtr(buf.ptr), self.result_allocs.items.len - 1);
-                        return @intFromPtr(buf.ptr);
-                    }
-                    return ret;
-                },
+                        pc += 1;
+                    },
+                    .panic => {
+                        const panic_code = @as(u8, @truncate(self.resolveVal(&frame, inst.args[0])));
+                        self.clearPanicState();
+                        self.panic_code = panic_code;
+                        return error.Panic;
+                    },
+                    .panic_msg => {
+                        const panic_code = @as(u8, @truncate(self.resolveVal(&frame, inst.args[0])));
+                        const msg_ptr = self.resolveVal(&frame, inst.args[1]);
+                        const msg_len = @as(usize, @intCast(self.resolveVal(&frame, inst.args[2])));
+                        self.clearPanicState();
+                        self.panic_code = panic_code;
+                        if (msg_ptr != 0 and msg_len != 0) {
+                            const src = @as([*]const u8, @ptrFromInt(msg_ptr))[0..msg_len];
+                            const buf = try self.allocator.alloc(u8, msg_len);
+                            @memcpy(buf, src);
+                            self.panic_message = buf;
+                        }
+                        return error.Panic;
+                    },
+                    .consume => {
+                        const ptr = self.resolveVal(&frame, inst.args[0]);
+                        _ = self.freeTrackedResultAlloc(ptr);
+                        pc += 1;
+                    },
+                    .return_ => {
+                        const ret = if (inst.args.len > 0) self.resolveVal(&frame, inst.args[0]) else 0;
+                        if (func.returns_result and !std.mem.eql(u8, func.name, "main")) {
+                            const buf = try self.allocator.alloc(u64, 3);
+                            errdefer self.allocator.free(buf);
+                            buf[0] = 0;
+                            buf[1] = ret;
+                            buf[2] = 0;
+                            try self.result_allocs.append(buf);
+                            try self.result_alloc_index.put(@intFromPtr(buf.ptr), self.result_allocs.items.len - 1);
+                            return @intFromPtr(buf.ptr);
+                        }
+                        return ret;
+                    },
                 }
             }
 
@@ -940,5 +953,4 @@ pub const VM = struct {
             return 0;
         }
     }
-
 };
