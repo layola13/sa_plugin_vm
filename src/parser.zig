@@ -1317,12 +1317,13 @@ pub const Parser = struct {
                 }
             } else if (std.mem.eql(u8, first_token, "atomic_store")) {
                 op = .atomic_store;
-                try args_list.append(try self.parseExprOperand(&cursor, out));
+                const ptr = try self.parseExprOperand(&cursor, out);
                 try args_list.append(try self.parseExprOperand(&cursor, out));
                 const as_token = cursor.next() orelse return error.InvalidStoreSyntax;
                 if (!std.mem.eql(u8, as_token, "as")) return error.InvalidStoreSyntax;
                 const type_str = cursor.next() orelse return error.InvalidStoreSyntax;
                 dest_type = parseType(type_str);
+                try args_list.append(ptr);
             } else if (std.mem.eql(u8, first_token, "cmpxchg")) {
                 op = .cmpxchg;
                 try args_list.append(try self.parseExprOperand(&cursor, out));
@@ -1367,7 +1368,7 @@ pub const Parser = struct {
                 op = .assume_borrow;
                 try args_list.append(try self.parseExprOperand(&cursor, out));
             } else {
-                op = if (std.mem.eql(u8, first_token, "ptr_add")) .ptr_add else if (std.mem.eql(u8, first_token, "add")) .add else if (std.mem.eql(u8, first_token, "sub")) .sub else if (std.mem.eql(u8, first_token, "mul")) .mul else if (std.mem.eql(u8, first_token, "div")) .div else if (std.mem.eql(u8, first_token, "rem")) .rem else if (std.mem.eql(u8, first_token, "and")) .and_ else if (std.mem.eql(u8, first_token, "or")) .or_ else if (std.mem.eql(u8, first_token, "xor")) .xor_ else if (std.mem.eql(u8, first_token, "sgt")) .sgt else if (std.mem.eql(u8, first_token, "slt")) .slt else if (std.mem.eql(u8, first_token, "sge")) .sge else if (std.mem.eql(u8, first_token, "sle")) .sle else if (std.mem.eql(u8, first_token, "ugt")) .ugt else if (std.mem.eql(u8, first_token, "ult")) .ult else if (std.mem.eql(u8, first_token, "uge")) .uge else if (std.mem.eql(u8, first_token, "ule")) .ule else if (std.mem.eql(u8, first_token, "eq")) .eq else if (std.mem.eql(u8, first_token, "ne")) .ne else if (std.mem.eql(u8, first_token, "sdiv")) .sdiv else if (std.mem.eql(u8, first_token, "udiv")) .udiv else if (std.mem.eql(u8, first_token, "srem")) .srem else .urem;
+                op = if (std.mem.eql(u8, first_token, "ptr_add")) .ptr_add else if (std.mem.eql(u8, first_token, "add")) .add else if (std.mem.eql(u8, first_token, "sub")) .sub else if (std.mem.eql(u8, first_token, "mul")) .mul else if (std.mem.eql(u8, first_token, "div")) .div else if (std.mem.eql(u8, first_token, "rem")) .rem else if (std.mem.eql(u8, first_token, "and")) .and_ else if (std.mem.eql(u8, first_token, "or")) .or_ else if (std.mem.eql(u8, first_token, "xor")) .xor_ else if (std.mem.eql(u8, first_token, "sdiv")) .sdiv else if (std.mem.eql(u8, first_token, "udiv")) .udiv else if (std.mem.eql(u8, first_token, "srem")) .srem else if (std.mem.eql(u8, first_token, "urem")) .urem else if (std.mem.eql(u8, first_token, "shl")) .shl else if (std.mem.eql(u8, first_token, "shr")) .shr else if (std.mem.eql(u8, first_token, "gt")) .gt else if (std.mem.eql(u8, first_token, "lt")) .lt else if (std.mem.eql(u8, first_token, "sgt")) .sgt else if (std.mem.eql(u8, first_token, "slt")) .slt else if (std.mem.eql(u8, first_token, "sge")) .sge else if (std.mem.eql(u8, first_token, "sle")) .sle else if (std.mem.eql(u8, first_token, "ugt")) .ugt else if (std.mem.eql(u8, first_token, "ult")) .ult else if (std.mem.eql(u8, first_token, "uge")) .uge else if (std.mem.eql(u8, first_token, "ule")) .ule else if (std.mem.eql(u8, first_token, "eq")) .eq else .ne;
                 try args_list.append(try self.parseExprOperand(&cursor, out));
                 try args_list.append(try self.parseExprOperand(&cursor, out));
             }

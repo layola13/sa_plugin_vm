@@ -59,10 +59,9 @@ pub export fn munmap(ptr: ?*anyopaque, len: usize) callconv(.c) i32 {
     _ = len;
     return 0;
 }
-pub export fn signal(sig: i32, handler: ?*anyopaque) callconv(.c) ?*anyopaque {
-    _ = sig;
+pub export fn signal(sig: i32, handler: ?*anyopaque) callconv(.c) i32 {
     _ = handler;
-    return null;
+    return sig;
 }
 pub export fn pthread_spawn(func: ?*anyopaque, arg: ?*anyopaque) callconv(.c) i32 {
     _ = func;
