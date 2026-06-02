@@ -273,13 +273,13 @@ fn canStartInlineExpr(token: []const u8, cursor: *TokenCursor) bool {
 
     const min_remaining: usize =
         if (std.mem.eql(u8, token, "load") or std.mem.eql(u8, token, "atomic_load") or
-            std.mem.eql(u8, token, "raw_cast") or std.mem.eql(u8, token, "bitcast") or
-            std.mem.eql(u8, token, "sext") or std.mem.eql(u8, token, "zext") or
-            std.mem.eql(u8, token, "trunc"))
+        std.mem.eql(u8, token, "raw_cast") or std.mem.eql(u8, token, "bitcast") or
+        std.mem.eql(u8, token, "sext") or std.mem.eql(u8, token, "zext") or
+        std.mem.eql(u8, token, "trunc"))
             3
         else if (std.mem.eql(u8, token, "take") or std.mem.eql(u8, token, "assume_safe") or
-            std.mem.eql(u8, token, "assume_borrow") or std.mem.eql(u8, token, "stack_alloc") or
-            std.mem.eql(u8, token, "alloc"))
+        std.mem.eql(u8, token, "assume_borrow") or std.mem.eql(u8, token, "stack_alloc") or
+        std.mem.eql(u8, token, "alloc"))
             1
         else if (isInlineExprOp(token))
             2
@@ -524,20 +524,32 @@ pub const Parser = struct {
             if (std.mem.startsWith(u8, line, "[MACRO]")) {
                 const parts_str = line["[MACRO]".len..];
                 var token_it = std.mem.tokenizeAny(u8, parts_str, " \t,");
-                const macro_name_raw = token_it.next() orelse { idx += 1; continue; };
+                const macro_name_raw = token_it.next() orelse {
+                    idx += 1;
+                    continue;
+                };
                 // Skip if already registered
-                if (self.macros.contains(macro_name_raw)) { idx += 1; continue; }
+                if (self.macros.contains(macro_name_raw)) {
+                    idx += 1;
+                    continue;
+                }
                 const macro_name = try self.allocator.dupe(u8, macro_name_raw);
                 errdefer self.allocator.free(macro_name);
 
                 var params = std.ArrayList([]const u8).init(self.allocator);
-                errdefer { for (params.items) |p| self.allocator.free(p); params.deinit(); }
+                errdefer {
+                    for (params.items) |p| self.allocator.free(p);
+                    params.deinit();
+                }
                 while (token_it.next()) |param| {
                     try params.append(try self.allocator.dupe(u8, param));
                 }
 
                 var body = std.ArrayList([]const u8).init(self.allocator);
-                errdefer { for (body.items) |b| self.allocator.free(b); body.deinit(); }
+                errdefer {
+                    for (body.items) |b| self.allocator.free(b);
+                    body.deinit();
+                }
 
                 idx += 1;
                 while (idx < raw_lines.len) {
@@ -554,7 +566,10 @@ pub const Parser = struct {
                 try self.macros.put(macro_name, m);
                 idx += 1;
             } else if (std.mem.startsWith(u8, line, "#def")) {
-                const eq_idx = std.mem.indexOf(u8, line, "=") orelse { idx += 1; continue; };
+                const eq_idx = std.mem.indexOf(u8, line, "=") orelse {
+                    idx += 1;
+                    continue;
+                };
                 const name_raw = std.mem.trim(u8, line["#def".len..eq_idx], " \t");
                 const val_raw = std.mem.trim(u8, line[eq_idx + 1 ..], " \t");
                 if (!self.def_macros.contains(name_raw)) {
@@ -668,7 +683,7 @@ pub const Parser = struct {
                 const parts_str = line["EXPAND".len..];
                 var token_it = std.mem.tokenizeAny(u8, parts_str, " \t,");
                 const macro_name = token_it.next() orelse return error.InvalidMacroExpansion;
-                
+
                 var args = std.ArrayList([]const u8).init(self.allocator);
                 defer {
                     for (args.items) |a| self.allocator.free(a);
@@ -808,7 +823,7 @@ pub const Parser = struct {
                         // 2. Replace %i with current step index
                         var index_buf: [32]u8 = undefined;
                         const index_str = try std.fmt.bufPrint(&index_buf, "{d}", .{step});
-                        
+
                         const temp_line = try self.replaceSubstring(expanded_line, "%i", index_str);
                         self.allocator.free(expanded_line);
                         expanded_line = temp_line;
@@ -859,7 +874,7 @@ pub const Parser = struct {
         if (std.mem.startsWith(u8, raw, "utf8:\"")) {
             const quote_end = std.mem.lastIndexOf(u8, raw, "\"") orelse return error.InvalidStringLiteral;
             const content = raw["utf8:\"".len..quote_end];
-            
+
             var result = std.ArrayList(u8).init(self.allocator);
             errdefer result.deinit();
 
@@ -867,12 +882,30 @@ pub const Parser = struct {
             while (i < content.len) {
                 if (content[i] == '\\' and i + 1 < content.len) {
                     switch (content[i + 1]) {
-                        'n' => { try result.append('\n'); i += 2; },
-                        't' => { try result.append('\t'); i += 2; },
-                        'r' => { try result.append('\r'); i += 2; },
-                        '0' => { try result.append(0); i += 2; },
-                        '\\' => { try result.append('\\'); i += 2; },
-                        '"' => { try result.append('"'); i += 2; },
+                        'n' => {
+                            try result.append('\n');
+                            i += 2;
+                        },
+                        't' => {
+                            try result.append('\t');
+                            i += 2;
+                        },
+                        'r' => {
+                            try result.append('\r');
+                            i += 2;
+                        },
+                        '0' => {
+                            try result.append(0);
+                            i += 2;
+                        },
+                        '\\' => {
+                            try result.append('\\');
+                            i += 2;
+                        },
+                        '"' => {
+                            try result.append('"');
+                            i += 2;
+                        },
                         'x' => {
                             if (i + 3 < content.len) {
                                 const hex = content[i + 2 .. i + 4];
@@ -887,7 +920,7 @@ pub const Parser = struct {
                         else => {
                             try result.append(content[i]);
                             i += 1;
-                        }
+                        },
                     }
                 } else {
                     try result.append(content[i]);
@@ -930,7 +963,7 @@ pub const Parser = struct {
 
             var search = raw;
             while (std.mem.indexOf(u8, search, "hex:")) |hex_pos| {
-                search = search[hex_pos + "hex:".len..];
+                search = search[hex_pos + "hex:".len ..];
                 // Parse \xNN sequences until non-hex-escape
                 var i: usize = 0;
                 while (i + 1 < search.len and search[i] == '\\' and search[i + 1] == 'x') {
@@ -1048,7 +1081,7 @@ pub const Parser = struct {
             if (!std.mem.eql(u8, as_tok, "as")) return error.MissingLoadAs;
             const type_str = cursor.next() orelse return error.MissingLoadType;
             const op = if (std.mem.eql(u8, tok, "atomic_load")) OpCode.atomic_load else OpCode.load;
-            return try self.emitTempInstruction(out, op, &.{ addr }, parseType(type_str));
+            return try self.emitTempInstruction(out, op, &.{addr}, parseType(type_str));
         }
 
         if (std.mem.eql(u8, tok, "raw_cast") or std.mem.eql(u8, tok, "bitcast") or std.mem.eql(u8, tok, "sext") or std.mem.eql(u8, tok, "zext") or std.mem.eql(u8, tok, "trunc")) {
@@ -1057,28 +1090,28 @@ pub const Parser = struct {
             if (!std.mem.eql(u8, as_tok, "as")) return error.MissingCastAs;
             const type_str = cursor.next() orelse return error.MissingCastType;
             const op = if (std.mem.eql(u8, tok, "bitcast")) OpCode.bitcast else if (std.mem.eql(u8, tok, "sext")) OpCode.sext else if (std.mem.eql(u8, tok, "zext")) OpCode.zext else if (std.mem.eql(u8, tok, "trunc")) OpCode.trunc else OpCode.raw_cast;
-            return try self.emitTempInstruction(out, op, &.{ arg }, parseType(type_str));
+            return try self.emitTempInstruction(out, op, &.{arg}, parseType(type_str));
         }
 
         if (std.mem.eql(u8, tok, "take")) {
             const arg = try self.parseExprOperand(cursor, out);
-            return try self.emitTempInstruction(out, .take, &.{ arg }, .void);
+            return try self.emitTempInstruction(out, .take, &.{arg}, .void);
         }
 
         if (std.mem.eql(u8, tok, "assume_safe")) {
             const arg = try self.parseExprOperand(cursor, out);
-            return try self.emitTempInstruction(out, .assume_safe, &.{ arg }, .void);
+            return try self.emitTempInstruction(out, .assume_safe, &.{arg}, .void);
         }
 
         if (std.mem.eql(u8, tok, "assume_borrow")) {
             const arg = try self.parseExprOperand(cursor, out);
-            return try self.emitTempInstruction(out, .assume_borrow, &.{ arg }, .void);
+            return try self.emitTempInstruction(out, .assume_borrow, &.{arg}, .void);
         }
 
         if (std.mem.eql(u8, tok, "stack_alloc") or std.mem.eql(u8, tok, "alloc")) {
             const size = try self.parseExprOperand(cursor, out);
             const op = if (std.mem.eql(u8, tok, "stack_alloc")) OpCode.stack_alloc else OpCode.alloc;
-            return try self.emitTempInstruction(out, op, &.{ size }, .void);
+            return try self.emitTempInstruction(out, op, &.{size}, .void);
         }
 
         if (isInlineExprOp(tok)) {
@@ -1135,6 +1168,9 @@ pub const Parser = struct {
                 idx += 1;
             } else if (std.mem.startsWith(u8, line, "@") and std.mem.indexOf(u8, line, "(") != null and std.mem.indexOf(u8, line, ")") != null and std.mem.endsWith(u8, line, ":")) {
                 if (current_func_name) |func_name| {
+                    if (current_blocks.items.len > 0) {
+                        current_blocks.items[current_blocks.items.len - 1].end_inst = current_instructions.items.len;
+                    }
                     const func = Function{
                         .name = func_name,
                         .params = current_func_params,
@@ -1203,6 +1239,13 @@ pub const Parser = struct {
             } else {
                 // Instruction line
                 if (current_func_name != null) {
+                    if (current_blocks.items.len == 0) {
+                        try current_blocks.append(.{
+                            .label = try self.allocator.dupe(u8, "__implicit_entry"),
+                            .start_inst = current_instructions.items.len,
+                            .end_inst = 0,
+                        });
+                    }
                     if (try self.tryAddInlineUtf8Constant(line, &prog.constants)) {
                         idx += 1;
                         continue;
@@ -1394,7 +1437,7 @@ pub const Parser = struct {
             op = .call;
             const lparen = std.mem.indexOf(u8, args_raw, "(") orelse return error.InvalidCallSyntax;
             const rparen = std.mem.lastIndexOf(u8, args_raw, ")") orelse return error.InvalidCallSyntax;
-            
+
             const call_idx = std.mem.indexOf(u8, args_raw, "call") orelse return error.InvalidCallSyntax;
             var func_name_raw = std.mem.trim(u8, args_raw[call_idx + "call".len .. lparen], " \t");
             if (std.mem.startsWith(u8, func_name_raw, "@")) {
@@ -1413,7 +1456,7 @@ pub const Parser = struct {
             op = .call_indirect;
             const lparen = std.mem.indexOf(u8, args_raw, "(") orelse return error.InvalidCallSyntax;
             const rparen = std.mem.lastIndexOf(u8, args_raw, ")") orelse return error.InvalidCallSyntax;
-            
+
             const call_idx = std.mem.indexOf(u8, args_raw, "call_indirect") orelse return error.InvalidCallSyntax;
             const func_ptr_str = std.mem.trim(u8, args_raw[call_idx + "call_indirect".len .. lparen], " \t");
             try args_list.append(try self.parseOperand(func_ptr_str));

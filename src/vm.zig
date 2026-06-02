@@ -39,6 +39,124 @@ const CallCacheKey = struct {
     args: [CALL_CACHE_MAX_ARGS]usize,
 };
 
+const BYTECODE_PAYLOAD_MAX: u32 = 0x00ff_ffff;
+const BYTE_SLOT_NONE: u8 = 0xff;
+
+const ByteOp = enum(u8) {
+    nop,
+    slow,
+    assign_rr,
+    load_const,
+    add_rr,
+    add_rc,
+    sub_rr,
+    sub_rc,
+    mul_rr,
+    mul_rc,
+    udiv_rr,
+    udiv_rc,
+    ptr_add_rr,
+    ptr_add_rc,
+    and_rr,
+    or_rr,
+    xor_rr,
+    eq_rr,
+    eq_rc,
+    ne_rr,
+    ne_rc,
+    ugt_rr,
+    ugt_rc,
+    ult_rr,
+    ult_rc,
+    uge_rr,
+    uge_rc,
+    ule_rr,
+    ule_rc,
+    sgt_rr,
+    sgt_rc,
+    slt_rr,
+    slt_rc,
+    sge_rr,
+    sge_rc,
+    sle_rr,
+    sle_rc,
+    load_u64_off8,
+    store_u64_reg_off8,
+    store_u64_const_off8,
+    store_u64_local_reg_off8,
+    store_u64_local_const_off8,
+    call,
+    call_indirect,
+    consume_reg,
+    take_off8,
+    try_reg,
+};
+
+const CompiledOperandKind = enum(u8) {
+    immediate,
+    register,
+    offset_addr,
+};
+
+const CompiledOperand = struct {
+    kind: CompiledOperandKind = .immediate,
+    slot: u32 = INVALID_SLOT,
+    imm: u64 = 0,
+    offset: i32 = 0,
+};
+
+const CallMetadata = struct {
+    inst_pc: usize,
+    dest_slot: u32,
+    target: ResolvedCall,
+    is_tail_call: bool,
+    args: []CompiledOperand,
+};
+
+const IndirectCallMetadata = struct {
+    inst_pc: usize,
+    dest_slot: u32,
+    fn_ptr: CompiledOperand,
+    args: []CompiledOperand,
+};
+
+const BlockTermKind = enum(u8) {
+    end,
+    fallthrough,
+    br,
+    jmp,
+    return_,
+};
+
+const CompiledBlock = struct {
+    start: usize,
+    end: usize,
+    term_kind: BlockTermKind = .end,
+    cond: CompiledOperand = .{},
+    ret: CompiledOperand = .{},
+    true_block: usize = 0,
+    false_block: usize = 0,
+    term_pc: usize = 0,
+};
+
+const CompiledFunction = struct {
+    func: *const parser.Function,
+    code: []u32,
+    blocks: []CompiledBlock,
+    constants: []u64,
+    slow_inst_pcs: []usize,
+    calls: []CallMetadata,
+    indirect_calls: []IndirectCallMetadata,
+    slot_count: usize,
+    needs_arena: bool,
+};
+
+const StepResult = union(enum) {
+    next,
+    tail_restart,
+    returned: usize,
+};
+
 pub const VM = struct {
     program: *parser.Program,
     allocator: std.mem.Allocator,
@@ -58,6 +176,8 @@ pub const VM = struct {
     function_reads_memory: std.StringHashMap(bool),
     /// Pre-resolved call targets per function, parallel to instruction array.
     function_call_targets: std.StringHashMap([]ResolvedCall),
+    /// Compiled u32 bytecode and side tables per function.
+    compiled_functions: std.StringHashMap(CompiledFunction),
     call_cache: std.AutoHashMap(CallCacheKey, usize),
     memory_epoch: u64,
     frame_pool: std.ArrayList([]u64),
@@ -85,6 +205,7 @@ pub const VM = struct {
             .function_cacheable = std.StringHashMap(bool).init(allocator),
             .function_reads_memory = std.StringHashMap(bool).init(allocator),
             .function_call_targets = std.StringHashMap([]ResolvedCall).init(allocator),
+            .compiled_functions = std.StringHashMap(CompiledFunction).init(allocator),
             .call_cache = std.AutoHashMap(CallCacheKey, usize).init(allocator),
             .memory_epoch = 1,
             .frame_pool = std.ArrayList([]u64).init(allocator),
@@ -123,6 +244,11 @@ pub const VM = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.function_call_targets.deinit();
+        var cf_it = self.compiled_functions.iterator();
+        while (cf_it.next()) |entry| {
+            self.freeCompiledFunction(entry.value_ptr);
+        }
+        self.compiled_functions.deinit();
         self.call_cache.deinit();
         for (self.frame_pool.items) |buf| {
             self.allocator.free(buf);
@@ -150,6 +276,28 @@ pub const VM = struct {
         }
         self.panic_message = null;
         self.panic_code = null;
+    }
+
+    fn freeCompiledFunction(self: *VM, compiled: *CompiledFunction) void {
+        self.allocator.free(compiled.code);
+        self.allocator.free(compiled.blocks);
+        self.allocator.free(compiled.constants);
+        self.allocator.free(compiled.slow_inst_pcs);
+        for (compiled.calls) |meta| self.allocator.free(meta.args);
+        self.allocator.free(compiled.calls);
+        for (compiled.indirect_calls) |meta| self.allocator.free(meta.args);
+        self.allocator.free(compiled.indirect_calls);
+        compiled.* = .{
+            .func = compiled.func,
+            .code = &.{},
+            .blocks = &.{},
+            .constants = &.{},
+            .slow_inst_pcs = &.{},
+            .calls = &.{},
+            .indirect_calls = &.{},
+            .slot_count = 0,
+            .needs_arena = false,
+        };
     }
 
     pub fn run(self: *VM) !i32 {
@@ -597,6 +745,351 @@ pub const VM = struct {
         return new_call_targets;
     }
 
+    fn blockIndexForPc(func: *const parser.Function, pc: usize) ?usize {
+        for (func.blocks, 0..) |block, idx| {
+            if (pc == block.start_inst) return idx;
+        }
+        if (pc >= func.instructions.len) return func.blocks.len;
+        for (func.blocks, 0..) |block, idx| {
+            if (pc >= block.start_inst and pc < block.end_inst) return idx;
+        }
+        return null;
+    }
+
+    fn slotByte(slot: u32) ?u8 {
+        if (slot == INVALID_SLOT or slot >= BYTE_SLOT_NONE) return null;
+        return @as(u8, @intCast(slot));
+    }
+
+    fn offsetByte(offset: i32) ?u8 {
+        if (offset < std.math.minInt(i8) or offset > std.math.maxInt(i8)) return null;
+        return @as(u8, @bitCast(@as(i8, @intCast(offset))));
+    }
+
+    fn packABC(op: ByteOp, a: u8, b: u8, c: u8) u32 {
+        return @as(u32, @intFromEnum(op)) |
+            (@as(u32, a) << 8) |
+            (@as(u32, b) << 16) |
+            (@as(u32, c) << 24);
+    }
+
+    fn packA16(op: ByteOp, a: u8, imm16: u16) u32 {
+        return @as(u32, @intFromEnum(op)) |
+            (@as(u32, a) << 8) |
+            (@as(u32, imm16) << 16);
+    }
+
+    fn packPayload(op: ByteOp, payload: u32) !u32 {
+        if (payload > BYTECODE_PAYLOAD_MAX) return error.BytecodeIndexTooLarge;
+        return @as(u32, @intFromEnum(op)) | (payload << 8);
+    }
+
+    fn rawOp(raw: u32) ByteOp {
+        return @as(ByteOp, @enumFromInt(@as(u8, @truncate(raw))));
+    }
+
+    fn rawA(raw: u32) u8 {
+        return @as(u8, @truncate(raw >> 8));
+    }
+
+    fn rawB(raw: u32) u8 {
+        return @as(u8, @truncate(raw >> 16));
+    }
+
+    fn rawC(raw: u32) u8 {
+        return @as(u8, @truncate(raw >> 24));
+    }
+
+    fn rawPayload(raw: u32) usize {
+        return @as(usize, @intCast(raw >> 8));
+    }
+
+    fn compiledOperand(arg: parser.Operand) CompiledOperand {
+        return switch (arg.kind) {
+            .immediate, .constant_addr => .{ .kind = .immediate, .imm = arg.imm_val },
+            .register, .stack_addr => .{ .kind = .register, .slot = arg.slot_idx },
+            .offset_addr => .{ .kind = .offset_addr, .slot = arg.slot_idx, .offset = arg.offset },
+            .label => .{ .kind = .immediate, .imm = arg.pc_target },
+        };
+    }
+
+    fn addConstant(constants: *std.ArrayList(u64), value: u64) !u32 {
+        const idx = constants.items.len;
+        if (idx > std.math.maxInt(u32)) return error.BytecodeIndexTooLarge;
+        try constants.append(value);
+        return @as(u32, @intCast(idx));
+    }
+
+    fn appendSlow(code: *std.ArrayList(u32), slow_inst_pcs: *std.ArrayList(usize), inst_pc: usize) !void {
+        const idx = slow_inst_pcs.items.len;
+        if (idx > BYTECODE_PAYLOAD_MAX) return error.BytecodeIndexTooLarge;
+        try slow_inst_pcs.append(inst_pc);
+        try code.append(try packPayload(.slow, @as(u32, @intCast(idx))));
+    }
+
+    fn addrBaseOffset8(arg: parser.Operand) ?struct { base: u8, offset: u8 } {
+        return switch (arg.kind) {
+            .register, .stack_addr => blk: {
+                const base = slotByte(arg.slot_idx) orelse break :blk null;
+                break :blk .{ .base = base, .offset = @as(u8, @bitCast(@as(i8, 0))) };
+            },
+            .offset_addr => blk: {
+                const base = slotByte(arg.slot_idx) orelse break :blk null;
+                const off = offsetByte(arg.offset) orelse break :blk null;
+                break :blk .{ .base = base, .offset = off };
+            },
+            else => null,
+        };
+    }
+
+    fn appendBinary(
+        code: *std.ArrayList(u32),
+        constants: *std.ArrayList(u64),
+        slow_inst_pcs: *std.ArrayList(usize),
+        inst: *const parser.Instruction,
+        inst_pc: usize,
+        rr_op: ByteOp,
+        rc_op: ByteOp,
+    ) !void {
+        const dest = slotByte(inst.dest_slot) orelse return appendSlow(code, slow_inst_pcs, inst_pc);
+        if (inst.args.len < 2) return appendSlow(code, slow_inst_pcs, inst_pc);
+        const lhs = slotByte(inst.args[0].slot_idx) orelse return appendSlow(code, slow_inst_pcs, inst_pc);
+        switch (inst.args[1].kind) {
+            .register, .stack_addr => {
+                const rhs = slotByte(inst.args[1].slot_idx) orelse return appendSlow(code, slow_inst_pcs, inst_pc);
+                try code.append(packABC(rr_op, dest, lhs, rhs));
+            },
+            .immediate, .constant_addr => {
+                if (rc_op == rr_op) return appendSlow(code, slow_inst_pcs, inst_pc);
+                const const_idx = try addConstant(constants, inst.args[1].imm_val);
+                if (const_idx > std.math.maxInt(u8)) return appendSlow(code, slow_inst_pcs, inst_pc);
+                try code.append(packABC(rc_op, dest, lhs, @as(u8, @intCast(const_idx))));
+            },
+            else => return appendSlow(code, slow_inst_pcs, inst_pc),
+        }
+    }
+
+    fn appendCall(
+        self: *VM,
+        code: *std.ArrayList(u32),
+        calls: *std.ArrayList(CallMetadata),
+        inst: *const parser.Instruction,
+        inst_pc: usize,
+        target: ResolvedCall,
+    ) !void {
+        if (inst.args.len == 0) return error.SymbolNotFound;
+        const arg_count = inst.args.len - 1;
+        const args = try self.allocator.alloc(CompiledOperand, arg_count);
+        errdefer self.allocator.free(args);
+        for (inst.args[1..], 0..) |arg, idx| args[idx] = compiledOperand(arg);
+        const idx = calls.items.len;
+        if (idx > BYTECODE_PAYLOAD_MAX) return error.BytecodeIndexTooLarge;
+        try calls.append(.{
+            .inst_pc = inst_pc,
+            .dest_slot = inst.dest_slot,
+            .target = target,
+            .is_tail_call = inst.is_tail_call,
+            .args = args,
+        });
+        try code.append(try packPayload(.call, @as(u32, @intCast(idx))));
+    }
+
+    fn appendIndirectCall(
+        self: *VM,
+        code: *std.ArrayList(u32),
+        indirect_calls: *std.ArrayList(IndirectCallMetadata),
+        inst: *const parser.Instruction,
+        inst_pc: usize,
+    ) !void {
+        if (inst.args.len == 0) return error.SymbolNotFound;
+        const arg_count = inst.args.len - 1;
+        const args = try self.allocator.alloc(CompiledOperand, arg_count);
+        errdefer self.allocator.free(args);
+        for (inst.args[1..], 0..) |arg, idx| args[idx] = compiledOperand(arg);
+        const idx = indirect_calls.items.len;
+        if (idx > BYTECODE_PAYLOAD_MAX) return error.BytecodeIndexTooLarge;
+        try indirect_calls.append(.{
+            .inst_pc = inst_pc,
+            .dest_slot = inst.dest_slot,
+            .fn_ptr = compiledOperand(inst.args[0]),
+            .args = args,
+        });
+        try code.append(try packPayload(.call_indirect, @as(u32, @intCast(idx))));
+    }
+
+    fn compileInstruction(
+        self: *VM,
+        code: *std.ArrayList(u32),
+        constants: *std.ArrayList(u64),
+        slow_inst_pcs: *std.ArrayList(usize),
+        calls: *std.ArrayList(CallMetadata),
+        indirect_calls: *std.ArrayList(IndirectCallMetadata),
+        inst: *const parser.Instruction,
+        inst_pc: usize,
+        call_target: ResolvedCall,
+    ) !void {
+        switch (inst.op) {
+            .assign, .assume_safe, .assume_borrow, .raw_cast, .bitcast => {
+                const dest = slotByte(inst.dest_slot) orelse return;
+                if (inst.src_slot != INVALID_SLOT) {
+                    const src = slotByte(inst.src_slot) orelse return appendSlow(code, slow_inst_pcs, inst_pc);
+                    try code.append(packABC(.assign_rr, dest, src, 0));
+                } else if (inst.args.len > 0 and (inst.args[0].kind == .immediate or inst.args[0].kind == .constant_addr)) {
+                    const const_idx = try addConstant(constants, inst.args[0].imm_val);
+                    if (const_idx > std.math.maxInt(u16)) return appendSlow(code, slow_inst_pcs, inst_pc);
+                    try code.append(packA16(.load_const, dest, @as(u16, @intCast(const_idx))));
+                } else {
+                    return appendSlow(code, slow_inst_pcs, inst_pc);
+                }
+            },
+            .add => try appendBinary(code, constants, slow_inst_pcs, inst, inst_pc, .add_rr, .add_rc),
+            .sub => try appendBinary(code, constants, slow_inst_pcs, inst, inst_pc, .sub_rr, .sub_rc),
+            .mul => try appendBinary(code, constants, slow_inst_pcs, inst, inst_pc, .mul_rr, .mul_rc),
+            .div, .udiv => try appendBinary(code, constants, slow_inst_pcs, inst, inst_pc, .udiv_rr, .udiv_rc),
+            .ptr_add => try appendBinary(code, constants, slow_inst_pcs, inst, inst_pc, .ptr_add_rr, .ptr_add_rc),
+            .and_ => try appendBinary(code, constants, slow_inst_pcs, inst, inst_pc, .and_rr, .and_rr),
+            .or_ => try appendBinary(code, constants, slow_inst_pcs, inst, inst_pc, .or_rr, .or_rr),
+            .xor_ => try appendBinary(code, constants, slow_inst_pcs, inst, inst_pc, .xor_rr, .xor_rr),
+            .eq => try appendBinary(code, constants, slow_inst_pcs, inst, inst_pc, .eq_rr, .eq_rc),
+            .ne => try appendBinary(code, constants, slow_inst_pcs, inst, inst_pc, .ne_rr, .ne_rc),
+            .ugt => try appendBinary(code, constants, slow_inst_pcs, inst, inst_pc, .ugt_rr, .ugt_rc),
+            .ult => try appendBinary(code, constants, slow_inst_pcs, inst, inst_pc, .ult_rr, .ult_rc),
+            .uge => try appendBinary(code, constants, slow_inst_pcs, inst, inst_pc, .uge_rr, .uge_rc),
+            .ule => try appendBinary(code, constants, slow_inst_pcs, inst, inst_pc, .ule_rr, .ule_rc),
+            .sgt, .gt => try appendBinary(code, constants, slow_inst_pcs, inst, inst_pc, .sgt_rr, .sgt_rc),
+            .slt, .lt => try appendBinary(code, constants, slow_inst_pcs, inst, inst_pc, .slt_rr, .slt_rc),
+            .sge => try appendBinary(code, constants, slow_inst_pcs, inst, inst_pc, .sge_rr, .sge_rc),
+            .sle => try appendBinary(code, constants, slow_inst_pcs, inst, inst_pc, .sle_rr, .sle_rc),
+            .load => {
+                const dest = slotByte(inst.dest_slot) orelse return appendSlow(code, slow_inst_pcs, inst_pc);
+                if (inst.args.len < 1) return appendSlow(code, slow_inst_pcs, inst_pc);
+                const addr = addrBaseOffset8(inst.args[0]) orelse return appendSlow(code, slow_inst_pcs, inst_pc);
+                switch (inst.dest_type) {
+                    .ptr, .i64, .u64 => try code.append(packABC(.load_u64_off8, dest, addr.base, addr.offset)),
+                    else => return appendSlow(code, slow_inst_pcs, inst_pc),
+                }
+            },
+            .store => {
+                if (inst.args.len < 2) return appendSlow(code, slow_inst_pcs, inst_pc);
+                const addr = addrBaseOffset8(inst.args[1]) orelse return appendSlow(code, slow_inst_pcs, inst_pc);
+                switch (inst.dest_type) {
+                    .ptr, .i64, .u64 => switch (inst.args[0].kind) {
+                        .register, .stack_addr => {
+                            const val = slotByte(inst.args[0].slot_idx) orelse return appendSlow(code, slow_inst_pcs, inst_pc);
+                            const op: ByteOp = if (inst.is_local_stack_write) .store_u64_local_reg_off8 else .store_u64_reg_off8;
+                            try code.append(packABC(op, val, addr.base, addr.offset));
+                        },
+                        .immediate, .constant_addr => {
+                            const const_idx = try addConstant(constants, inst.args[0].imm_val);
+                            if (const_idx > std.math.maxInt(u8)) return appendSlow(code, slow_inst_pcs, inst_pc);
+                            const op: ByteOp = if (inst.is_local_stack_write) .store_u64_local_const_off8 else .store_u64_const_off8;
+                            try code.append(packABC(op, @as(u8, @intCast(const_idx)), addr.base, addr.offset));
+                        },
+                        else => return appendSlow(code, slow_inst_pcs, inst_pc),
+                    },
+                    else => return appendSlow(code, slow_inst_pcs, inst_pc),
+                }
+            },
+            .call => try self.appendCall(code, calls, inst, inst_pc, call_target),
+            .call_indirect => try self.appendIndirectCall(code, indirect_calls, inst, inst_pc),
+            .consume => {
+                if (inst.args.len < 1) return;
+                const slot = slotByte(inst.args[0].slot_idx) orelse return appendSlow(code, slow_inst_pcs, inst_pc);
+                try code.append(packABC(.consume_reg, slot, 0, 0));
+            },
+            .take => {
+                const dest = slotByte(inst.dest_slot) orelse return appendSlow(code, slow_inst_pcs, inst_pc);
+                if (inst.args.len < 1) return appendSlow(code, slow_inst_pcs, inst_pc);
+                const addr = addrBaseOffset8(inst.args[0]) orelse return appendSlow(code, slow_inst_pcs, inst_pc);
+                try code.append(packABC(.take_off8, dest, addr.base, addr.offset));
+            },
+            .try_ => {
+                const dest = slotByte(inst.dest_slot) orelse BYTE_SLOT_NONE;
+                if (inst.args.len < 1) return appendSlow(code, slow_inst_pcs, inst_pc);
+                const slot = slotByte(inst.args[0].slot_idx) orelse return appendSlow(code, slow_inst_pcs, inst_pc);
+                try code.append(packABC(.try_reg, dest, slot, 0));
+            },
+            .br, .jmp, .return_ => {},
+            else => try appendSlow(code, slow_inst_pcs, inst_pc),
+        }
+    }
+
+    fn compileFunction(self: *VM, func: *const parser.Function, call_targets: []const ResolvedCall, slot_count: usize, needs_arena: bool) !CompiledFunction {
+        var code = std.ArrayList(u32).init(self.allocator);
+        errdefer code.deinit();
+        var blocks = std.ArrayList(CompiledBlock).init(self.allocator);
+        errdefer blocks.deinit();
+        var constants = std.ArrayList(u64).init(self.allocator);
+        errdefer constants.deinit();
+        var slow_inst_pcs = std.ArrayList(usize).init(self.allocator);
+        errdefer slow_inst_pcs.deinit();
+        var calls = std.ArrayList(CallMetadata).init(self.allocator);
+        errdefer {
+            for (calls.items) |meta| self.allocator.free(meta.args);
+            calls.deinit();
+        }
+        var indirect_calls = std.ArrayList(IndirectCallMetadata).init(self.allocator);
+        errdefer {
+            for (indirect_calls.items) |meta| self.allocator.free(meta.args);
+            indirect_calls.deinit();
+        }
+
+        for (func.blocks, 0..) |block, block_idx| {
+            var term = CompiledBlock{ .start = code.items.len, .end = code.items.len };
+            var body_end = block.end_inst;
+            if (block.start_inst < block.end_inst) {
+                const term_pc = block.end_inst - 1;
+                const term_inst = func.instructions[term_pc];
+                switch (term_inst.op) {
+                    .br => if (term_inst.args.len >= 3) {
+                        body_end = term_pc;
+                        term.term_kind = .br;
+                        term.term_pc = term_pc;
+                        term.cond = compiledOperand(term_inst.args[0]);
+                        term.true_block = blockIndexForPc(func, term_inst.args[1].pc_target) orelse return error.LabelNotFound;
+                        term.false_block = blockIndexForPc(func, term_inst.args[2].pc_target) orelse return error.LabelNotFound;
+                    },
+                    .jmp => if (term_inst.args.len >= 1) {
+                        body_end = term_pc;
+                        term.term_kind = .jmp;
+                        term.term_pc = term_pc;
+                        term.true_block = blockIndexForPc(func, term_inst.args[0].pc_target) orelse return error.LabelNotFound;
+                    },
+                    .return_ => {
+                        body_end = term_pc;
+                        term.term_kind = .return_;
+                        term.term_pc = term_pc;
+                        if (term_inst.args.len > 0) term.ret = compiledOperand(term_inst.args[0]);
+                    },
+                    else => {},
+                }
+            }
+
+            var pc = block.start_inst;
+            while (pc < body_end) : (pc += 1) {
+                try self.compileInstruction(&code, &constants, &slow_inst_pcs, &calls, &indirect_calls, &func.instructions[pc], pc, call_targets[pc]);
+            }
+            term.end = code.items.len;
+            if (term.term_kind == .end and block_idx + 1 < func.blocks.len) {
+                term.term_kind = .fallthrough;
+                term.true_block = block_idx + 1;
+            }
+            try blocks.append(term);
+        }
+
+        return .{
+            .func = func,
+            .code = try code.toOwnedSlice(),
+            .blocks = try blocks.toOwnedSlice(),
+            .constants = try constants.toOwnedSlice(),
+            .slow_inst_pcs = try slow_inst_pcs.toOwnedSlice(),
+            .calls = try calls.toOwnedSlice(),
+            .indirect_calls = try indirect_calls.toOwnedSlice(),
+            .slot_count = slot_count,
+            .needs_arena = needs_arena,
+        };
+    }
+
     fn refreshQuickenedSourceSlots(func: *parser.Function) void {
         for (func.instructions) |*inst| {
             inst.src_slot = INVALID_SLOT;
@@ -705,7 +1198,10 @@ pub const VM = struct {
             refreshQuickenedSourceSlots(func);
             try self.elideDeadPureInstructions(func, reg_map.count());
             call_targets = try self.compactNoOpInstructions(func, call_targets);
+            const needs_arena = functionHasOp(func, .stack_alloc);
+            const compiled = try self.compileFunction(func, call_targets, reg_map.count(), needs_arena);
             try self.function_call_targets.put(func_name, call_targets);
+            try self.compiled_functions.put(func_name, compiled);
             try self.function_cacheable.put(func_name, !self.functionHasExternalSideEffect(func));
             try self.function_reads_memory.put(func_name, functionReadsMemory(func));
         }
@@ -1067,8 +1563,436 @@ pub const VM = struct {
         };
     }
 
+    fn finishReturn(self: *VM, func: *const parser.Function, ret: usize) !usize {
+        if (func.returns_result and !std.mem.eql(u8, func.name, "main")) {
+            const buf = try self.allocator.alloc(u64, 3);
+            errdefer self.allocator.free(buf);
+            buf[0] = 0;
+            buf[1] = ret;
+            buf[2] = 0;
+            try self.result_allocs.append(buf);
+            try self.result_alloc_index.put(@intFromPtr(buf.ptr), self.result_allocs.items.len - 1);
+            return @intFromPtr(buf.ptr);
+        }
+        return ret;
+    }
+
+    fn executeReturn(self: *VM, func: *const parser.Function, frame: *Frame, inst: *const parser.Instruction) !usize {
+        const ret = if (inst.args.len > 0) self.resolveVal(frame, inst.args[0]) else 0;
+        return self.finishReturn(func, ret);
+    }
+
+    inline fn resolveCompiledVal(self: *VM, frame: *Frame, arg: CompiledOperand) usize {
+        _ = self;
+        return switch (arg.kind) {
+            .immediate => @as(usize, @intCast(arg.imm)),
+            .register => @as(usize, @intCast(frame.data[arg.slot])),
+            .offset_addr => blk: {
+                const base = @as(usize, @intCast(frame.data[arg.slot]));
+                const offset_bits: usize = @bitCast(@as(isize, arg.offset));
+                break :blk base +% offset_bits;
+            },
+        };
+    }
+
+    inline fn addrFromOff8(frame: *Frame, base_slot: u8, off8: u8) usize {
+        const base = @as(usize, @intCast(frame.data[base_slot]));
+        const signed = @as(i8, @bitCast(off8));
+        const offset_bits: usize = @bitCast(@as(isize, signed));
+        return base +% offset_bits;
+    }
+
+    fn collectCompiledCallArgs(self: *VM, frame: *Frame, operands: []const CompiledOperand, inline_buf: []usize) !CallArgs {
+        if (operands.len <= inline_buf.len) {
+            for (operands, 0..) |arg, idx| inline_buf[idx] = self.resolveCompiledVal(frame, arg);
+            return .{ .items = inline_buf[0..operands.len] };
+        }
+        const owned = try self.allocator.alloc(usize, operands.len);
+        for (operands, 0..) |arg, idx| owned[idx] = self.resolveCompiledVal(frame, arg);
+        return .{ .items = owned, .owned = owned };
+    }
+
+    fn executeCompiledCall(self: *VM, func: *const parser.Function, frame: *Frame, meta: *const CallMetadata, current_args: []usize) !StepResult {
+        if (meta.is_tail_call) {
+            if (meta.args.len != current_args.len) return error.FfiArityMismatch;
+            for (meta.args, 0..) |arg, ai| current_args[ai] = self.resolveCompiledVal(frame, arg);
+            return .tail_restart;
+        }
+
+        var args_buf: [16]usize = undefined;
+        var args = try self.collectCompiledCallArgs(frame, meta.args, args_buf[0..]);
+        defer args.deinit(self.allocator);
+
+        const ret = switch (meta.target) {
+            .builtin_print => blk: {
+                const slice = @as([*]const u8, @ptrFromInt(args.items[0]))[0..args.items[1]];
+                _ = std.posix.write(std.posix.STDOUT_FILENO, slice) catch {};
+                break :blk @as(usize, 0);
+            },
+            .builtin_time_ms => @as(usize, @intCast(@as(u64, @bitCast(std.time.milliTimestamp())))),
+            .builtin_time_s => @as(usize, @intCast(@as(u64, @bitCast(std.time.timestamp())))),
+            .builtin_time_ns => blk: {
+                const ns = @as(i64, @intCast(std.time.nanoTimestamp()));
+                break :blk @as(usize, @intCast(@as(u64, @bitCast(ns))));
+            },
+            .builtin_time_instant_ns => @as(usize, @intCast(std.time.nanoTimestamp())),
+            .interpreted => |target_func| try self.executeInterpretedCall(target_func, args.items),
+            .ffi_typed => |ft| blk: {
+                const out = try self.ffi.callSymbolWithPtr(ft.sym, ft.sig, args.items);
+                self.bumpMemoryEpoch();
+                break :blk out;
+            },
+            .ffi_legacy => |sym| blk: {
+                const out = self.ffi.callPointerLegacy(@intFromPtr(sym), args.items);
+                self.bumpMemoryEpoch();
+                break :blk out;
+            },
+            .pthread_spawn => blk: {
+                const out = try self.executePthreadCall("pthread_spawn", args.items);
+                self.bumpMemoryEpoch();
+                break :blk out;
+            },
+            .pthread_spawn_detached => blk: {
+                const out = try self.executePthreadCall("pthread_spawn_detached", args.items);
+                self.bumpMemoryEpoch();
+                break :blk out;
+            },
+            .pthread_join => blk: {
+                const out = try self.executePthreadCall("pthread_join", args.items);
+                self.bumpMemoryEpoch();
+                break :blk out;
+            },
+            .pthread_drop => blk: {
+                const out = try self.executePthreadCall("pthread_drop", args.items);
+                self.bumpMemoryEpoch();
+                break :blk out;
+            },
+            .unresolved => blk: {
+                const inst = func.instructions[meta.inst_pc];
+                const out = try self.callUnresolved(inst.args[0].name, args.items);
+                self.bumpMemoryEpoch();
+                break :blk out;
+            },
+        };
+
+        if (meta.dest_slot != INVALID_SLOT) frame.data[meta.dest_slot] = @as(u64, @intCast(ret));
+        return .next;
+    }
+
+    fn executeCompiledIndirectCall(self: *VM, frame: *Frame, meta: *const IndirectCallMetadata) !StepResult {
+        const ptr = self.resolveCompiledVal(frame, meta.fn_ptr);
+        var args_buf: [16]usize = undefined;
+        var args = try self.collectCompiledCallArgs(frame, meta.args, args_buf[0..]);
+        defer args.deinit(self.allocator);
+
+        const ret = if (self.function_addresses.get(ptr)) |target|
+            try self.executeInterpretedCall(target, args.items)
+        else blk: {
+            const out = self.ffi.callPointerLegacy(ptr, args.items);
+            self.bumpMemoryEpoch();
+            break :blk out;
+        };
+        if (meta.dest_slot != INVALID_SLOT) frame.data[meta.dest_slot] = @as(u64, @intCast(ret));
+        return .next;
+    }
+
+    fn executeSlowInstruction(
+        self: *VM,
+        func: *const parser.Function,
+        frame: *Frame,
+        inst_pc: usize,
+        local_alloc: std.mem.Allocator,
+        current_args: []usize,
+        call_targets: []const ResolvedCall,
+    ) anyerror!StepResult {
+        const inst = &func.instructions[inst_pc];
+        switch (inst.op) {
+            .stack_alloc, .alloc => {
+                const size = self.resolveVal(frame, inst.args[0]);
+                const word_count = (size + 7) / 8;
+                const buf = if (inst.op == .stack_alloc)
+                    try local_alloc.alloc(u64, @max(1, word_count))
+                else
+                    try self.allocator.alloc(u64, @max(1, word_count));
+                @memset(std.mem.sliceAsBytes(buf), 0);
+                if (inst.op == .alloc) {
+                    try self.heap_allocs.append(buf);
+                    self.bumpMemoryEpoch();
+                }
+                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = @intFromPtr(buf.ptr);
+                return .next;
+            },
+            .ptr_add => {
+                const ptr_val = self.resolveScalarVal(frame, inst.args[0]);
+                const offset_val = self.resolveScalarVal(frame, inst.args[1]);
+                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ptr_val +% offset_val;
+                return .next;
+            },
+            .add, .sub, .mul, .div, .rem, .sdiv, .udiv, .srem, .urem, .shl, .shr => {
+                const arg1 = self.resolveScalarVal(frame, inst.args[0]);
+                const arg2 = self.resolveScalarVal(frame, inst.args[1]);
+                const result: u64 = switch (inst.op) {
+                    .add => arg1 +% arg2,
+                    .sub => arg1 -% arg2,
+                    .mul => arg1 *% arg2,
+                    .div, .udiv => if (arg2 != 0) arg1 / arg2 else 0,
+                    .sdiv => sdiv: {
+                        const s1 = @as(i64, @bitCast(arg1));
+                        const s2 = @as(i64, @bitCast(arg2));
+                        break :sdiv @as(u64, @bitCast(if (s2 != 0) @divTrunc(s1, s2) else @as(i64, 0)));
+                    },
+                    .srem => srem: {
+                        const s1 = @as(i64, @bitCast(arg1));
+                        const s2 = @as(i64, @bitCast(arg2));
+                        break :srem @as(u64, @bitCast(if (s2 != 0) @rem(s1, s2) else @as(i64, 0)));
+                    },
+                    .urem, .rem => if (arg2 != 0) arg1 % arg2 else 0,
+                    .shl => arg1 << @intCast(arg2 & 63),
+                    .shr => arg1 >> @intCast(arg2 & 63),
+                    else => unreachable,
+                };
+                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = result;
+                return .next;
+            },
+            .and_, .or_, .xor_ => {
+                const arg1 = self.resolveScalarVal(frame, inst.args[0]);
+                const arg2 = self.resolveScalarVal(frame, inst.args[1]);
+                const result: u64 = switch (inst.op) {
+                    .and_ => arg1 & arg2,
+                    .or_ => arg1 | arg2,
+                    .xor_ => arg1 ^ arg2,
+                    else => unreachable,
+                };
+                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = result;
+                return .next;
+            },
+            .call => {
+                if (inst.is_tail_call) {
+                    if (inst.args.len - 1 != current_args.len) return error.FfiArityMismatch;
+                    for (inst.args[1..], 0..) |arg, ai| current_args[ai] = self.resolveScalarVal(frame, arg);
+                    return .tail_restart;
+                }
+                var args_buf: [16]usize = undefined;
+                var args = try self.collectCallArgs(frame, inst.args[1..], args_buf[0..]);
+                defer args.deinit(self.allocator);
+                const ret = switch (call_targets[inst_pc]) {
+                    .builtin_print => blk: {
+                        const slice = @as([*]const u8, @ptrFromInt(args.items[0]))[0..args.items[1]];
+                        _ = std.posix.write(std.posix.STDOUT_FILENO, slice) catch {};
+                        break :blk @as(usize, 0);
+                    },
+                    .builtin_time_ms => @as(usize, @intCast(@as(u64, @bitCast(std.time.milliTimestamp())))),
+                    .builtin_time_s => @as(usize, @intCast(@as(u64, @bitCast(std.time.timestamp())))),
+                    .builtin_time_ns => blk: {
+                        const ns = @as(i64, @intCast(std.time.nanoTimestamp()));
+                        break :blk @as(usize, @intCast(@as(u64, @bitCast(ns))));
+                    },
+                    .builtin_time_instant_ns => @as(usize, @intCast(std.time.nanoTimestamp())),
+                    .interpreted => |target_func| try self.executeInterpretedCall(target_func, args.items),
+                    .ffi_typed => |ft| blk: {
+                        const out = try self.ffi.callSymbolWithPtr(ft.sym, ft.sig, args.items);
+                        self.bumpMemoryEpoch();
+                        break :blk out;
+                    },
+                    .ffi_legacy => |sym| blk: {
+                        const out = self.ffi.callPointerLegacy(@intFromPtr(sym), args.items);
+                        self.bumpMemoryEpoch();
+                        break :blk out;
+                    },
+                    .pthread_spawn => blk: {
+                        const out = try self.executePthreadCall("pthread_spawn", args.items);
+                        self.bumpMemoryEpoch();
+                        break :blk out;
+                    },
+                    .pthread_spawn_detached => blk: {
+                        const out = try self.executePthreadCall("pthread_spawn_detached", args.items);
+                        self.bumpMemoryEpoch();
+                        break :blk out;
+                    },
+                    .pthread_join => blk: {
+                        const out = try self.executePthreadCall("pthread_join", args.items);
+                        self.bumpMemoryEpoch();
+                        break :blk out;
+                    },
+                    .pthread_drop => blk: {
+                        const out = try self.executePthreadCall("pthread_drop", args.items);
+                        self.bumpMemoryEpoch();
+                        break :blk out;
+                    },
+                    .unresolved => blk: {
+                        const out = try self.callUnresolved(inst.args[0].name, args.items);
+                        self.bumpMemoryEpoch();
+                        break :blk out;
+                    },
+                };
+                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = @as(u64, @intCast(ret));
+                return .next;
+            },
+            .call_indirect => {
+                const ptr = self.resolveAddrVal(frame, inst.args[0]);
+                var args_buf: [16]usize = undefined;
+                var args = try self.collectCallArgs(frame, inst.args[1..], args_buf[0..]);
+                defer args.deinit(self.allocator);
+                const ret = if (self.function_addresses.get(ptr)) |target|
+                    try self.executeInterpretedCall(target, args.items)
+                else blk: {
+                    const out = self.ffi.callPointerLegacy(ptr, args.items);
+                    self.bumpMemoryEpoch();
+                    break :blk out;
+                };
+                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = @as(u64, @intCast(ret));
+                return .next;
+            },
+            .load, .atomic_load => {
+                const addr = self.resolveAddrVal(frame, inst.args[0]);
+                const val: u64 = switch (inst.dest_type) {
+                    .ptr, .i64, .u64 => @as(*align(1) const u64, @ptrFromInt(addr)).*,
+                    .i32 => @as(u64, @bitCast(@as(i64, @as(*align(1) const i32, @ptrFromInt(addr)).*))),
+                    .u32 => @as(u64, @intCast(@as(*align(1) const u32, @ptrFromInt(addr)).*)),
+                    .i16 => @as(u64, @bitCast(@as(i64, @as(*align(1) const i16, @ptrFromInt(addr)).*))),
+                    .u16 => @as(u64, @intCast(@as(*align(1) const u16, @ptrFromInt(addr)).*)),
+                    .i8 => @as(u64, @bitCast(@as(i64, @as(*align(1) const i8, @ptrFromInt(addr)).*))),
+                    .u8 => @as(u64, @intCast(@as(*align(1) const u8, @ptrFromInt(addr)).*)),
+                    .f64 => @bitCast(@as(*align(1) const f64, @ptrFromInt(addr)).*),
+                    .f32 => @as(u64, @intCast(@as(u32, @bitCast(@as(*align(1) const f32, @ptrFromInt(addr)).*)))),
+                    else => return error.UnsupportedLoadType,
+                };
+                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = val;
+                return .next;
+            },
+            .store, .atomic_store => {
+                const val = self.resolveScalarVal(frame, inst.args[0]);
+                const addr = self.resolveAddrVal(frame, inst.args[1]);
+                switch (inst.dest_type) {
+                    .ptr, .i64, .u64 => @as(*align(1) u64, @ptrFromInt(addr)).* = val,
+                    .i32, .u32 => @as(*align(1) u32, @ptrFromInt(addr)).* = @as(u32, @intCast(val & 0xffffffff)),
+                    .i16, .u16 => @as(*align(1) u16, @ptrFromInt(addr)).* = @as(u16, @intCast(val & 0xffff)),
+                    .i8, .u8 => @as(*align(1) u8, @ptrFromInt(addr)).* = @as(u8, @intCast(val & 0xff)),
+                    else => @as(*align(1) u64, @ptrFromInt(addr)).* = val,
+                }
+                if (!inst.is_local_stack_write) self.bumpMemoryEpoch();
+                return .next;
+            },
+            .cmpxchg => {
+                const addr = self.resolveAddrVal(frame, inst.args[0]);
+                const expected = self.resolveScalarVal(frame, inst.args[1]);
+                const new_val = self.resolveScalarVal(frame, inst.args[2]);
+                const old_val: u64 = switch (inst.dest_type) {
+                    .ptr, .i64, .u64 => @cmpxchgStrong(u64, @as(*u64, @ptrFromInt(addr)), expected, new_val, .seq_cst, .seq_cst) orelse expected,
+                    .i32, .u32 => @cmpxchgStrong(u32, @as(*u32, @ptrFromInt(addr)), @as(u32, @intCast(expected & 0xffffffff)), @as(u32, @intCast(new_val & 0xffffffff)), .seq_cst, .seq_cst) orelse @as(u32, @intCast(expected & 0xffffffff)),
+                    .i16, .u16 => @cmpxchgStrong(u16, @as(*u16, @ptrFromInt(addr)), @as(u16, @intCast(expected & 0xffff)), @as(u16, @intCast(new_val & 0xffff)), .seq_cst, .seq_cst) orelse @as(u16, @intCast(expected & 0xffff)),
+                    .i8, .u8 => @cmpxchgStrong(u8, @as(*u8, @ptrFromInt(addr)), @as(u8, @intCast(expected & 0xff)), @as(u8, @intCast(new_val & 0xff)), .seq_cst, .seq_cst) orelse @as(u8, @intCast(expected & 0xff)),
+                    else => return error.UnsupportedCmpxchgType,
+                };
+                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = old_val;
+                if (inst.dest_slot2 != INVALID_SLOT) frame.data[inst.dest_slot2] = if (old_val == expected) 1 else 0;
+                self.bumpMemoryEpoch();
+                return .next;
+            },
+            .atomic_rmw_add => {
+                const addr = self.resolveAddrVal(frame, inst.args[0]);
+                const val = self.resolveScalarVal(frame, inst.args[1]);
+                const old_val: u64 = switch (inst.dest_type) {
+                    .ptr, .i64, .u64 => @atomicRmw(u64, @as(*u64, @ptrFromInt(addr)), .Add, val, .seq_cst),
+                    .i32, .u32 => @atomicRmw(u32, @as(*u32, @ptrFromInt(addr)), .Add, @as(u32, @intCast(val & 0xffffffff)), .seq_cst),
+                    .i16, .u16 => @atomicRmw(u16, @as(*u16, @ptrFromInt(addr)), .Add, @as(u16, @intCast(val & 0xffff)), .seq_cst),
+                    .i8, .u8 => @atomicRmw(u8, @as(*u8, @ptrFromInt(addr)), .Add, @as(u8, @intCast(val & 0xff)), .seq_cst),
+                    else => return error.UnsupportedAtomicRmwType,
+                };
+                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = old_val;
+                self.bumpMemoryEpoch();
+                return .next;
+            },
+            .eq, .ne, .sgt, .ugt, .gt, .slt, .ult, .lt, .sge, .uge, .sle, .ule => {
+                const v1 = self.resolveScalarVal(frame, inst.args[0]);
+                const v2 = self.resolveScalarVal(frame, inst.args[1]);
+                const is_true = switch (inst.op) {
+                    .eq => v1 == v2,
+                    .ne => v1 != v2,
+                    .sgt, .gt => @as(i64, @bitCast(v1)) > @as(i64, @bitCast(v2)),
+                    .ugt => v1 > v2,
+                    .slt, .lt => @as(i64, @bitCast(v1)) < @as(i64, @bitCast(v2)),
+                    .ult => v1 < v2,
+                    .sge => @as(i64, @bitCast(v1)) >= @as(i64, @bitCast(v2)),
+                    .uge => v1 >= v2,
+                    .sle => @as(i64, @bitCast(v1)) <= @as(i64, @bitCast(v2)),
+                    .ule => v1 <= v2,
+                    else => unreachable,
+                };
+                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = if (is_true) 1 else 0;
+                return .next;
+            },
+            .assign, .assume_safe, .assume_borrow, .raw_cast, .bitcast => {
+                if (inst.dest_slot != INVALID_SLOT) {
+                    frame.data[inst.dest_slot] = if (inst.src_slot != INVALID_SLOT) frame.data[inst.src_slot] else self.resolveVal(frame, inst.args[0]);
+                }
+                return .next;
+            },
+            .sext => {
+                const raw = self.resolveVal(frame, inst.args[0]);
+                const from_bits: u8 = switch (inst.dest_type) {
+                    .i8, .u8 => 8,
+                    .i16, .u16 => 16,
+                    .i32, .u32 => 32,
+                    else => 64,
+                };
+                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = signExtend(raw, from_bits);
+                return .next;
+            },
+            .zext, .trunc => {
+                const raw = self.resolveVal(frame, inst.args[0]);
+                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = truncToType(raw, inst.dest_type);
+                return .next;
+            },
+            .take => {
+                const ptr = @as(*align(1) const usize, @ptrFromInt(self.resolveVal(frame, inst.args[0])));
+                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ptr.*;
+                return .next;
+            },
+            .try_ => {
+                const addr = self.resolveVal(frame, inst.args[0]);
+                const tag = @as(*align(1) const u64, @ptrFromInt(addr)).*;
+                if (tag != 0) {
+                    _ = self.freeTrackedResultAlloc(addr);
+                    return .{ .returned = tag };
+                }
+                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = @as(*align(1) const u64, @ptrFromInt(addr + 8)).*;
+                _ = self.freeTrackedResultAlloc(addr);
+                return .next;
+            },
+            .panic => {
+                const panic_code = @as(u8, @truncate(self.resolveVal(frame, inst.args[0])));
+                self.clearPanicState();
+                self.panic_code = panic_code;
+                return error.Panic;
+            },
+            .panic_msg => {
+                const panic_code = @as(u8, @truncate(self.resolveVal(frame, inst.args[0])));
+                const msg_ptr = self.resolveVal(frame, inst.args[1]);
+                const msg_len = @as(usize, @intCast(self.resolveVal(frame, inst.args[2])));
+                self.clearPanicState();
+                self.panic_code = panic_code;
+                if (msg_ptr != 0 and msg_len != 0) {
+                    const src = @as([*]const u8, @ptrFromInt(msg_ptr))[0..msg_len];
+                    const buf = try self.allocator.alloc(u8, msg_len);
+                    @memcpy(buf, src);
+                    self.panic_message = buf;
+                }
+                return error.Panic;
+            },
+            .consume => {
+                const ptr = self.resolveVal(frame, inst.args[0]);
+                _ = self.freeTrackedResultAlloc(ptr);
+                return .next;
+            },
+            .return_ => return .{ .returned = try self.executeReturn(func, frame, inst) },
+            .br, .jmp => return error.UnexpectedControlFlow,
+        }
+    }
+
     fn executeFunction(self: *VM, func: *const parser.Function, call_args: []const usize) anyerror!usize {
-        const needs_arena = self.function_needs_arena.get(func.name) orelse true;
+        const compiled = self.compiled_functions.getPtr(func.name) orelse return error.SymbolNotFound;
+        const needs_arena = compiled.needs_arena;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer if (needs_arena) arena.deinit();
         var local_alloc = if (needs_arena) arena.allocator() else self.allocator;
@@ -1085,334 +2009,160 @@ pub const VM = struct {
         }
         defer if (current_args_owned) self.allocator.free(current_args);
 
-        const slot_count = self.function_slot_counts.get(func.name) orelse (func.params.len + 64);
-        var frame = try self.acquireFrame(local_alloc, slot_count, !needs_arena);
+        var frame = try self.acquireFrame(local_alloc, compiled.slot_count, !needs_arena);
         defer self.releaseFrame(&frame, !needs_arena);
         const call_targets = self.function_call_targets.get(func.name) orelse return error.SymbolNotFound;
 
         while (true) {
+            for (current_args, 0..) |arg_val, i| frame.data[i] = arg_val;
 
-            // Params are at slots 0..N-1 (registered first, in order).
-            for (current_args, 0..) |arg_val, i| {
-                frame.data[i] = arg_val;
-            }
-
-            var pc: usize = 0;
+            var block_idx: usize = 0;
             var tail_restart = false;
 
-            instr_loop: while (pc < func.instructions.len) {
-                const inst = &func.instructions[pc];
-                switch (inst.op) {
-                    .stack_alloc, .alloc => {
-                        const size = self.resolveVal(&frame, inst.args[0]);
-                        const word_count = (size + 7) / 8;
-                        const buf = if (inst.op == .stack_alloc)
-                            try local_alloc.alloc(u64, @max(1, word_count))
-                        else
-                            try self.allocator.alloc(u64, @max(1, word_count));
-                        @memset(std.mem.sliceAsBytes(buf), 0);
-                        if (inst.op == .alloc) {
-                            try self.heap_allocs.append(buf);
-                            self.bumpMemoryEpoch();
-                        }
-                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = @intFromPtr(buf.ptr);
-                        pc += 1;
-                    },
-                    .ptr_add => {
-                        const ptr_val = self.resolveScalarVal(&frame, inst.args[0]);
-                        const offset_val = self.resolveScalarVal(&frame, inst.args[1]);
-                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ptr_val +% offset_val;
-                        pc += 1;
-                    },
-                    .add, .sub, .mul, .div, .rem, .sdiv, .udiv, .srem, .urem, .shl, .shr => {
-                        const arg1 = self.resolveScalarVal(&frame, inst.args[0]);
-                        const arg2 = self.resolveScalarVal(&frame, inst.args[1]);
-                        const result: u64 = switch (inst.op) {
-                            .add => arg1 +% arg2,
-                            .sub => arg1 -% arg2,
-                            .mul => arg1 *% arg2,
-                            .div, .udiv => if (arg2 != 0) arg1 / arg2 else 0,
-                            .sdiv => sdiv: {
-                                const s1 = @as(i64, @bitCast(arg1));
-                                const s2 = @as(i64, @bitCast(arg2));
-                                break :sdiv @as(u64, @bitCast(if (s2 != 0) @divTrunc(s1, s2) else @as(i64, 0)));
-                            },
-                            .srem => srem: {
-                                const s1 = @as(i64, @bitCast(arg1));
-                                const s2 = @as(i64, @bitCast(arg2));
-                                break :srem @as(u64, @bitCast(if (s2 != 0) @rem(s1, s2) else @as(i64, 0)));
-                            },
-                            .urem, .rem => if (arg2 != 0) arg1 % arg2 else 0,
-                            .shl => arg1 << @intCast(arg2 & 63),
-                            .shr => arg1 >> @intCast(arg2 & 63),
-                            else => unreachable,
-                        };
-                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = result;
-                        pc += 1;
-                    },
-                    .and_, .or_, .xor_ => {
-                        const arg1 = self.resolveScalarVal(&frame, inst.args[0]);
-                        const arg2 = self.resolveScalarVal(&frame, inst.args[1]);
-                        const result: u64 = switch (inst.op) {
-                            .and_ => arg1 & arg2,
-                            .or_ => arg1 | arg2,
-                            .xor_ => arg1 ^ arg2,
-                            else => unreachable,
-                        };
-                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = result;
-                        pc += 1;
-                    },
-                    .call => {
-                        // Fast path: pre-computed tail self-call — no arg collection needed.
-                        if (inst.is_tail_call) {
-                            if (inst.args.len - 1 != current_args.len) return error.FfiArityMismatch;
-                            for (inst.args[1..], 0..) |arg, ai| {
-                                current_args[ai] = self.resolveScalarVal(&frame, arg);
+            block_loop: while (block_idx < compiled.blocks.len) {
+                const block = compiled.blocks[block_idx];
+                var ip = block.start;
+                while (ip < block.end) : (ip += 1) {
+                    const raw = compiled.code[ip];
+                    switch (rawOp(raw)) {
+                        .nop => {},
+                        .slow => {
+                            const slow_idx = rawPayload(raw);
+                            const inst_pc = compiled.slow_inst_pcs[slow_idx];
+                            switch (try self.executeSlowInstruction(func, &frame, inst_pc, local_alloc, current_args, call_targets)) {
+                                .next => {},
+                                .tail_restart => {
+                                    tail_restart = true;
+                                    break :block_loop;
+                                },
+                                .returned => |ret| return ret,
                             }
-                            tail_restart = true;
-                            break :instr_loop;
-                        }
-                        var args_buf: [16]usize = undefined;
-                        var args = try self.collectCallArgs(&frame, inst.args[1..], args_buf[0..]);
-                        defer args.deinit(self.allocator);
-                        const call_target = call_targets[pc];
-                        switch (call_target) {
-                            .builtin_print => {
-                                const slice = @as([*]const u8, @ptrFromInt(args.items[0]))[0..args.items[1]];
-                                _ = std.posix.write(std.posix.STDOUT_FILENO, slice) catch {};
-                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = 0;
-                            },
-                            .builtin_time_ms => {
-                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = @as(u64, @bitCast(std.time.milliTimestamp()));
-                            },
-                            .builtin_time_s => {
-                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = @as(u64, @bitCast(std.time.timestamp()));
-                            },
-                            .builtin_time_ns => {
-                                const ns = @as(i64, @intCast(std.time.nanoTimestamp()));
-                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = @as(u64, @bitCast(ns));
-                            },
-                            .builtin_time_instant_ns => {
-                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = @as(u64, @intCast(std.time.nanoTimestamp()));
-                            },
-                            .interpreted => |target_func| {
-                                const ret = try self.executeInterpretedCall(target_func, args.items);
-                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                            },
-                            .ffi_typed => |ft| {
-                                const ret = try self.ffi.callSymbolWithPtr(ft.sym, ft.sig, args.items);
-                                self.bumpMemoryEpoch();
-                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                            },
-                            .ffi_legacy => |sym| {
-                                const ret = self.ffi.callPointerLegacy(@intFromPtr(sym), args.items);
-                                self.bumpMemoryEpoch();
-                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                            },
-                            .pthread_spawn => {
-                                const ret = try self.executePthreadCall("pthread_spawn", args.items);
-                                self.bumpMemoryEpoch();
-                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                            },
-                            .pthread_spawn_detached => {
-                                const ret = try self.executePthreadCall("pthread_spawn_detached", args.items);
-                                self.bumpMemoryEpoch();
-                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                            },
-                            .pthread_join => {
-                                const ret = try self.executePthreadCall("pthread_join", args.items);
-                                self.bumpMemoryEpoch();
-                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                            },
-                            .pthread_drop => {
-                                const ret = try self.executePthreadCall("pthread_drop", args.items);
-                                self.bumpMemoryEpoch();
-                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                            },
-                            .unresolved => {
-                                const ret = try self.callUnresolved(inst.args[0].name, args.items);
-                                self.bumpMemoryEpoch();
-                                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                            },
-                        }
-                        pc += 1;
-                    },
-                    .call_indirect => {
-                        const ptr = self.resolveAddrVal(&frame, inst.args[0]);
-                        var args_buf: [16]usize = undefined;
-                        var args = try self.collectCallArgs(&frame, inst.args[1..], args_buf[0..]);
-                        defer args.deinit(self.allocator);
-                        if (self.function_addresses.get(ptr)) |target| {
-                            const ret = try self.executeInterpretedCall(target, args.items);
-                            if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                        } else {
-                            const ret = self.ffi.callPointerLegacy(ptr, args.items);
+                        },
+                        .assign_rr => frame.data[rawA(raw)] = frame.data[rawB(raw)],
+                        .load_const => {
+                            const const_idx = @as(usize, @intCast(raw >> 16));
+                            frame.data[rawA(raw)] = compiled.constants[const_idx];
+                        },
+                        .add_rr => frame.data[rawA(raw)] = frame.data[rawB(raw)] +% frame.data[rawC(raw)],
+                        .add_rc => frame.data[rawA(raw)] = frame.data[rawB(raw)] +% compiled.constants[rawC(raw)],
+                        .sub_rr => frame.data[rawA(raw)] = frame.data[rawB(raw)] -% frame.data[rawC(raw)],
+                        .sub_rc => frame.data[rawA(raw)] = frame.data[rawB(raw)] -% compiled.constants[rawC(raw)],
+                        .mul_rr => frame.data[rawA(raw)] = frame.data[rawB(raw)] *% frame.data[rawC(raw)],
+                        .mul_rc => frame.data[rawA(raw)] = frame.data[rawB(raw)] *% compiled.constants[rawC(raw)],
+                        .udiv_rr => {
+                            const rhs = frame.data[rawC(raw)];
+                            frame.data[rawA(raw)] = if (rhs != 0) frame.data[rawB(raw)] / rhs else 0;
+                        },
+                        .udiv_rc => {
+                            const rhs = compiled.constants[rawC(raw)];
+                            frame.data[rawA(raw)] = if (rhs != 0) frame.data[rawB(raw)] / rhs else 0;
+                        },
+                        .ptr_add_rr => frame.data[rawA(raw)] = frame.data[rawB(raw)] +% frame.data[rawC(raw)],
+                        .ptr_add_rc => frame.data[rawA(raw)] = frame.data[rawB(raw)] +% compiled.constants[rawC(raw)],
+                        .and_rr => frame.data[rawA(raw)] = frame.data[rawB(raw)] & frame.data[rawC(raw)],
+                        .or_rr => frame.data[rawA(raw)] = frame.data[rawB(raw)] | frame.data[rawC(raw)],
+                        .xor_rr => frame.data[rawA(raw)] = frame.data[rawB(raw)] ^ frame.data[rawC(raw)],
+                        .eq_rr => frame.data[rawA(raw)] = if (frame.data[rawB(raw)] == frame.data[rawC(raw)]) 1 else 0,
+                        .eq_rc => frame.data[rawA(raw)] = if (frame.data[rawB(raw)] == compiled.constants[rawC(raw)]) 1 else 0,
+                        .ne_rr => frame.data[rawA(raw)] = if (frame.data[rawB(raw)] != frame.data[rawC(raw)]) 1 else 0,
+                        .ne_rc => frame.data[rawA(raw)] = if (frame.data[rawB(raw)] != compiled.constants[rawC(raw)]) 1 else 0,
+                        .ugt_rr => frame.data[rawA(raw)] = if (frame.data[rawB(raw)] > frame.data[rawC(raw)]) 1 else 0,
+                        .ugt_rc => frame.data[rawA(raw)] = if (frame.data[rawB(raw)] > compiled.constants[rawC(raw)]) 1 else 0,
+                        .ult_rr => frame.data[rawA(raw)] = if (frame.data[rawB(raw)] < frame.data[rawC(raw)]) 1 else 0,
+                        .ult_rc => frame.data[rawA(raw)] = if (frame.data[rawB(raw)] < compiled.constants[rawC(raw)]) 1 else 0,
+                        .uge_rr => frame.data[rawA(raw)] = if (frame.data[rawB(raw)] >= frame.data[rawC(raw)]) 1 else 0,
+                        .uge_rc => frame.data[rawA(raw)] = if (frame.data[rawB(raw)] >= compiled.constants[rawC(raw)]) 1 else 0,
+                        .ule_rr => frame.data[rawA(raw)] = if (frame.data[rawB(raw)] <= frame.data[rawC(raw)]) 1 else 0,
+                        .ule_rc => frame.data[rawA(raw)] = if (frame.data[rawB(raw)] <= compiled.constants[rawC(raw)]) 1 else 0,
+                        .sgt_rr => frame.data[rawA(raw)] = if (@as(i64, @bitCast(frame.data[rawB(raw)])) > @as(i64, @bitCast(frame.data[rawC(raw)]))) 1 else 0,
+                        .sgt_rc => frame.data[rawA(raw)] = if (@as(i64, @bitCast(frame.data[rawB(raw)])) > @as(i64, @bitCast(compiled.constants[rawC(raw)]))) 1 else 0,
+                        .slt_rr => frame.data[rawA(raw)] = if (@as(i64, @bitCast(frame.data[rawB(raw)])) < @as(i64, @bitCast(frame.data[rawC(raw)]))) 1 else 0,
+                        .slt_rc => frame.data[rawA(raw)] = if (@as(i64, @bitCast(frame.data[rawB(raw)])) < @as(i64, @bitCast(compiled.constants[rawC(raw)]))) 1 else 0,
+                        .sge_rr => frame.data[rawA(raw)] = if (@as(i64, @bitCast(frame.data[rawB(raw)])) >= @as(i64, @bitCast(frame.data[rawC(raw)]))) 1 else 0,
+                        .sge_rc => frame.data[rawA(raw)] = if (@as(i64, @bitCast(frame.data[rawB(raw)])) >= @as(i64, @bitCast(compiled.constants[rawC(raw)]))) 1 else 0,
+                        .sle_rr => frame.data[rawA(raw)] = if (@as(i64, @bitCast(frame.data[rawB(raw)])) <= @as(i64, @bitCast(frame.data[rawC(raw)]))) 1 else 0,
+                        .sle_rc => frame.data[rawA(raw)] = if (@as(i64, @bitCast(frame.data[rawB(raw)])) <= @as(i64, @bitCast(compiled.constants[rawC(raw)]))) 1 else 0,
+                        .load_u64_off8 => {
+                            const addr = addrFromOff8(&frame, rawB(raw), rawC(raw));
+                            frame.data[rawA(raw)] = @as(*align(1) const u64, @ptrFromInt(addr)).*;
+                        },
+                        .store_u64_reg_off8 => {
+                            const addr = addrFromOff8(&frame, rawB(raw), rawC(raw));
+                            @as(*align(1) u64, @ptrFromInt(addr)).* = frame.data[rawA(raw)];
                             self.bumpMemoryEpoch();
-                            if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ret;
-                        }
-                        pc += 1;
-                    },
-                    .load, .atomic_load => {
-                        const addr = self.resolveAddrVal(&frame, inst.args[0]);
-                        const val: u64 = switch (inst.dest_type) {
-                            .ptr, .i64, .u64 => @as(*align(1) const u64, @ptrFromInt(addr)).*,
-                            .i32 => @as(u64, @bitCast(@as(i64, @as(*align(1) const i32, @ptrFromInt(addr)).*))),
-                            .u32 => @as(u64, @intCast(@as(*align(1) const u32, @ptrFromInt(addr)).*)),
-                            .i16 => @as(u64, @bitCast(@as(i64, @as(*align(1) const i16, @ptrFromInt(addr)).*))),
-                            .u16 => @as(u64, @intCast(@as(*align(1) const u16, @ptrFromInt(addr)).*)),
-                            .i8 => @as(u64, @bitCast(@as(i64, @as(*align(1) const i8, @ptrFromInt(addr)).*))),
-                            .u8 => @as(u64, @intCast(@as(*align(1) const u8, @ptrFromInt(addr)).*)),
-                            .f64 => @bitCast(@as(*align(1) const f64, @ptrFromInt(addr)).*),
-                            .f32 => @as(u64, @intCast(@as(u32, @bitCast(@as(*align(1) const f32, @ptrFromInt(addr)).*)))),
-                            else => return error.UnsupportedLoadType,
-                        };
-                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = val;
-                        pc += 1;
-                    },
-                    .store, .atomic_store => {
-                        const val = self.resolveScalarVal(&frame, inst.args[0]);
-                        const addr = self.resolveAddrVal(&frame, inst.args[1]);
-                        switch (inst.dest_type) {
-                            .ptr, .i64, .u64 => @as(*align(1) u64, @ptrFromInt(addr)).* = val,
-                            .i32, .u32 => @as(*align(1) u32, @ptrFromInt(addr)).* = @as(u32, @intCast(val & 0xffffffff)),
-                            .i16, .u16 => @as(*align(1) u16, @ptrFromInt(addr)).* = @as(u16, @intCast(val & 0xffff)),
-                            .i8, .u8 => @as(*align(1) u8, @ptrFromInt(addr)).* = @as(u8, @intCast(val & 0xff)),
-                            else => @as(*align(1) u64, @ptrFromInt(addr)).* = val,
-                        }
-                        if (!inst.is_local_stack_write) self.bumpMemoryEpoch();
-                        pc += 1;
-                    },
-                    .cmpxchg => {
-                        const addr = self.resolveAddrVal(&frame, inst.args[0]);
-                        const expected = self.resolveScalarVal(&frame, inst.args[1]);
-                        const new_val = self.resolveScalarVal(&frame, inst.args[2]);
-                        const old_val: u64 = switch (inst.dest_type) {
-                            .ptr, .i64, .u64 => @cmpxchgStrong(u64, @as(*u64, @ptrFromInt(addr)), expected, new_val, .seq_cst, .seq_cst) orelse expected,
-                            .i32, .u32 => @cmpxchgStrong(u32, @as(*u32, @ptrFromInt(addr)), @as(u32, @intCast(expected & 0xffffffff)), @as(u32, @intCast(new_val & 0xffffffff)), .seq_cst, .seq_cst) orelse @as(u32, @intCast(expected & 0xffffffff)),
-                            .i16, .u16 => @cmpxchgStrong(u16, @as(*u16, @ptrFromInt(addr)), @as(u16, @intCast(expected & 0xffff)), @as(u16, @intCast(new_val & 0xffff)), .seq_cst, .seq_cst) orelse @as(u16, @intCast(expected & 0xffff)),
-                            .i8, .u8 => @cmpxchgStrong(u8, @as(*u8, @ptrFromInt(addr)), @as(u8, @intCast(expected & 0xff)), @as(u8, @intCast(new_val & 0xff)), .seq_cst, .seq_cst) orelse @as(u8, @intCast(expected & 0xff)),
-                            else => return error.UnsupportedCmpxchgType,
-                        };
-                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = old_val;
-                        if (inst.dest_slot2 != INVALID_SLOT) frame.data[inst.dest_slot2] = if (old_val == expected) 1 else 0;
-                        self.bumpMemoryEpoch();
-                        pc += 1;
-                    },
-                    .atomic_rmw_add => {
-                        const addr = self.resolveAddrVal(&frame, inst.args[0]);
-                        const val = self.resolveScalarVal(&frame, inst.args[1]);
-                        const old_val: u64 = switch (inst.dest_type) {
-                            .ptr, .i64, .u64 => @atomicRmw(u64, @as(*u64, @ptrFromInt(addr)), .Add, val, .seq_cst),
-                            .i32, .u32 => @atomicRmw(u32, @as(*u32, @ptrFromInt(addr)), .Add, @as(u32, @intCast(val & 0xffffffff)), .seq_cst),
-                            .i16, .u16 => @atomicRmw(u16, @as(*u16, @ptrFromInt(addr)), .Add, @as(u16, @intCast(val & 0xffff)), .seq_cst),
-                            .i8, .u8 => @atomicRmw(u8, @as(*u8, @ptrFromInt(addr)), .Add, @as(u8, @intCast(val & 0xff)), .seq_cst),
-                            else => return error.UnsupportedAtomicRmwType,
-                        };
-                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = old_val;
-                        self.bumpMemoryEpoch();
-                        pc += 1;
-                    },
-                    .eq, .ne, .sgt, .ugt, .gt, .slt, .ult, .lt, .sge, .uge, .sle, .ule => {
-                        const v1 = self.resolveScalarVal(&frame, inst.args[0]);
-                        const v2 = self.resolveScalarVal(&frame, inst.args[1]);
-                        const is_true = switch (inst.op) {
-                            .eq => v1 == v2,
-                            .ne => v1 != v2,
-                            .sgt, .gt => @as(i64, @bitCast(v1)) > @as(i64, @bitCast(v2)),
-                            .ugt => v1 > v2,
-                            .slt, .lt => @as(i64, @bitCast(v1)) < @as(i64, @bitCast(v2)),
-                            .ult => v1 < v2,
-                            .sge => @as(i64, @bitCast(v1)) >= @as(i64, @bitCast(v2)),
-                            .uge => v1 >= v2,
-                            .sle => @as(i64, @bitCast(v1)) <= @as(i64, @bitCast(v2)),
-                            .ule => v1 <= v2,
-                            else => unreachable,
-                        };
-                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = if (is_true) 1 else 0;
-                        pc += 1;
-                    },
-                    .br => {
-                        const cond = self.resolveVal(&frame, inst.args[0]);
-                        pc = if (cond != 0) inst.args[1].pc_target else inst.args[2].pc_target;
-                    },
-                    .jmp => pc = inst.args[0].pc_target,
-                    .assign, .assume_safe, .assume_borrow, .raw_cast, .bitcast => {
-                        if (inst.dest_slot != INVALID_SLOT) {
-                            frame.data[inst.dest_slot] = if (inst.src_slot != INVALID_SLOT) frame.data[inst.src_slot] else self.resolveVal(&frame, inst.args[0]);
-                        }
-                        pc += 1;
-                    },
-                    .sext => {
-                        const raw = self.resolveVal(&frame, inst.args[0]);
-                        const from_bits: u8 = switch (inst.dest_type) {
-                            .i8, .u8 => 8,
-                            .i16, .u16 => 16,
-                            .i32, .u32 => 32,
-                            else => 64,
-                        };
-                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = signExtend(raw, from_bits);
-                        pc += 1;
-                    },
-                    .zext, .trunc => {
-                        const raw = self.resolveVal(&frame, inst.args[0]);
-                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = truncToType(raw, inst.dest_type);
-                        pc += 1;
-                    },
-                    .take => {
-                        const ptr = @as(*align(1) const usize, @ptrFromInt(self.resolveVal(&frame, inst.args[0])));
-                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ptr.*;
-                        pc += 1;
-                    },
-                    .try_ => {
-                        const addr = self.resolveVal(&frame, inst.args[0]);
-                        const tag = @as(*align(1) const u64, @ptrFromInt(addr)).*;
-                        if (tag != 0) {
+                        },
+                        .store_u64_const_off8 => {
+                            const addr = addrFromOff8(&frame, rawB(raw), rawC(raw));
+                            @as(*align(1) u64, @ptrFromInt(addr)).* = compiled.constants[rawA(raw)];
+                            self.bumpMemoryEpoch();
+                        },
+                        .store_u64_local_reg_off8 => {
+                            const addr = addrFromOff8(&frame, rawB(raw), rawC(raw));
+                            @as(*align(1) u64, @ptrFromInt(addr)).* = frame.data[rawA(raw)];
+                        },
+                        .store_u64_local_const_off8 => {
+                            const addr = addrFromOff8(&frame, rawB(raw), rawC(raw));
+                            @as(*align(1) u64, @ptrFromInt(addr)).* = compiled.constants[rawA(raw)];
+                        },
+                        .call => {
+                            const meta = &compiled.calls[rawPayload(raw)];
+                            switch (try self.executeCompiledCall(func, &frame, meta, current_args)) {
+                                .next => {},
+                                .tail_restart => {
+                                    tail_restart = true;
+                                    break :block_loop;
+                                },
+                                .returned => |ret| return ret,
+                            }
+                        },
+                        .call_indirect => {
+                            const meta = &compiled.indirect_calls[rawPayload(raw)];
+                            switch (try self.executeCompiledIndirectCall(&frame, meta)) {
+                                .next => {},
+                                .tail_restart => {
+                                    tail_restart = true;
+                                    break :block_loop;
+                                },
+                                .returned => |ret| return ret,
+                            }
+                        },
+                        .consume_reg => {
+                            const ptr = frame.data[rawA(raw)];
+                            _ = self.freeTrackedResultAlloc(@as(usize, @intCast(ptr)));
+                        },
+                        .take_off8 => {
+                            const addr = addrFromOff8(&frame, rawB(raw), rawC(raw));
+                            frame.data[rawA(raw)] = @as(*align(1) const usize, @ptrFromInt(addr)).*;
+                        },
+                        .try_reg => {
+                            const addr = @as(usize, @intCast(frame.data[rawB(raw)]));
+                            const tag = @as(*align(1) const u64, @ptrFromInt(addr)).*;
+                            if (tag != 0) {
+                                _ = self.freeTrackedResultAlloc(addr);
+                                return tag;
+                            }
+                            const dest = rawA(raw);
+                            if (dest != BYTE_SLOT_NONE) frame.data[dest] = @as(*align(1) const u64, @ptrFromInt(addr + 8)).*;
                             _ = self.freeTrackedResultAlloc(addr);
-                            return tag;
-                        }
-                        if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = @as(*align(1) const u64, @ptrFromInt(addr + 8)).*;
-                        _ = self.freeTrackedResultAlloc(addr);
-                        pc += 1;
+                        },
+                    }
+                }
+
+                switch (block.term_kind) {
+                    .br => {
+                        const cond = self.resolveCompiledVal(&frame, block.cond);
+                        block_idx = if (cond != 0) block.true_block else block.false_block;
+                        continue :block_loop;
                     },
-                    .panic => {
-                        const panic_code = @as(u8, @truncate(self.resolveVal(&frame, inst.args[0])));
-                        self.clearPanicState();
-                        self.panic_code = panic_code;
-                        return error.Panic;
-                    },
-                    .panic_msg => {
-                        const panic_code = @as(u8, @truncate(self.resolveVal(&frame, inst.args[0])));
-                        const msg_ptr = self.resolveVal(&frame, inst.args[1]);
-                        const msg_len = @as(usize, @intCast(self.resolveVal(&frame, inst.args[2])));
-                        self.clearPanicState();
-                        self.panic_code = panic_code;
-                        if (msg_ptr != 0 and msg_len != 0) {
-                            const src = @as([*]const u8, @ptrFromInt(msg_ptr))[0..msg_len];
-                            const buf = try self.allocator.alloc(u8, msg_len);
-                            @memcpy(buf, src);
-                            self.panic_message = buf;
-                        }
-                        return error.Panic;
-                    },
-                    .consume => {
-                        const ptr = self.resolveVal(&frame, inst.args[0]);
-                        _ = self.freeTrackedResultAlloc(ptr);
-                        pc += 1;
+                    .jmp, .fallthrough => {
+                        block_idx = block.true_block;
+                        continue :block_loop;
                     },
                     .return_ => {
-                        const ret = if (inst.args.len > 0) self.resolveVal(&frame, inst.args[0]) else 0;
-                        if (func.returns_result and !std.mem.eql(u8, func.name, "main")) {
-                            const buf = try self.allocator.alloc(u64, 3);
-                            errdefer self.allocator.free(buf);
-                            buf[0] = 0;
-                            buf[1] = ret;
-                            buf[2] = 0;
-                            try self.result_allocs.append(buf);
-                            try self.result_alloc_index.put(@intFromPtr(buf.ptr), self.result_allocs.items.len - 1);
-                            return @intFromPtr(buf.ptr);
-                        }
-                        return ret;
+                        const ret = self.resolveCompiledVal(&frame, block.ret);
+                        return self.finishReturn(func, ret);
                     },
+                    .end => break :block_loop,
                 }
             }
 
@@ -1421,7 +2171,7 @@ pub const VM = struct {
                     frame.deinit();
                     _ = arena.reset(.retain_capacity);
                     local_alloc = arena.allocator();
-                    frame = try self.acquireFrame(local_alloc, slot_count, false);
+                    frame = try self.acquireFrame(local_alloc, compiled.slot_count, false);
                 } else {
                     frame.reset();
                 }
