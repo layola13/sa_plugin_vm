@@ -130,6 +130,10 @@ const BlockTermKind = enum(u8) {
     fast_avg_load_eq_rr,
     fast_tail_add_rc,
     fast_tail_sub_rc,
+    fast_br_eq_rr,
+    fast_br_eq_rc,
+    fast_br_ugt_rr,
+    fast_br_ult_rr,
     jmp,
     return_,
 };
@@ -457,6 +461,15 @@ pub const VM = struct {
         return false;
     }
 
+    fn programCanCreateTrackedResultAlloc(self: *VM) bool {
+        var func_it = self.program.functions.iterator();
+        while (func_it.next()) |entry| {
+            const func = entry.value_ptr;
+            if (func.returns_result and !std.mem.eql(u8, func.name, "main")) return true;
+        }
+        return false;
+    }
+
     fn isDeadPureCandidate(op: parser.OpCode) bool {
         return switch (op) {
             .ptr_add,
@@ -672,14 +685,16 @@ pub const VM = struct {
         allocator.free(inst.args);
     }
 
-    fn elideNoopConsumes(self: *VM, func: *parser.Function, slot_count: usize, call_targets: []const ResolvedCall) !void {
+    fn elideNoopConsumes(self: *VM, func: *parser.Function, slot_count: usize, call_targets: []const ResolvedCall, tracked_results_possible: bool) !void {
         const states = try self.allocator.alloc(TrackedResultState, @max(slot_count, 1));
         defer self.allocator.free(states);
 
         @memset(states, .unknown);
         for (func.instructions, 0..) |*inst, pc| {
-            if (inst.op == .consume and inst.args.len > 0 and operandTrackedResultState(states, inst.args[0]) == .no_result) {
-                rewriteInstToNoOp(inst);
+            if (inst.op == .consume) {
+                if (!tracked_results_possible or (inst.args.len > 0 and operandTrackedResultState(states, inst.args[0]) == .no_result)) {
+                    rewriteInstToNoOp(inst);
+                }
             }
 
             if (inst.dest_slot != INVALID_SLOT) {
@@ -1021,7 +1036,7 @@ pub const VM = struct {
     }
 
     fn fastTailBinRcKind(code: []const u32, block: CompiledBlock) ?BlockTermKind {
-        if (block.term_kind != .return_ or block.end != block.start + 3) return null;
+        if (block.term_kind != .return_ or block.end < block.start + 3) return null;
         const calc = code[block.start];
         const tail = code[block.start + 1];
         const kind: BlockTermKind = switch (rawOp(calc)) {
@@ -1040,6 +1055,18 @@ pub const VM = struct {
             if (@as(u8, @truncate(slots >> (@as(u5, @intCast(idx)) * 8))) == calc_dest) return kind;
         }
         return null;
+    }
+
+    fn fastEmptyBrKind(block: CompiledBlock) ?BlockTermKind {
+        if (block.term_kind != .br or block.term_cmp == 0 or block.end != block.start) return null;
+        const rhs_is_const = ((block.term_cmp >> 24) & 1) != 0;
+        const op: TermCmpOp = @enumFromInt(@as(u8, @truncate(block.term_cmp)));
+        return switch (op) {
+            .eq => if (rhs_is_const) .fast_br_eq_rc else .fast_br_eq_rr,
+            .ugt => if (!rhs_is_const) .fast_br_ugt_rr else null,
+            .ult => if (!rhs_is_const) .fast_br_ult_rr else null,
+            else => null,
+        };
     }
 
     fn appendCall(
@@ -1285,6 +1312,8 @@ pub const VM = struct {
                 term.term_kind = .fast_avg_load_eq_rr;
             } else if (fastTailBinRcKind(code.items, term)) |fast_kind| {
                 term.term_kind = fast_kind;
+            } else if (fastEmptyBrKind(term)) |fast_kind| {
+                term.term_kind = fast_kind;
             }
             if (term.term_kind == .end and block_idx + 1 < func.blocks.len) {
                 term.term_kind = .fallthrough;
@@ -1346,6 +1375,7 @@ pub const VM = struct {
     /// Binding pass: resolve register slot indices, branch pc targets, and call
     /// targets for every instruction in every function. Runs once after init.
     fn bindingPass(self: *VM) !void {
+        const tracked_results_possible = self.programCanCreateTrackedResultAlloc();
         var func_it = self.program.functions.iterator();
         while (func_it.next()) |entry| {
             const func_name = entry.key_ptr.*;
@@ -1410,7 +1440,7 @@ pub const VM = struct {
                 }
             }
             inlineBlockLocalImmediateAssigns(func);
-            try self.elideNoopConsumes(func, reg_map.count(), call_targets);
+            try self.elideNoopConsumes(func, reg_map.count(), call_targets, tracked_results_possible);
             refreshQuickenedSourceSlots(func);
             try self.elideDeadPureInstructions(func, reg_map.count());
             call_targets = try self.compactNoOpInstructions(func, call_targets);
@@ -2300,6 +2330,22 @@ pub const VM = struct {
                     block_idx = 0;
                     continue :block_loop;
                 }
+                if (block.term_kind == .fast_br_eq_rr) {
+                    block_idx = if (frame.data[@as(u8, @truncate(block.term_cmp >> 8))] == frame.data[@as(u8, @truncate(block.term_cmp >> 16))]) block.true_block else block.false_block;
+                    continue :block_loop;
+                }
+                if (block.term_kind == .fast_br_eq_rc) {
+                    block_idx = if (frame.data[@as(u8, @truncate(block.term_cmp >> 8))] == compiled.constants[@as(u8, @truncate(block.term_cmp >> 16))]) block.true_block else block.false_block;
+                    continue :block_loop;
+                }
+                if (block.term_kind == .fast_br_ugt_rr) {
+                    block_idx = if (frame.data[@as(u8, @truncate(block.term_cmp >> 8))] > frame.data[@as(u8, @truncate(block.term_cmp >> 16))]) block.true_block else block.false_block;
+                    continue :block_loop;
+                }
+                if (block.term_kind == .fast_br_ult_rr) {
+                    block_idx = if (frame.data[@as(u8, @truncate(block.term_cmp >> 8))] < frame.data[@as(u8, @truncate(block.term_cmp >> 16))]) block.true_block else block.false_block;
+                    continue :block_loop;
+                }
                 var ip = block.start;
                 while (ip < block.end) : (ip += 1) {
                     const raw = compiled.code[ip];
@@ -2457,7 +2503,14 @@ pub const VM = struct {
                 }
 
                 switch (block.term_kind) {
-                    .fast_avg_load_eq_rr, .fast_tail_add_rc, .fast_tail_sub_rc => unreachable,
+                    .fast_avg_load_eq_rr,
+                    .fast_tail_add_rc,
+                    .fast_tail_sub_rc,
+                    .fast_br_eq_rr,
+                    .fast_br_eq_rc,
+                    .fast_br_ugt_rr,
+                    .fast_br_ult_rr,
+                    => unreachable,
                     .br => {
                         const cond = if (block.term_cmp != 0)
                             evalTermCmp(&frame, compiled.constants, block.term_cmp)
