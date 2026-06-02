@@ -87,6 +87,7 @@ const ByteOp = enum(u8) {
     store_u64_const_off8,
     store_u64_local_reg_off8,
     store_u64_local_const_off8,
+    tail_self_regs,
     call,
     call_indirect,
     consume_reg,
@@ -382,6 +383,7 @@ pub const VM = struct {
     }
 
     fn freeTrackedResultAlloc(self: *VM, ptr: usize) bool {
+        if (self.result_alloc_index.count() == 0) return false;
         const idx = self.result_alloc_index.get(ptr) orelse return false;
         const buf = self.result_allocs.items[idx];
         self.allocator.free(buf);
@@ -817,6 +819,13 @@ pub const VM = struct {
         return @as(usize, @intCast(raw >> 8));
     }
 
+    fn packSlots4(slots: [4]u8) u32 {
+        return @as(u32, slots[0]) |
+            (@as(u32, slots[1]) << 8) |
+            (@as(u32, slots[2]) << 16) |
+            (@as(u32, slots[3]) << 24);
+    }
+
     fn compiledOperand(arg: parser.Operand) CompiledOperand {
         return switch (arg.kind) {
             .immediate, .constant_addr => .{ .kind = .immediate, .imm = arg.imm_val },
@@ -996,9 +1005,23 @@ pub const VM = struct {
         inst: *const parser.Instruction,
         inst_pc: usize,
         target: ResolvedCall,
+        can_emit_tail_self_regs: bool,
     ) !void {
         if (inst.args.len == 0) return error.SymbolNotFound;
         const arg_count = inst.args.len - 1;
+        if (can_emit_tail_self_regs and inst.is_tail_call and arg_count <= 4) {
+            var slots = [_]u8{ 0, 0, 0, 0 };
+            for (inst.args[1..], 0..) |arg, idx| {
+                switch (arg.kind) {
+                    .register, .stack_addr => slots[idx] = slotByte(arg.slot_idx) orelse break,
+                    else => break,
+                }
+            } else {
+                try code.append(packABC(.tail_self_regs, @as(u8, @intCast(arg_count)), 0, 0));
+                try code.append(packSlots4(slots));
+                return;
+            }
+        }
         const args = try self.allocator.alloc(CompiledOperand, arg_count);
         errdefer self.allocator.free(args);
         for (inst.args[1..], 0..) |arg, idx| args[idx] = compiledOperand(arg);
@@ -1047,6 +1070,7 @@ pub const VM = struct {
         inst: *const parser.Instruction,
         inst_pc: usize,
         call_target: ResolvedCall,
+        needs_arena: bool,
     ) !void {
         switch (inst.op) {
             .assign, .assume_safe, .assume_borrow, .raw_cast, .bitcast => {
@@ -1110,7 +1134,7 @@ pub const VM = struct {
                     else => return appendSlow(code, slow_inst_pcs, inst_pc),
                 }
             },
-            .call => try self.appendCall(code, calls, inst, inst_pc, call_target),
+            .call => try self.appendCall(code, calls, inst, inst_pc, call_target, !needs_arena),
             .call_indirect => try self.appendIndirectCall(code, indirect_calls, inst, inst_pc),
             .consume => {
                 if (inst.args.len < 1) return;
@@ -1209,7 +1233,7 @@ pub const VM = struct {
                     pc += 3;
                     continue;
                 }
-                try self.compileInstruction(&code, &constants, &slow_inst_pcs, &calls, &indirect_calls, &func.instructions[pc], pc, call_targets[pc]);
+                try self.compileInstruction(&code, &constants, &slow_inst_pcs, &calls, &indirect_calls, &func.instructions[pc], pc, call_targets[pc], needs_arena);
                 pc += 1;
             }
             term.end = code.items.len;
@@ -2278,8 +2302,30 @@ pub const VM = struct {
                             const addr = addrFromOff8(&frame, rawB(raw), rawC(raw));
                             @as(*align(1) u64, @ptrFromInt(addr)).* = compiled.constants[rawA(raw)];
                         },
+                        .tail_self_regs => {
+                            const argc = rawA(raw);
+                            if (argc != current_args.len) return error.FfiArityMismatch;
+                            const slots = compiled.code[ip + 1];
+                            const v0 = if (argc > 0) frame.data[@as(u8, @truncate(slots))] else 0;
+                            const v1 = if (argc > 1) frame.data[@as(u8, @truncate(slots >> 8))] else 0;
+                            const v2 = if (argc > 2) frame.data[@as(u8, @truncate(slots >> 16))] else 0;
+                            const v3 = if (argc > 3) frame.data[@as(u8, @truncate(slots >> 24))] else 0;
+                            if (argc > 0) frame.data[0] = v0;
+                            if (argc > 1) frame.data[1] = v1;
+                            if (argc > 2) frame.data[2] = v2;
+                            if (argc > 3) frame.data[3] = v3;
+                            block_idx = 0;
+                            continue :block_loop;
+                        },
                         .call => {
                             const meta = &compiled.calls[rawPayload(raw)];
+                            if (meta.is_tail_call and !needs_arena) {
+                                if (meta.args.len != current_args.len) return error.FfiArityMismatch;
+                                for (meta.args, 0..) |arg, ai| current_args[ai] = self.resolveCompiledVal(&frame, arg);
+                                for (current_args, 0..) |arg_val, ai| frame.data[ai] = @as(u64, @intCast(arg_val));
+                                block_idx = 0;
+                                continue :block_loop;
+                            }
                             switch (try self.executeCompiledCall(func, &frame, meta, current_args)) {
                                 .next => {},
                                 .tail_restart => {
@@ -2301,8 +2347,10 @@ pub const VM = struct {
                             }
                         },
                         .consume_reg => {
-                            const ptr = frame.data[rawA(raw)];
-                            _ = self.freeTrackedResultAlloc(@as(usize, @intCast(ptr)));
+                            if (self.result_alloc_index.count() != 0) {
+                                const ptr = frame.data[rawA(raw)];
+                                _ = self.freeTrackedResultAlloc(@as(usize, @intCast(ptr)));
+                            }
                         },
                         .take_off8 => {
                             const addr = addrFromOff8(&frame, rawB(raw), rawC(raw));
