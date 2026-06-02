@@ -1,0 +1,7 @@
+@test "dead pure chain"():
+L_ENTRY:
+    slot = stack_alloc 8
+    store slot+0, 123 as u64
+    p = load slot+0 as ptr
+    ghost = load p+0 as u64
+    return

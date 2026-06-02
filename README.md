@@ -69,7 +69,7 @@ SA assembly utilizes `.sal` macro facades (e.g. `EXPAND DENO_HOSTNAME`) and `@im
 | **Memory** | `atomic_load`, `atomic_store` | `dest = atomic_load addr as TYPE` | Atomic memory access |
 | **Memory** | `cmpxchg` | `old, ok = cmpxchg addr, exp, new as TYPE` | Compare-and-swap |
 | **Memory** | `atomic_rmw_add` | `old = atomic_rmw_add addr, val as TYPE` | Atomic fetch-and-add |
-| **Memory** | `take` | `dest = take ptr` | Load and zero (ownership move) |
+| **Memory** | `take` | `dest = take ptr` | Pointer-typed load (mirrors current native lowering) |
 | **Arithmetic** | `add`, `sub`, `mul` | `dest = op a, b` | Integer arithmetic (wrapping) |
 | **Arithmetic** | `div`, `rem` | `dest = op a, b` | Unsigned division/remainder |
 | **Arithmetic** | `sdiv`, `udiv` | `dest = op a, b` | Signed/unsigned division |
@@ -105,32 +105,33 @@ The VM is a **pure SA bytecode interpreter** running in a sandboxed environment.
 | **SIMD Intrinsics** | (architecture-specific) | CPU vector intrinsics require native code generation. |
 | **Multi-binary packages** | `pkg_bin_multiple` | Multiple entry point package builds require the full SA compiler toolchain. |
 
-> **Note**: The exact skip list is maintained in `run_vm_tests.sh`. Runtime smoke tests for HTTP, `dlopen`, SQLite, `pthread`, and filesystem shims are now handled by the VM itself rather than the stale whitepaper assumptions.
+> **Note**: Older whitepaper/script references are stale. The current source tree is the authority for supported behavior.
 
 ---
 
 ## 3. Test Coverage
 
-Run the full Rosetta parity verification suite:
+Run the local regression suite and a VM smoke test:
 
 ```bash
-# Quick integration smoke test (hello world, loops, FFI)
-./run_vm_tests.sh
+# Build plugin tests
+zig build test
 
-# Full Rosetta parity test (all 333 demos)
-./test_all_vm.sh
+# Build release plugin
+zig build -Doptimize=ReleaseFast
+
+# Run a simple VM smoke test
+SA_PLUGIN_DEV=1 SA_PLUGINS_PATH="$PWD/zig-out/lib" sa vm run tests/hello_world.sa
 ```
 
-**Current Results** (as of latest build):
+Representative external compatibility check used during current work:
 
 | Status | Count | Notes |
 |---|---|---|
-| ✅ PASS | ~295 | Pure SA bytecode demos |
-| ⚠️ SKIP | 8 | Compile-time rejection tests |
-| ❌ FAIL (expected) | ~22 | FFI/eco/OS-syscall — design limitation |
-| ❌ FAIL (native build) | ~4 | SA compiler itself cannot build these |
+| ✅ PASS | 35/35 | `/home/vscode/projects/TheAlgorithms/Sa/tests/*.sa` under `sa vm test` |
+| ✅ PASS | 4/4 | `bench_search.sa`, `bench_bst_1000.sa`, `bench_merge.sa`, `bench_sorting.sa` ran without VM crashes |
 
-**Pass rate on pure SA bytecode demos: ~97%**
+This repository also includes regression fixtures for `@test` fallback mode and dead pure instruction elimination under [`tests/`](</home/vscode/projects/sa_plugins/sa_plugin_vm/tests>).
 
 ---
 
@@ -144,14 +145,14 @@ zig build -Doptimize=ReleaseFast
 
 ### Install
 ```bash
-# From project root:
-bash run_vm_tests.sh "Rosetta Hello World test"
+zig build -Doptimize=ReleaseFast
 ```
 
 ### Verify
 ```bash
 sa plugin list
 sa vm run /path/to/demo/main.sa
+sa vm test /path/to/tests.sa
 ```
 
 ---

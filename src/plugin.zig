@@ -10,6 +10,7 @@ const skills = [_]plugin_api.SkillSection{
         .summary = "Dynamic interpreter VM for running SA assembly files directly",
         .items = &.{
             "vm run <file.sa>",
+            "vm test <file.sa>",
             "Direct interpretation without compilation",
             "Full dynamic FFI compatibility with installed plugins",
         },
@@ -42,10 +43,12 @@ fn runVmCommand(allocator: std.mem.Allocator, ctx: *const plugin_api.Context, ar
     _ = ctx;
     if (argv.len < 2) return null;
     if (!std.mem.eql(u8, argv[1], "vm")) return null;
-    if (argv.len < 4 or !std.mem.eql(u8, argv[2], "run")) {
-        try stderr.print("Usage: sa vm run [--allow-ffi] <file.sa>\n", .{});
+    if (argv.len < 4 or (!std.mem.eql(u8, argv[2], "run") and !std.mem.eql(u8, argv[2], "test"))) {
+        try stderr.print("Usage: sa vm <run|test> [--allow-ffi] <file.sa>\n", .{});
         return 1;
     }
+
+    const run_tests = std.mem.eql(u8, argv[2], "test");
 
     var allow_ffi = false;
     var file_path: ?[]const u8 = null;
@@ -61,7 +64,7 @@ fn runVmCommand(allocator: std.mem.Allocator, ctx: *const plugin_api.Context, ar
     }
 
     if (file_path == null) {
-        try stderr.print("Usage: sa vm run [--allow-ffi] <file.sa>\n", .{});
+        try stderr.print("Usage: sa vm <run|test> [--allow-ffi] <file.sa>\n", .{});
         return 1;
     }
 
@@ -98,7 +101,7 @@ fn runVmCommand(allocator: std.mem.Allocator, ctx: *const plugin_api.Context, ar
 
     var vm_inst = vm.VM.init(std.heap.c_allocator, prog, &ffi_mgr);
     defer vm_inst.deinit();
-    const code = vm_inst.run() catch |err| {
+    const code = (if (run_tests) vm_inst.runTests() else vm_inst.run()) catch |err| {
         if (err == error.Panic) {
             if (vm_inst.panic_code) |panic_code| {
                 if (vm_inst.panic_message) |msg| {
@@ -157,4 +160,41 @@ pub export var saasm_plugin_descriptor_v1: plugin_api.PluginDescriptor = descrip
 
 pub export fn saasm_plugin_descriptor_v1_fn(out: *plugin_api.PluginDescriptor) callconv(.c) void {
     out.* = saasm_plugin_descriptor_v1;
+}
+
+fn runVmCommandForTest(mode: []const u8, file_path: []const u8) !u8 {
+    var stdout_buf = std.ArrayList(u8).init(std.testing.allocator);
+    defer stdout_buf.deinit();
+    var stderr_buf = std.ArrayList(u8).init(std.testing.allocator);
+    defer stderr_buf.deinit();
+
+    const ctx = plugin_api.Context{ .allocator = std.testing.allocator };
+    const argv = [_][]const u8{ "sa", "vm", mode, file_path };
+    const result = try runVmCommand(std.testing.allocator, &ctx, &argv, stdout_buf.writer().any(), stderr_buf.writer().any());
+    try std.testing.expect(result != null);
+    return result.?;
+}
+
+test "vm run falls back to @test functions when @main is absent" {
+    const file_path = try std.fs.path.resolve(std.testing.allocator, &.{"tests/vm_test_mode.sa"});
+    defer std.testing.allocator.free(file_path);
+
+    const code = try runVmCommandForTest("run", file_path);
+    try std.testing.expectEqual(@as(u8, 0), code);
+}
+
+test "vm run handles dead pure load chains without touching invalid memory" {
+    const file_path = try std.fs.path.resolve(std.testing.allocator, &.{"tests/vm_dead_pure.sa"});
+    defer std.testing.allocator.free(file_path);
+
+    const code = try runVmCommandForTest("run", file_path);
+    try std.testing.expectEqual(@as(u8, 0), code);
+}
+
+test "vm test mode handles dead pure load chains without touching invalid memory" {
+    const file_path = try std.fs.path.resolve(std.testing.allocator, &.{"tests/vm_dead_pure_test_mode.sa"});
+    defer std.testing.allocator.free(file_path);
+
+    const code = try runVmCommandForTest("test", file_path);
+    try std.testing.expectEqual(@as(u8, 0), code);
 }

@@ -1,0 +1,9 @@
+@test "vm harness"():
+L_ENTRY:
+    sum = add 2, 3
+    ok = eq sum, 5
+    br ok -> L_PASS, L_FAIL
+L_PASS:
+    return
+L_FAIL:
+    panic(11)

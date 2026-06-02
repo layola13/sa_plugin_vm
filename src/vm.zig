@@ -7,6 +7,14 @@ const INVALID_SLOT: u32 = std.math.maxInt(u32);
 const CALL_CACHE_MAX_ARGS: usize = 4;
 const CALL_CACHE_MAX_ENTRIES: u32 = 4096;
 
+fn isTestFunctionName(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "test ");
+}
+
+fn testFunctionLessThan(_: void, lhs: *const parser.Function, rhs: *const parser.Function) bool {
+    return std.mem.lessThan(u8, lhs.name, rhs.name);
+}
+
 /// Pre-resolved dispatch target for a .call instruction, computed during the binding pass.
 const ResolvedCall = union(enum) {
     builtin_print,
@@ -148,12 +156,42 @@ pub const VM = struct {
         self.clearPanicState();
         try self.initFunctionsAndVtables();
 
-        const main_func = self.program.functions.get("main") orelse {
-            std.debug.print("Error: @main function not found!\n", .{});
-            return 1;
-        };
+        const main_func = self.program.functions.get("main") orelse return self.runTestsAfterInit();
         const main_code = try self.executeFunction(&main_func, &.{});
         return @as(i32, @bitCast(@as(u32, @intCast(main_code & 0xffffffff))));
+    }
+
+    pub fn runTests(self: *VM) !i32 {
+        self.clearPanicState();
+        try self.initFunctionsAndVtables();
+        return self.runTestsAfterInit();
+    }
+
+    fn runTestsAfterInit(self: *VM) !i32 {
+        var test_funcs = std.ArrayList(*const parser.Function).init(self.allocator);
+        defer test_funcs.deinit();
+
+        var func_it = self.program.functions.iterator();
+        while (func_it.next()) |entry| {
+            if (isTestFunctionName(entry.key_ptr.*)) {
+                try test_funcs.append(entry.value_ptr);
+            }
+        }
+
+        if (test_funcs.items.len == 0) {
+            std.debug.print("Error: @main function not found and no @test functions found!\n", .{});
+            return 1;
+        }
+
+        std.sort.heap(*const parser.Function, test_funcs.items, {}, testFunctionLessThan);
+        for (test_funcs.items) |test_func| {
+            if (test_func.params.len != 0) {
+                std.debug.print("Error: @test function '{s}' must not take parameters!\n", .{test_func.name});
+                return 1;
+            }
+            _ = try self.executeFunction(test_func, &.{});
+        }
+        return 0;
     }
 
     fn findBlockForPc(self: *VM, func: *const parser.Function, pc: usize) ?parser.BasicBlock {
@@ -249,6 +287,93 @@ pub const VM = struct {
         return false;
     }
 
+    fn isDeadPureCandidate(op: parser.OpCode) bool {
+        return switch (op) {
+            .ptr_add,
+            .add,
+            .sub,
+            .mul,
+            .div,
+            .rem,
+            .and_,
+            .or_,
+            .xor_,
+            .sdiv,
+            .udiv,
+            .srem,
+            .urem,
+            .shl,
+            .shr,
+            .gt,
+            .lt,
+            .load,
+            .eq,
+            .ne,
+            .sgt,
+            .slt,
+            .sge,
+            .sle,
+            .ugt,
+            .ult,
+            .uge,
+            .ule,
+            .assign,
+            .raw_cast,
+            .bitcast,
+            .sext,
+            .zext,
+            .trunc,
+            .take,
+            => true,
+            else => false,
+        };
+    }
+
+    fn countOperandUse(use_counts: []u32, arg: parser.Operand) void {
+        switch (arg.kind) {
+            .register, .stack_addr, .offset_addr => if (arg.slot_idx != INVALID_SLOT and arg.slot_idx < use_counts.len) {
+                use_counts[arg.slot_idx] += 1;
+            },
+            else => {},
+        }
+    }
+
+    fn decrementOperandUse(use_counts: []u32, arg: parser.Operand) void {
+        switch (arg.kind) {
+            .register, .stack_addr, .offset_addr => if (arg.slot_idx != INVALID_SLOT and arg.slot_idx < use_counts.len and use_counts[arg.slot_idx] > 0) {
+                use_counts[arg.slot_idx] -= 1;
+            },
+            else => {},
+        }
+    }
+
+    fn elideDeadPureInstructions(self: *VM, func: *parser.Function, slot_count: usize) !void {
+        const use_counts = try self.allocator.alloc(u32, @max(slot_count, 1));
+        defer self.allocator.free(use_counts);
+        @memset(use_counts, 0);
+
+        for (func.instructions) |inst| {
+            if (inst.op == .consume) continue;
+            for (inst.args) |arg| countOperandUse(use_counts, arg);
+        }
+
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (func.instructions) |*inst| {
+                if (!isDeadPureCandidate(inst.op)) continue;
+                if (inst.dest_slot == INVALID_SLOT or inst.dest_slot >= use_counts.len) continue;
+                if (use_counts[inst.dest_slot] != 0) continue;
+
+                for (inst.args) |arg| decrementOperandUse(use_counts, arg);
+                inst.op = .assign;
+                inst.dest_slot = INVALID_SLOT;
+                inst.src_slot = INVALID_SLOT;
+                changed = true;
+            }
+        }
+    }
+
     /// Binding pass: resolve register slot indices, branch pc targets, and call
     /// targets for every instruction in every function. Runs once after init.
     fn bindingPass(self: *VM) !void {
@@ -319,6 +444,7 @@ pub const VM = struct {
                     if (src.kind == .register or src.kind == .stack_addr) inst.src_slot = src.slot_idx;
                 }
             }
+            try self.elideDeadPureInstructions(func, reg_map.count());
             try self.function_call_targets.put(func_name, call_targets);
             try self.function_cacheable.put(func_name, !self.functionHasExternalSideEffect(func));
             try self.function_reads_memory.put(func_name, functionReadsMemory(func));
@@ -973,10 +1099,8 @@ pub const VM = struct {
                         pc += 1;
                     },
                     .take => {
-                        const ptr = @as(*align(1) usize, @ptrFromInt(self.resolveVal(&frame, inst.args[0])));
+                        const ptr = @as(*align(1) const usize, @ptrFromInt(self.resolveVal(&frame, inst.args[0])));
                         if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ptr.*;
-                        ptr.* = 0;
-                        self.bumpMemoryEpoch();
                         pc += 1;
                     },
                     .try_ => {
