@@ -55,6 +55,7 @@ const ByteOp = enum(u8) {
     mul_rc,
     udiv_rr,
     udiv_rc,
+    avg2_rr,
     ptr_add_rr,
     ptr_add_rc,
     and_rr,
@@ -81,6 +82,7 @@ const ByteOp = enum(u8) {
     sle_rr,
     sle_rc,
     load_u64_off8,
+    load_u64_index8,
     store_u64_reg_off8,
     store_u64_const_off8,
     store_u64_local_reg_off8,
@@ -128,12 +130,27 @@ const BlockTermKind = enum(u8) {
     return_,
 };
 
+const TermCmpOp = enum(u8) {
+    none = 0,
+    eq,
+    ne,
+    ugt,
+    ult,
+    uge,
+    ule,
+    sgt,
+    slt,
+    sge,
+    sle,
+};
+
 const CompiledBlock = struct {
     start: usize,
     end: usize,
     term_kind: BlockTermKind = .end,
     cond: CompiledOperand = .{},
     ret: CompiledOperand = .{},
+    term_cmp: u32 = 0,
     true_block: usize = 0,
     false_block: usize = 0,
     term_pc: usize = 0,
@@ -654,21 +671,17 @@ pub const VM = struct {
         const states = try self.allocator.alloc(TrackedResultState, @max(slot_count, 1));
         defer self.allocator.free(states);
 
-        for (func.blocks) |block| {
-            @memset(states, .unknown);
-            var pc = block.start_inst;
-            while (pc < block.end_inst) : (pc += 1) {
-                const inst = &func.instructions[pc];
-                if (inst.op == .consume and inst.args.len > 0 and operandTrackedResultState(states, inst.args[0]) == .no_result) {
-                    rewriteInstToNoOp(inst);
-                }
+        @memset(states, .unknown);
+        for (func.instructions, 0..) |*inst, pc| {
+            if (inst.op == .consume and inst.args.len > 0 and operandTrackedResultState(states, inst.args[0]) == .no_result) {
+                rewriteInstToNoOp(inst);
+            }
 
-                if (inst.dest_slot != INVALID_SLOT) {
-                    states[inst.dest_slot] = classifyTrackedPrimaryResult(inst, call_targets[pc], states);
-                }
-                if (inst.op == .cmpxchg and inst.dest_slot2 != INVALID_SLOT) {
-                    states[inst.dest_slot2] = .no_result;
-                }
+            if (inst.dest_slot != INVALID_SLOT) {
+                states[inst.dest_slot] = classifyTrackedPrimaryResult(inst, call_targets[pc], states);
+            }
+            if (inst.op == .cmpxchg and inst.dest_slot2 != INVALID_SLOT) {
+                states[inst.dest_slot2] = .no_result;
             }
         }
     }
@@ -813,6 +826,29 @@ pub const VM = struct {
         };
     }
 
+    fn termCmpOp(op: parser.OpCode) TermCmpOp {
+        return switch (op) {
+            .eq => .eq,
+            .ne => .ne,
+            .ugt => .ugt,
+            .ult => .ult,
+            .uge => .uge,
+            .ule => .ule,
+            .sgt, .gt => .sgt,
+            .slt, .lt => .slt,
+            .sge => .sge,
+            .sle => .sle,
+            else => .none,
+        };
+    }
+
+    fn packTermCmp(op: TermCmpOp, lhs: u8, rhs: u8, rhs_is_const: bool) u32 {
+        return @as(u32, @intFromEnum(op)) |
+            (@as(u32, lhs) << 8) |
+            (@as(u32, rhs) << 16) |
+            (@as(u32, @intFromBool(rhs_is_const)) << 24);
+    }
+
     fn addConstant(constants: *std.ArrayList(u64), value: u64) !u32 {
         const idx = constants.items.len;
         if (idx > std.math.maxInt(u32)) return error.BytecodeIndexTooLarge;
@@ -867,6 +903,90 @@ pub const VM = struct {
             },
             else => return appendSlow(code, slow_inst_pcs, inst_pc),
         }
+    }
+
+    fn compileTermCmp(
+        constants: *std.ArrayList(u64),
+        cmp_inst: parser.Instruction,
+        br_inst: parser.Instruction,
+        use_counts: []const u32,
+    ) !?u32 {
+        const op = termCmpOp(cmp_inst.op);
+        if (op == .none) return null;
+        if (cmp_inst.dest_slot == INVALID_SLOT or cmp_inst.args.len < 2 or br_inst.args.len < 1) return null;
+        if (br_inst.args[0].slot_idx != cmp_inst.dest_slot) return null;
+        if (cmp_inst.dest_slot >= use_counts.len or use_counts[cmp_inst.dest_slot] != 1) return null;
+
+        const lhs = slotByte(cmp_inst.args[0].slot_idx) orelse return null;
+        switch (cmp_inst.args[1].kind) {
+            .register, .stack_addr => {
+                const rhs = slotByte(cmp_inst.args[1].slot_idx) orelse return null;
+                return packTermCmp(op, lhs, rhs, false);
+            },
+            .immediate, .constant_addr => {
+                const const_idx = try addConstant(constants, cmp_inst.args[1].imm_val);
+                if (const_idx > std.math.maxInt(u8)) return null;
+                return packTermCmp(op, lhs, @as(u8, @intCast(const_idx)), true);
+            },
+            else => return null,
+        }
+    }
+
+    fn appendAddUdiv2(
+        code: *std.ArrayList(u32),
+        insts: []const parser.Instruction,
+        pc: usize,
+        body_end: usize,
+        use_counts: []const u32,
+    ) !bool {
+        if (pc + 1 >= body_end) return false;
+        const add_inst = insts[pc];
+        const div_inst = insts[pc + 1];
+        if (add_inst.op != .add or add_inst.dest_slot == INVALID_SLOT or add_inst.args.len < 2) return false;
+        if (add_inst.dest_slot >= use_counts.len or use_counts[add_inst.dest_slot] != 1) return false;
+        if ((div_inst.op != .udiv and div_inst.op != .div) or div_inst.dest_slot == INVALID_SLOT or div_inst.args.len < 2) return false;
+        if (div_inst.args[0].slot_idx != add_inst.dest_slot) return false;
+        if (!((div_inst.args[1].kind == .immediate or div_inst.args[1].kind == .constant_addr) and div_inst.args[1].imm_val == 2)) return false;
+
+        const dest = slotByte(div_inst.dest_slot) orelse return false;
+        const lhs = slotByte(add_inst.args[0].slot_idx) orelse return false;
+        const rhs = slotByte(add_inst.args[1].slot_idx) orelse return false;
+        try code.append(packABC(.avg2_rr, dest, lhs, rhs));
+        return true;
+    }
+
+    fn appendIndexedLoad8(
+        code: *std.ArrayList(u32),
+        insts: []const parser.Instruction,
+        pc: usize,
+        body_end: usize,
+        use_counts: []const u32,
+    ) !bool {
+        if (pc + 2 >= body_end) return false;
+        const mul_inst = insts[pc];
+        const ptr_inst = insts[pc + 1];
+        const load_inst = insts[pc + 2];
+
+        if (mul_inst.op != .mul or mul_inst.dest_slot == INVALID_SLOT or mul_inst.args.len < 2) return false;
+        if (!((mul_inst.args[1].kind == .immediate or mul_inst.args[1].kind == .constant_addr) and mul_inst.args[1].imm_val == 8)) return false;
+        if (mul_inst.dest_slot >= use_counts.len or use_counts[mul_inst.dest_slot] != 1) return false;
+
+        if (ptr_inst.op != .ptr_add or ptr_inst.dest_slot == INVALID_SLOT or ptr_inst.args.len < 2) return false;
+        if (ptr_inst.args[1].slot_idx != mul_inst.dest_slot) return false;
+        if (ptr_inst.dest_slot >= use_counts.len or use_counts[ptr_inst.dest_slot] != 1) return false;
+
+        if (load_inst.op != .load or load_inst.dest_slot == INVALID_SLOT or load_inst.args.len < 1) return false;
+        const addr = load_inst.args[0];
+        if (addr.kind != .offset_addr or addr.slot_idx != ptr_inst.dest_slot or addr.offset != 0) return false;
+
+        const dest = slotByte(load_inst.dest_slot) orelse return false;
+        const base = slotByte(ptr_inst.args[0].slot_idx) orelse return false;
+        const index = slotByte(mul_inst.args[0].slot_idx) orelse return false;
+        switch (load_inst.dest_type) {
+            .ptr, .i64, .u64 => try code.append(packABC(.load_u64_index8, dest, base, index)),
+            else => return false,
+        }
+        return true;
     }
 
     fn appendCall(
@@ -1034,6 +1154,13 @@ pub const VM = struct {
             indirect_calls.deinit();
         }
 
+        const use_counts = try self.allocator.alloc(u32, @max(slot_count, 1));
+        defer self.allocator.free(use_counts);
+        @memset(use_counts, 0);
+        for (func.instructions) |inst| {
+            for (inst.args) |arg| countOperandUse(use_counts, arg);
+        }
+
         for (func.blocks, 0..) |block, block_idx| {
             var term = CompiledBlock{ .start = code.items.len, .end = code.items.len };
             var body_end = block.end_inst;
@@ -1048,6 +1175,13 @@ pub const VM = struct {
                         term.cond = compiledOperand(term_inst.args[0]);
                         term.true_block = blockIndexForPc(func, term_inst.args[1].pc_target) orelse return error.LabelNotFound;
                         term.false_block = blockIndexForPc(func, term_inst.args[2].pc_target) orelse return error.LabelNotFound;
+                        if (term_pc > block.start_inst) {
+                            const cmp_pc = term_pc - 1;
+                            if (try compileTermCmp(&constants, func.instructions[cmp_pc], term_inst, use_counts)) |term_cmp| {
+                                body_end = cmp_pc;
+                                term.term_cmp = term_cmp;
+                            }
+                        }
                     },
                     .jmp => if (term_inst.args.len >= 1) {
                         body_end = term_pc;
@@ -1066,8 +1200,17 @@ pub const VM = struct {
             }
 
             var pc = block.start_inst;
-            while (pc < body_end) : (pc += 1) {
+            while (pc < body_end) {
+                if (try appendAddUdiv2(&code, func.instructions, pc, body_end, use_counts)) {
+                    pc += 2;
+                    continue;
+                }
+                if (try appendIndexedLoad8(&code, func.instructions, pc, body_end, use_counts)) {
+                    pc += 3;
+                    continue;
+                }
                 try self.compileInstruction(&code, &constants, &slow_inst_pcs, &calls, &indirect_calls, &func.instructions[pc], pc, call_targets[pc]);
+                pc += 1;
             }
             term.end = code.items.len;
             if (term.term_kind == .end and block_idx + 1 < func.blocks.len) {
@@ -1602,6 +1745,32 @@ pub const VM = struct {
         return base +% offset_bits;
     }
 
+    inline fn addrFromIndex8(frame: *Frame, base_slot: u8, index_slot: u8) usize {
+        const base = @as(usize, @intCast(frame.data[base_slot]));
+        const index = @as(usize, @intCast(frame.data[index_slot]));
+        return base +% (index *% 8);
+    }
+
+    inline fn evalTermCmp(frame: *Frame, constants: []const u64, raw: u32) bool {
+        const op: TermCmpOp = @enumFromInt(@as(u8, @truncate(raw)));
+        const lhs = frame.data[@as(u8, @truncate(raw >> 8))];
+        const rhs_token = @as(u8, @truncate(raw >> 16));
+        const rhs = if (((raw >> 24) & 1) != 0) constants[rhs_token] else frame.data[rhs_token];
+        return switch (op) {
+            .none => lhs != 0,
+            .eq => lhs == rhs,
+            .ne => lhs != rhs,
+            .ugt => lhs > rhs,
+            .ult => lhs < rhs,
+            .uge => lhs >= rhs,
+            .ule => lhs <= rhs,
+            .sgt => @as(i64, @bitCast(lhs)) > @as(i64, @bitCast(rhs)),
+            .slt => @as(i64, @bitCast(lhs)) < @as(i64, @bitCast(rhs)),
+            .sge => @as(i64, @bitCast(lhs)) >= @as(i64, @bitCast(rhs)),
+            .sle => @as(i64, @bitCast(lhs)) <= @as(i64, @bitCast(rhs)),
+        };
+    }
+
     fn collectCompiledCallArgs(self: *VM, frame: *Frame, operands: []const CompiledOperand, inline_buf: []usize) !CallArgs {
         if (operands.len <= inline_buf.len) {
             for (operands, 0..) |arg, idx| inline_buf[idx] = self.resolveCompiledVal(frame, arg);
@@ -2057,6 +2226,7 @@ pub const VM = struct {
                             const rhs = compiled.constants[rawC(raw)];
                             frame.data[rawA(raw)] = if (rhs != 0) frame.data[rawB(raw)] / rhs else 0;
                         },
+                        .avg2_rr => frame.data[rawA(raw)] = (frame.data[rawB(raw)] +% frame.data[rawC(raw)]) / 2,
                         .ptr_add_rr => frame.data[rawA(raw)] = frame.data[rawB(raw)] +% frame.data[rawC(raw)],
                         .ptr_add_rc => frame.data[rawA(raw)] = frame.data[rawB(raw)] +% compiled.constants[rawC(raw)],
                         .and_rr => frame.data[rawA(raw)] = frame.data[rawB(raw)] & frame.data[rawC(raw)],
@@ -2084,6 +2254,10 @@ pub const VM = struct {
                         .sle_rc => frame.data[rawA(raw)] = if (@as(i64, @bitCast(frame.data[rawB(raw)])) <= @as(i64, @bitCast(compiled.constants[rawC(raw)]))) 1 else 0,
                         .load_u64_off8 => {
                             const addr = addrFromOff8(&frame, rawB(raw), rawC(raw));
+                            frame.data[rawA(raw)] = @as(*align(1) const u64, @ptrFromInt(addr)).*;
+                        },
+                        .load_u64_index8 => {
+                            const addr = addrFromIndex8(&frame, rawB(raw), rawC(raw));
                             frame.data[rawA(raw)] = @as(*align(1) const u64, @ptrFromInt(addr)).*;
                         },
                         .store_u64_reg_off8 => {
@@ -2150,8 +2324,11 @@ pub const VM = struct {
 
                 switch (block.term_kind) {
                     .br => {
-                        const cond = self.resolveCompiledVal(&frame, block.cond);
-                        block_idx = if (cond != 0) block.true_block else block.false_block;
+                        const cond = if (block.term_cmp != 0)
+                            evalTermCmp(&frame, compiled.constants, block.term_cmp)
+                        else
+                            self.resolveCompiledVal(&frame, block.cond) != 0;
+                        block_idx = if (cond) block.true_block else block.false_block;
                         continue :block_loop;
                     },
                     .jmp, .fallthrough => {
@@ -2173,7 +2350,8 @@ pub const VM = struct {
                     local_alloc = arena.allocator();
                     frame = try self.acquireFrame(local_alloc, compiled.slot_count, false);
                 } else {
-                    frame.reset();
+                    // Non-arena tail self-calls overwrite parameter slots before re-entering.
+                    // Keeping the rest of the frame avoids millions of hot-loop memsets.
                 }
                 continue;
             }
