@@ -1,0 +1,9 @@
+@main() -> i32:
+L_ENTRY:
+    x = 1 as u64
+    a = add x, 2
+    x = 3 as u64
+    b = add x, 4
+    sum = add a, b
+    sum_i32 = zext sum as i32
+    return sum_i32

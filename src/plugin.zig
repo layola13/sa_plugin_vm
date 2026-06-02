@@ -198,3 +198,11 @@ test "vm test mode handles dead pure load chains without touching invalid memory
     const code = try runVmCommandForTest("test", file_path);
     try std.testing.expectEqual(@as(u8, 0), code);
 }
+
+test "vm block-local immediate inlining stops at redefinition" {
+    const file_path = try std.fs.path.resolve(std.testing.allocator, &.{"tests/vm_immediate_inline.sa"});
+    defer std.testing.allocator.free(file_path);
+
+    const code = try runVmCommandForTest("run", file_path);
+    try std.testing.expectEqual(@as(u8, 10), code);
+}

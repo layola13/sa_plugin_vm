@@ -347,6 +347,266 @@ pub const VM = struct {
         }
     }
 
+    fn isImmediateAssignCandidate(inst: *const parser.Instruction) bool {
+        if (inst.op != .assign or inst.dest_slot == INVALID_SLOT or inst.args.len != 1) return false;
+        return switch (inst.args[0].kind) {
+            .immediate, .constant_addr => true,
+            else => false,
+        };
+    }
+
+    fn inlineConstantOperand(arg: *parser.Operand, slot: u32, source: parser.Operand) bool {
+        switch (arg.kind) {
+            .register, .stack_addr => {
+                if (arg.slot_idx != slot) return false;
+                arg.kind = source.kind;
+                arg.imm_val = source.imm_val;
+                arg.offset = 0;
+                arg.slot_idx = INVALID_SLOT;
+                return true;
+            },
+            .offset_addr => {
+                if (arg.slot_idx != slot) return false;
+                const base = @as(usize, @intCast(source.imm_val));
+                const offset_bits: usize = @bitCast(@as(isize, arg.offset));
+                arg.kind = .immediate;
+                arg.imm_val = @as(u64, @intCast(base +% offset_bits));
+                arg.offset = 0;
+                arg.slot_idx = INVALID_SLOT;
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    fn inlineBlockLocalImmediateAssigns(func: *parser.Function) void {
+        for (func.blocks) |block| {
+            var pc = block.start_inst;
+            while (pc < block.end_inst) : (pc += 1) {
+                const inst = &func.instructions[pc];
+                if (!isImmediateAssignCandidate(inst)) continue;
+
+                const slot = inst.dest_slot;
+                const source = inst.args[0];
+                var next_pc = pc + 1;
+                while (next_pc < block.end_inst) : (next_pc += 1) {
+                    const next = &func.instructions[next_pc];
+                    if (next.dest_slot == slot or next.dest_slot2 == slot) break;
+                    for (next.args) |*arg| {
+                        _ = inlineConstantOperand(arg, slot, source);
+                    }
+                }
+            }
+        }
+    }
+
+    const TrackedResultState = enum(u2) {
+        unknown,
+        no_result,
+        maybe_result,
+    };
+
+    fn operandTrackedResultState(states: []const TrackedResultState, arg: parser.Operand) TrackedResultState {
+        return switch (arg.kind) {
+            .immediate, .constant_addr, .label => .no_result,
+            .register, .stack_addr => if (arg.slot_idx != INVALID_SLOT and arg.slot_idx < states.len) states[arg.slot_idx] else .unknown,
+            .offset_addr => if (arg.offset == 0 and arg.slot_idx != INVALID_SLOT and arg.slot_idx < states.len) states[arg.slot_idx] else .no_result,
+        };
+    }
+
+    fn classifyTrackedPrimaryResult(inst: *const parser.Instruction, call_target: ResolvedCall, states: []const TrackedResultState) TrackedResultState {
+        return switch (inst.op) {
+            .call => switch (call_target) {
+                .interpreted => |target_func| if (target_func.returns_result) .maybe_result else .no_result,
+                .ffi_typed => |ft| if (ft.sig.returns_result) .maybe_result else .no_result,
+                .builtin_print,
+                .builtin_time_ms,
+                .builtin_time_s,
+                .builtin_time_ns,
+                .builtin_time_instant_ns,
+                .pthread_spawn,
+                .pthread_spawn_detached,
+                .pthread_join,
+                .pthread_drop,
+                => .no_result,
+                .ffi_legacy, .unresolved => .maybe_result,
+            },
+            .call_indirect,
+            .load,
+            .atomic_load,
+            .take,
+            .try_,
+            .atomic_rmw_add,
+            => .maybe_result,
+            .assign,
+            .assume_safe,
+            .assume_borrow,
+            .raw_cast,
+            .bitcast,
+            => if (inst.args.len > 0) operandTrackedResultState(states, inst.args[0]) else .unknown,
+            .stack_alloc,
+            .alloc,
+            .ptr_add,
+            .add,
+            .sub,
+            .mul,
+            .div,
+            .rem,
+            .and_,
+            .or_,
+            .xor_,
+            .sdiv,
+            .udiv,
+            .srem,
+            .urem,
+            .shl,
+            .shr,
+            .gt,
+            .lt,
+            .eq,
+            .ne,
+            .sgt,
+            .slt,
+            .sge,
+            .sle,
+            .ugt,
+            .ult,
+            .uge,
+            .ule,
+            .sext,
+            .zext,
+            .trunc,
+            => .no_result,
+            .cmpxchg,
+            => .maybe_result,
+            else => .unknown,
+        };
+    }
+
+    fn rewriteInstToNoOp(inst: *parser.Instruction) void {
+        inst.op = .assign;
+        inst.dest_slot = INVALID_SLOT;
+        inst.dest_slot2 = INVALID_SLOT;
+        inst.src_slot = INVALID_SLOT;
+        for (inst.args) |*arg| {
+            arg.kind = .immediate;
+            arg.imm_val = 0;
+            arg.offset = 0;
+            arg.slot_idx = INVALID_SLOT;
+        }
+    }
+
+    fn freeInstructionOwnedFields(allocator: std.mem.Allocator, inst: parser.Instruction) void {
+        if (inst.dest) |dest| allocator.free(dest);
+        for (inst.args) |arg| allocator.free(arg.name);
+        allocator.free(inst.args);
+    }
+
+    fn elideNoopConsumes(self: *VM, func: *parser.Function, slot_count: usize, call_targets: []const ResolvedCall) !void {
+        const states = try self.allocator.alloc(TrackedResultState, @max(slot_count, 1));
+        defer self.allocator.free(states);
+
+        for (func.blocks) |block| {
+            @memset(states, .unknown);
+            var pc = block.start_inst;
+            while (pc < block.end_inst) : (pc += 1) {
+                const inst = &func.instructions[pc];
+                if (inst.op == .consume and inst.args.len > 0 and operandTrackedResultState(states, inst.args[0]) == .no_result) {
+                    rewriteInstToNoOp(inst);
+                }
+
+                if (inst.dest_slot != INVALID_SLOT) {
+                    states[inst.dest_slot] = classifyTrackedPrimaryResult(inst, call_targets[pc], states);
+                }
+                if (inst.op == .cmpxchg and inst.dest_slot2 != INVALID_SLOT) {
+                    states[inst.dest_slot2] = .no_result;
+                }
+            }
+        }
+    }
+
+    fn compactNoOpInstructions(self: *VM, func: *parser.Function, call_targets: []ResolvedCall) ![]ResolvedCall {
+        const old_insts = func.instructions;
+        if (old_insts.len == 0) return call_targets;
+
+        const keep = try self.allocator.alloc(bool, old_insts.len);
+        defer self.allocator.free(keep);
+
+        var kept_count: usize = 0;
+        for (old_insts, 0..) |inst, idx| {
+            const keep_inst = !(inst.op == .assign and inst.dest_slot == INVALID_SLOT);
+            keep[idx] = keep_inst;
+            if (keep_inst) kept_count += 1;
+        }
+        if (kept_count == old_insts.len) return call_targets;
+
+        const old_to_new_next = try self.allocator.alloc(usize, old_insts.len + 1);
+        defer self.allocator.free(old_to_new_next);
+        old_to_new_next[old_insts.len] = kept_count;
+        var next_pc = kept_count;
+        var rev = old_insts.len;
+        while (rev > 0) {
+            rev -= 1;
+            if (keep[rev]) next_pc -= 1;
+            old_to_new_next[rev] = next_pc;
+        }
+
+        const new_insts = try self.program.allocator.alloc(parser.Instruction, kept_count);
+        errdefer self.program.allocator.free(new_insts);
+        const new_call_targets = try self.allocator.alloc(ResolvedCall, kept_count);
+        errdefer self.allocator.free(new_call_targets);
+        const new_blocks = try self.program.allocator.alloc(parser.BasicBlock, func.blocks.len);
+        errdefer self.program.allocator.free(new_blocks);
+
+        var new_idx: usize = 0;
+        for (old_insts, 0..) |inst, old_idx| {
+            if (!keep[old_idx]) continue;
+            const copied = inst;
+            switch (copied.op) {
+                .br => if (copied.args.len >= 3) {
+                    copied.args[1].pc_target = old_to_new_next[copied.args[1].pc_target];
+                    copied.args[2].pc_target = old_to_new_next[copied.args[2].pc_target];
+                },
+                .jmp => if (copied.args.len >= 1) {
+                    copied.args[0].pc_target = old_to_new_next[copied.args[0].pc_target];
+                },
+                else => {},
+            }
+            new_insts[new_idx] = copied;
+            new_call_targets[new_idx] = call_targets[old_idx];
+            new_idx += 1;
+        }
+
+        for (func.blocks, 0..) |block, block_idx| {
+            new_blocks[block_idx] = .{
+                .label = block.label,
+                .start_inst = old_to_new_next[block.start_inst],
+                .end_inst = old_to_new_next[block.end_inst],
+            };
+        }
+
+        for (old_insts, 0..) |inst, old_idx| {
+            if (!keep[old_idx]) freeInstructionOwnedFields(self.program.allocator, inst);
+        }
+
+        self.program.allocator.free(old_insts);
+        self.program.allocator.free(func.blocks);
+        self.allocator.free(call_targets);
+        func.instructions = new_insts;
+        func.blocks = new_blocks;
+        return new_call_targets;
+    }
+
+    fn refreshQuickenedSourceSlots(func: *parser.Function) void {
+        for (func.instructions) |*inst| {
+            inst.src_slot = INVALID_SLOT;
+            if ((inst.op == .assign or inst.op == .assume_safe or inst.op == .assume_borrow or inst.op == .raw_cast or inst.op == .bitcast) and inst.args.len > 0) {
+                const src = inst.args[0];
+                if (src.kind == .register or src.kind == .stack_addr) inst.src_slot = src.slot_idx;
+            }
+        }
+    }
+
     fn elideDeadPureInstructions(self: *VM, func: *parser.Function, slot_count: usize) !void {
         const use_counts = try self.allocator.alloc(u32, @max(slot_count, 1));
         defer self.allocator.free(use_counts);
@@ -387,7 +647,7 @@ pub const VM = struct {
             var stack_alloc_slots = std.AutoHashMap(u32, void).init(self.allocator);
             defer stack_alloc_slots.deinit();
 
-            const call_targets = try self.allocator.alloc(ResolvedCall, func.instructions.len);
+            var call_targets = try self.allocator.alloc(ResolvedCall, func.instructions.len);
             errdefer self.allocator.free(call_targets);
             for (call_targets) |*t| t.* = .unresolved;
 
@@ -439,12 +699,12 @@ pub const VM = struct {
                         inst.is_tail_call = self.isTailSelfCallAt(func, pc);
                     }
                 }
-                if ((inst.op == .assign or inst.op == .assume_safe or inst.op == .assume_borrow or inst.op == .raw_cast or inst.op == .bitcast) and inst.args.len > 0) {
-                    const src = inst.args[0];
-                    if (src.kind == .register or src.kind == .stack_addr) inst.src_slot = src.slot_idx;
-                }
             }
+            inlineBlockLocalImmediateAssigns(func);
+            try self.elideNoopConsumes(func, reg_map.count(), call_targets);
+            refreshQuickenedSourceSlots(func);
             try self.elideDeadPureInstructions(func, reg_map.count());
+            call_targets = try self.compactNoOpInstructions(func, call_targets);
             try self.function_call_targets.put(func_name, call_targets);
             try self.function_cacheable.put(func_name, !self.functionHasExternalSideEffect(func));
             try self.function_reads_memory.put(func_name, functionReadsMemory(func));
