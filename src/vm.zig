@@ -2496,6 +2496,18 @@ pub const VM = struct {
                                 block_idx = 0;
                                 continue :block_loop;
                             }
+                            if (meta.args.len <= 8) {
+                                switch (meta.target) {
+                                    .interpreted => |target_func| {
+                                        var args_buf: [8]usize = undefined;
+                                        for (meta.args, 0..) |arg, ai| args_buf[ai] = self.resolveCompiledVal(&frame, arg);
+                                        const ret = try self.executeInterpretedCall(target_func, args_buf[0..meta.args.len]);
+                                        if (meta.dest_slot != INVALID_SLOT) frame.data[meta.dest_slot] = @as(u64, @intCast(ret));
+                                        continue;
+                                    },
+                                    else => {},
+                                }
+                            }
                             switch (try self.executeCompiledCall(func, &frame, meta, current_args)) {
                                 .next => {},
                                 .tail_restart => {
