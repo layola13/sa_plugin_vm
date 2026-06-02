@@ -127,6 +127,9 @@ const BlockTermKind = enum(u8) {
     end,
     fallthrough,
     br,
+    fast_avg_load_eq_rr,
+    fast_tail_add_rc,
+    fast_tail_sub_rc,
     jmp,
     return_,
 };
@@ -998,6 +1001,47 @@ pub const VM = struct {
         return true;
     }
 
+    fn isFastAvgLoadEqBlock(code: []const u32, block: CompiledBlock) bool {
+        if (block.term_kind != .br or block.term_cmp == 0) return false;
+        if (block.end != block.start + 2) return false;
+
+        const cmp_op: TermCmpOp = @enumFromInt(@as(u8, @truncate(block.term_cmp)));
+        if (cmp_op != .eq or ((block.term_cmp >> 24) & 1) != 0) return false;
+
+        const avg = code[block.start];
+        const load = code[block.start + 1];
+        if (rawOp(avg) != .avg2_rr or rawOp(load) != .load_u64_index8) return false;
+
+        const mid_slot = rawA(avg);
+        const val_slot = rawA(load);
+        const load_index_slot = rawC(load);
+        const cmp_lhs = @as(u8, @truncate(block.term_cmp >> 8));
+        if (load_index_slot != mid_slot or cmp_lhs != val_slot) return false;
+        return true;
+    }
+
+    fn fastTailBinRcKind(code: []const u32, block: CompiledBlock) ?BlockTermKind {
+        if (block.term_kind != .return_ or block.end != block.start + 3) return null;
+        const calc = code[block.start];
+        const tail = code[block.start + 1];
+        const kind: BlockTermKind = switch (rawOp(calc)) {
+            .add_rc => .fast_tail_add_rc,
+            .sub_rc => .fast_tail_sub_rc,
+            else => return null,
+        };
+        if (rawOp(tail) != .tail_self_regs) return null;
+
+        const calc_dest = rawA(calc);
+        const argc = rawA(tail);
+        if (argc == 0 or argc > 4) return null;
+        const slots = code[block.start + 2];
+        var idx: u8 = 0;
+        while (idx < argc) : (idx += 1) {
+            if (@as(u8, @truncate(slots >> (@as(u5, @intCast(idx)) * 8))) == calc_dest) return kind;
+        }
+        return null;
+    }
+
     fn appendCall(
         self: *VM,
         code: *std.ArrayList(u32),
@@ -1237,6 +1281,11 @@ pub const VM = struct {
                 pc += 1;
             }
             term.end = code.items.len;
+            if (isFastAvgLoadEqBlock(code.items, term)) {
+                term.term_kind = .fast_avg_load_eq_rr;
+            } else if (fastTailBinRcKind(code.items, term)) |fast_kind| {
+                term.term_kind = fast_kind;
+            }
             if (term.term_kind == .end and block_idx + 1 < func.blocks.len) {
                 term.term_kind = .fallthrough;
                 term.true_block = block_idx + 1;
@@ -2214,6 +2263,43 @@ pub const VM = struct {
 
             block_loop: while (block_idx < compiled.blocks.len) {
                 const block = compiled.blocks[block_idx];
+                if (block.term_kind == .fast_avg_load_eq_rr) {
+                    const avg = compiled.code[block.start];
+                    const load = compiled.code[block.start + 1];
+                    const mid = (frame.data[rawB(avg)] +% frame.data[rawC(avg)]) / 2;
+                    frame.data[rawA(avg)] = mid;
+                    const addr = frame.data[rawB(load)] +% (mid *% 8);
+                    const val = @as(*align(1) const u64, @ptrFromInt(addr)).*;
+                    frame.data[rawA(load)] = val;
+                    const rhs = frame.data[@as(u8, @truncate(block.term_cmp >> 16))];
+                    block_idx = if (val == rhs) block.true_block else block.false_block;
+                    continue :block_loop;
+                }
+                if (block.term_kind == .fast_tail_add_rc or block.term_kind == .fast_tail_sub_rc) {
+                    const calc = compiled.code[block.start];
+                    const tail = compiled.code[block.start + 1];
+                    const argc = rawA(tail);
+                    if (argc != current_args.len) return error.FfiArityMismatch;
+                    const calc_src = frame.data[rawB(calc)];
+                    const constant = compiled.constants[rawC(calc)];
+                    const calc_val = if (block.term_kind == .fast_tail_add_rc) calc_src +% constant else calc_src -% constant;
+                    const calc_dest = rawA(calc);
+                    const slots = compiled.code[block.start + 2];
+                    const s0 = @as(u8, @truncate(slots));
+                    const s1 = @as(u8, @truncate(slots >> 8));
+                    const s2 = @as(u8, @truncate(slots >> 16));
+                    const s3 = @as(u8, @truncate(slots >> 24));
+                    const v0 = if (s0 == calc_dest) calc_val else frame.data[s0];
+                    const v1 = if (argc > 1) if (s1 == calc_dest) calc_val else frame.data[s1] else 0;
+                    const v2 = if (argc > 2) if (s2 == calc_dest) calc_val else frame.data[s2] else 0;
+                    const v3 = if (argc > 3) if (s3 == calc_dest) calc_val else frame.data[s3] else 0;
+                    if (argc > 0) frame.data[0] = v0;
+                    if (argc > 1) frame.data[1] = v1;
+                    if (argc > 2) frame.data[2] = v2;
+                    if (argc > 3) frame.data[3] = v3;
+                    block_idx = 0;
+                    continue :block_loop;
+                }
                 var ip = block.start;
                 while (ip < block.end) : (ip += 1) {
                     const raw = compiled.code[ip];
@@ -2371,6 +2457,7 @@ pub const VM = struct {
                 }
 
                 switch (block.term_kind) {
+                    .fast_avg_load_eq_rr, .fast_tail_add_rc, .fast_tail_sub_rc => unreachable,
                     .br => {
                         const cond = if (block.term_cmp != 0)
                             evalTermCmp(&frame, compiled.constants, block.term_cmp)
