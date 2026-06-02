@@ -55,6 +55,8 @@ const ByteOp = enum(u8) {
     mul_rc,
     udiv_rr,
     udiv_rc,
+    urem_rr,
+    urem_rc,
     avg2_rr,
     ptr_add_rr,
     ptr_add_rc,
@@ -170,10 +172,13 @@ const CompiledFunction = struct {
     blocks: []CompiledBlock,
     constants: []u64,
     slow_inst_pcs: []usize,
+    call_targets: []ResolvedCall,
     calls: []CallMetadata,
     indirect_calls: []IndirectCallMetadata,
     slot_count: usize,
     needs_arena: bool,
+    cacheable: bool,
+    reads_memory: bool,
 };
 
 const StepResult = union(enum) {
@@ -199,10 +204,9 @@ pub const VM = struct {
     function_cacheable: std.StringHashMap(bool),
     /// Whether a cacheable function reads memory and therefore needs epoch-sensitive keys.
     function_reads_memory: std.StringHashMap(bool),
-    /// Pre-resolved call targets per function, parallel to instruction array.
-    function_call_targets: std.StringHashMap([]ResolvedCall),
     /// Compiled u32 bytecode and side tables per function.
     compiled_functions: std.StringHashMap(CompiledFunction),
+    compiled_function_ptrs: std.AutoHashMap(usize, *CompiledFunction),
     call_cache: std.AutoHashMap(CallCacheKey, usize),
     memory_epoch: u64,
     frame_pool: std.ArrayList([]u64),
@@ -229,8 +233,8 @@ pub const VM = struct {
             .function_needs_arena = std.StringHashMap(bool).init(allocator),
             .function_cacheable = std.StringHashMap(bool).init(allocator),
             .function_reads_memory = std.StringHashMap(bool).init(allocator),
-            .function_call_targets = std.StringHashMap([]ResolvedCall).init(allocator),
             .compiled_functions = std.StringHashMap(CompiledFunction).init(allocator),
+            .compiled_function_ptrs = std.AutoHashMap(usize, *CompiledFunction).init(allocator),
             .call_cache = std.AutoHashMap(CallCacheKey, usize).init(allocator),
             .memory_epoch = 1,
             .frame_pool = std.ArrayList([]u64).init(allocator),
@@ -264,11 +268,7 @@ pub const VM = struct {
         self.function_needs_arena.deinit();
         self.function_cacheable.deinit();
         self.function_reads_memory.deinit();
-        var ct_it = self.function_call_targets.iterator();
-        while (ct_it.next()) |entry| {
-            self.allocator.free(entry.value_ptr.*);
-        }
-        self.function_call_targets.deinit();
+        self.compiled_function_ptrs.deinit();
         var cf_it = self.compiled_functions.iterator();
         while (cf_it.next()) |entry| {
             self.freeCompiledFunction(entry.value_ptr);
@@ -308,6 +308,7 @@ pub const VM = struct {
         self.allocator.free(compiled.blocks);
         self.allocator.free(compiled.constants);
         self.allocator.free(compiled.slow_inst_pcs);
+        self.allocator.free(compiled.call_targets);
         for (compiled.calls) |meta| self.allocator.free(meta.args);
         self.allocator.free(compiled.calls);
         for (compiled.indirect_calls) |meta| self.allocator.free(meta.args);
@@ -318,10 +319,13 @@ pub const VM = struct {
             .blocks = &.{},
             .constants = &.{},
             .slow_inst_pcs = &.{},
+            .call_targets = &.{},
             .calls = &.{},
             .indirect_calls = &.{},
             .slot_count = 0,
             .needs_arena = false,
+            .cacheable = false,
+            .reads_memory = true,
         };
     }
 
@@ -329,8 +333,8 @@ pub const VM = struct {
         self.clearPanicState();
         try self.initFunctionsAndVtables();
 
-        const main_func = self.program.functions.get("main") orelse return self.runTestsAfterInit();
-        const main_code = try self.executeFunction(&main_func, &.{});
+        const main_func = self.program.functions.getPtr("main") orelse return self.runTestsAfterInit();
+        const main_code = try self.executeFunction(main_func, &.{});
         return @as(i32, @bitCast(@as(u32, @intCast(main_code & 0xffffffff))));
     }
 
@@ -1161,6 +1165,7 @@ pub const VM = struct {
             .sub => try appendBinary(code, constants, slow_inst_pcs, inst, inst_pc, .sub_rr, .sub_rc),
             .mul => try appendBinary(code, constants, slow_inst_pcs, inst, inst_pc, .mul_rr, .mul_rc),
             .div, .udiv => try appendBinary(code, constants, slow_inst_pcs, inst, inst_pc, .udiv_rr, .udiv_rc),
+            .rem, .urem => try appendBinary(code, constants, slow_inst_pcs, inst, inst_pc, .urem_rr, .urem_rc),
             .ptr_add => try appendBinary(code, constants, slow_inst_pcs, inst, inst_pc, .ptr_add_rr, .ptr_add_rc),
             .and_ => try appendBinary(code, constants, slow_inst_pcs, inst, inst_pc, .and_rr, .and_rr),
             .or_ => try appendBinary(code, constants, slow_inst_pcs, inst, inst_pc, .or_rr, .or_rr),
@@ -1229,7 +1234,15 @@ pub const VM = struct {
         }
     }
 
-    fn compileFunction(self: *VM, func: *const parser.Function, call_targets: []const ResolvedCall, slot_count: usize, needs_arena: bool) !CompiledFunction {
+    fn compileFunction(
+        self: *VM,
+        func: *const parser.Function,
+        call_targets: []ResolvedCall,
+        slot_count: usize,
+        needs_arena: bool,
+        cacheable: bool,
+        reads_memory: bool,
+    ) !CompiledFunction {
         var code = std.ArrayList(u32).init(self.allocator);
         errdefer code.deinit();
         var blocks = std.ArrayList(CompiledBlock).init(self.allocator);
@@ -1328,10 +1341,13 @@ pub const VM = struct {
             .blocks = try blocks.toOwnedSlice(),
             .constants = try constants.toOwnedSlice(),
             .slow_inst_pcs = try slow_inst_pcs.toOwnedSlice(),
+            .call_targets = call_targets,
             .calls = try calls.toOwnedSlice(),
             .indirect_calls = try indirect_calls.toOwnedSlice(),
             .slot_count = slot_count,
             .needs_arena = needs_arena,
+            .cacheable = cacheable,
+            .reads_memory = reads_memory,
         };
     }
 
@@ -1387,7 +1403,8 @@ pub const VM = struct {
             defer stack_alloc_slots.deinit();
 
             var call_targets = try self.allocator.alloc(ResolvedCall, func.instructions.len);
-            errdefer self.allocator.free(call_targets);
+            var call_targets_owned = true;
+            errdefer if (call_targets_owned) self.allocator.free(call_targets);
             for (call_targets) |*t| t.* = .unresolved;
 
             for (func.instructions, 0..) |*inst, pc| {
@@ -1445,11 +1462,18 @@ pub const VM = struct {
             try self.elideDeadPureInstructions(func, reg_map.count());
             call_targets = try self.compactNoOpInstructions(func, call_targets);
             const needs_arena = functionHasOp(func, .stack_alloc);
-            const compiled = try self.compileFunction(func, call_targets, reg_map.count(), needs_arena);
-            try self.function_call_targets.put(func_name, call_targets);
+            const cacheable = !self.functionHasExternalSideEffect(func);
+            const reads_memory = functionReadsMemory(func);
+            const compiled = try self.compileFunction(func, call_targets, reg_map.count(), needs_arena, cacheable, reads_memory);
+            call_targets_owned = false;
             try self.compiled_functions.put(func_name, compiled);
-            try self.function_cacheable.put(func_name, !self.functionHasExternalSideEffect(func));
-            try self.function_reads_memory.put(func_name, functionReadsMemory(func));
+            try self.function_cacheable.put(func_name, cacheable);
+            try self.function_reads_memory.put(func_name, reads_memory);
+        }
+
+        var compiled_it = self.compiled_functions.iterator();
+        while (compiled_it.next()) |entry| {
+            try self.compiled_function_ptrs.put(@intFromPtr(entry.value_ptr.func), entry.value_ptr);
         }
     }
 
@@ -1640,7 +1664,7 @@ pub const VM = struct {
                 const buf = self.frame_pool.items[idx];
                 if (buf.len >= needed) {
                     _ = self.frame_pool.swapRemove(idx);
-                    @memset(buf, 0);
+                    @memset(buf[0..needed], 0);
                     return Frame{ .data = buf, .allocator = allocator };
                 }
             }
@@ -1725,11 +1749,12 @@ pub const VM = struct {
     }
 
     fn executeInterpretedCall(self: *VM, target_func: *const parser.Function, args: []const usize) !usize {
-        if ((self.function_cacheable.get(target_func.name) orelse false)) {
-            const cache_epoch = if (self.function_reads_memory.get(target_func.name) orelse true) self.memory_epoch else 0;
+        const compiled = self.compiled_function_ptrs.get(@intFromPtr(target_func)) orelse return error.SymbolNotFound;
+        if (compiled.cacheable) {
+            const cache_epoch = if (compiled.reads_memory) self.memory_epoch else 0;
             if (makeCallCacheKey(target_func, args, cache_epoch)) |key| {
                 if (self.call_cache.get(key)) |cached| return cached;
-                const ret = try self.executeFunction(target_func, args);
+                const ret = try self.executeCompiledFunction(compiled, args);
                 if (self.call_cache.count() >= CALL_CACHE_MAX_ENTRIES) {
                     self.call_cache.clearRetainingCapacity();
                 }
@@ -1737,7 +1762,7 @@ pub const VM = struct {
                 return ret;
             }
         }
-        return self.executeFunction(target_func, args);
+        return self.executeCompiledFunction(compiled, args);
     }
 
     fn executePthreadCall(self: *VM, func_name: []const u8, args: []const usize) !usize {
@@ -2263,7 +2288,12 @@ pub const VM = struct {
     }
 
     fn executeFunction(self: *VM, func: *const parser.Function, call_args: []const usize) anyerror!usize {
-        const compiled = self.compiled_functions.getPtr(func.name) orelse return error.SymbolNotFound;
+        const compiled = self.compiled_function_ptrs.get(@intFromPtr(func)) orelse return error.SymbolNotFound;
+        return self.executeCompiledFunction(compiled, call_args);
+    }
+
+    fn executeCompiledFunction(self: *VM, compiled: *CompiledFunction, call_args: []const usize) anyerror!usize {
+        const func = compiled.func;
         const needs_arena = compiled.needs_arena;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer if (needs_arena) arena.deinit();
@@ -2283,7 +2313,7 @@ pub const VM = struct {
 
         var frame = try self.acquireFrame(local_alloc, compiled.slot_count, !needs_arena);
         defer self.releaseFrame(&frame, !needs_arena);
-        const call_targets = self.function_call_targets.get(func.name) orelse return error.SymbolNotFound;
+        const call_targets = compiled.call_targets;
 
         while (true) {
             for (current_args, 0..) |arg_val, i| frame.data[i] = arg_val;
@@ -2381,6 +2411,14 @@ pub const VM = struct {
                         .udiv_rc => {
                             const rhs = compiled.constants[rawC(raw)];
                             frame.data[rawA(raw)] = if (rhs != 0) frame.data[rawB(raw)] / rhs else 0;
+                        },
+                        .urem_rr => {
+                            const rhs = frame.data[rawC(raw)];
+                            frame.data[rawA(raw)] = if (rhs != 0) frame.data[rawB(raw)] % rhs else 0;
+                        },
+                        .urem_rc => {
+                            const rhs = compiled.constants[rawC(raw)];
+                            frame.data[rawA(raw)] = if (rhs != 0) frame.data[rawB(raw)] % rhs else 0;
                         },
                         .avg2_rr => frame.data[rawA(raw)] = (frame.data[rawB(raw)] +% frame.data[rawC(raw)]) / 2,
                         .ptr_add_rr => frame.data[rawA(raw)] = frame.data[rawB(raw)] +% frame.data[rawC(raw)],
