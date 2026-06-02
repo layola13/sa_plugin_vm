@@ -1,0 +1,4 @@
+@main() -> i32:
+L_ENTRY:
+    a = add 20, 22
+    return a

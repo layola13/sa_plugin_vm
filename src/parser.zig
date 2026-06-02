@@ -151,6 +151,32 @@ const ExternDecl = struct {
     signature: ExternSignature,
 };
 
+pub const PreprocessCacheStatus = enum {
+    disabled,
+    hit,
+    miss,
+    stale,
+    write_failed,
+
+    pub fn label(self: PreprocessCacheStatus) []const u8 {
+        return switch (self) {
+            .disabled => "disabled",
+            .hit => "hit",
+            .miss => "miss",
+            .stale => "stale",
+            .write_failed => "write_failed",
+        };
+    }
+};
+
+const FileDependency = struct {
+    path: []const u8,
+    size: u64,
+    mtime: i128,
+};
+
+const PREPROCESS_CACHE_MAGIC = "sa-vm-preprocess-cache-v1";
+
 pub const Program = struct {
     constants: std.StringHashMap([]const u8),
     functions: std.StringHashMap(Function),
@@ -195,6 +221,140 @@ pub const Program = struct {
         self.allocator.destroy(self);
     }
 };
+
+fn freeClonedParams(allocator: std.mem.Allocator, params: []const []const u8, initialized: usize) void {
+    for (params[0..initialized]) |param| allocator.free(param);
+    allocator.free(params);
+}
+
+fn cloneParams(allocator: std.mem.Allocator, src: []const []const u8) ![]const []const u8 {
+    const params = try allocator.alloc([]const u8, src.len);
+    var initialized: usize = 0;
+    errdefer freeClonedParams(allocator, params, initialized);
+    for (src, 0..) |param, idx| {
+        params[idx] = try allocator.dupe(u8, param);
+        initialized += 1;
+    }
+    return params;
+}
+
+fn freeClonedArgs(allocator: std.mem.Allocator, args: []Operand, initialized: usize) void {
+    for (args[0..initialized]) |arg| allocator.free(arg.name);
+    allocator.free(args);
+}
+
+fn cloneArgs(allocator: std.mem.Allocator, src: []const Operand) ![]Operand {
+    const args = try allocator.alloc(Operand, src.len);
+    var initialized: usize = 0;
+    errdefer freeClonedArgs(allocator, args, initialized);
+    for (src, 0..) |arg, idx| {
+        args[idx] = arg;
+        args[idx].name = try allocator.dupe(u8, arg.name);
+        initialized += 1;
+    }
+    return args;
+}
+
+fn freeClonedInstructions(allocator: std.mem.Allocator, instructions: []Instruction, initialized: usize) void {
+    for (instructions[0..initialized]) |inst| {
+        if (inst.dest) |dest| allocator.free(dest);
+        freeClonedArgs(allocator, inst.args, inst.args.len);
+    }
+    allocator.free(instructions);
+}
+
+fn cloneInstructions(allocator: std.mem.Allocator, src: []const Instruction) ![]Instruction {
+    const instructions = try allocator.alloc(Instruction, src.len);
+    var initialized: usize = 0;
+    errdefer freeClonedInstructions(allocator, instructions, initialized);
+    for (src, 0..) |inst, idx| {
+        const args = try cloneArgs(allocator, inst.args);
+        errdefer freeClonedArgs(allocator, args, args.len);
+        const dest = if (inst.dest) |d| try allocator.dupe(u8, d) else null;
+        instructions[idx] = inst;
+        instructions[idx].dest = dest;
+        instructions[idx].args = args;
+        initialized += 1;
+    }
+    return instructions;
+}
+
+fn freeClonedBlocks(allocator: std.mem.Allocator, blocks: []BasicBlock, initialized: usize) void {
+    for (blocks[0..initialized]) |block| allocator.free(block.label);
+    allocator.free(blocks);
+}
+
+fn cloneBlocks(allocator: std.mem.Allocator, src: []const BasicBlock) ![]const BasicBlock {
+    const blocks = try allocator.alloc(BasicBlock, src.len);
+    var initialized: usize = 0;
+    errdefer freeClonedBlocks(allocator, blocks, initialized);
+    for (src, 0..) |block, idx| {
+        blocks[idx] = .{
+            .label = try allocator.dupe(u8, block.label),
+            .start_inst = block.start_inst,
+            .end_inst = block.end_inst,
+        };
+        initialized += 1;
+    }
+    return blocks;
+}
+
+pub fn cloneProgram(allocator: std.mem.Allocator, src: *const Program) !*Program {
+    const out = try allocator.create(Program);
+    out.* = .{
+        .constants = std.StringHashMap([]const u8).init(allocator),
+        .functions = std.StringHashMap(Function).init(allocator),
+        .externs = std.StringHashMap(ExternSignature).init(allocator),
+        .allocator = allocator,
+    };
+    errdefer out.deinit();
+
+    var const_it = src.constants.iterator();
+    while (const_it.next()) |entry| {
+        const key = try allocator.dupe(u8, entry.key_ptr.*);
+        errdefer allocator.free(key);
+        const value = try allocator.dupe(u8, entry.value_ptr.*);
+        errdefer allocator.free(value);
+        try out.constants.put(key, value);
+    }
+
+    var extern_it = src.externs.iterator();
+    while (extern_it.next()) |entry| {
+        const key = try allocator.dupe(u8, entry.key_ptr.*);
+        errdefer allocator.free(key);
+        const arg_types = try allocator.dupe(PrimType, entry.value_ptr.arg_types);
+        errdefer allocator.free(arg_types);
+        try out.externs.put(key, .{
+            .arg_types = arg_types,
+            .return_type = entry.value_ptr.return_type,
+            .returns_result = entry.value_ptr.returns_result,
+        });
+    }
+
+    var func_it = src.functions.iterator();
+    while (func_it.next()) |entry| {
+        const src_func = entry.value_ptr.*;
+        const name = try allocator.dupe(u8, entry.key_ptr.*);
+        errdefer allocator.free(name);
+
+        const params = try cloneParams(allocator, src_func.params);
+        errdefer freeClonedParams(allocator, params, params.len);
+        const instructions = try cloneInstructions(allocator, src_func.instructions);
+        errdefer freeClonedInstructions(allocator, instructions, instructions.len);
+        const blocks = try cloneBlocks(allocator, src_func.blocks);
+        errdefer freeClonedBlocks(allocator, @constCast(blocks), blocks.len);
+
+        try out.functions.put(name, .{
+            .name = name,
+            .params = params,
+            .instructions = instructions,
+            .blocks = blocks,
+            .returns_result = src_func.returns_result,
+        });
+    }
+
+    return out;
+}
 
 const Macro = struct {
     name: []const u8,
@@ -294,6 +454,8 @@ pub const Parser = struct {
     macros: std.StringHashMap(Macro),
     constants: std.StringHashMap([]const u8),
     def_macros: std.StringHashMap([]const u8),
+    dependencies: std.ArrayList(FileDependency),
+    preprocess_cache_status: PreprocessCacheStatus = .disabled,
     macro_counter: usize = 0,
     expansion_counter: u64 = 0,
     expr_counter: u64 = 0,
@@ -305,6 +467,8 @@ pub const Parser = struct {
             .macros = std.StringHashMap(Macro).init(allocator),
             .constants = std.StringHashMap([]const u8).init(allocator),
             .def_macros = std.StringHashMap([]const u8).init(allocator),
+            .dependencies = std.ArrayList(FileDependency).init(allocator),
+            .preprocess_cache_status = .disabled,
             .macro_counter = 0,
             .expansion_counter = 0,
             .expr_counter = 0,
@@ -340,9 +504,14 @@ pub const Parser = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.def_macros.deinit();
+
+        for (self.dependencies.items) |dep| self.allocator.free(dep.path);
+        self.dependencies.deinit();
     }
 
     fn readLines(self: *Parser, file_path: []const u8) ![][]const u8 {
+        const resolved_primary = try std.fs.path.resolve(self.allocator, &.{file_path});
+        defer self.allocator.free(resolved_primary);
         const file = std.fs.cwd().openFile(file_path, .{}) catch |err| {
             if (err == error.FileNotFound and self.main_root_dir != null) {
                 const resolved = std.fs.path.resolve(self.allocator, &.{ self.main_root_dir.?, file_path }) catch return err;
@@ -351,16 +520,26 @@ pub const Parser = struct {
                     std.debug.print("Failed to open file: {s}, error: {}\n", .{ file_path, err });
                     return err;
                 };
-                return try self.readLinesFromFile(file_fallback);
+                return try self.readLinesFromFile(file_fallback, resolved);
             }
             std.debug.print("Failed to open file: {s}, error: {}\n", .{ file_path, err });
             return err;
         };
-        return try self.readLinesFromFile(file);
+        return try self.readLinesFromFile(file, resolved_primary);
     }
 
-    fn readLinesFromFile(self: *Parser, file: std.fs.File) ![][]const u8 {
+    fn addDependency(self: *Parser, path: []const u8, stat: std.fs.File.Stat) !void {
+        try self.dependencies.append(.{
+            .path = try self.allocator.dupe(u8, path),
+            .size = stat.size,
+            .mtime = stat.mtime,
+        });
+    }
+
+    fn readLinesFromFile(self: *Parser, file: std.fs.File, dep_path: []const u8) ![][]const u8 {
         defer file.close();
+        const stat = try file.stat();
+        try self.addDependency(dep_path, stat);
         const content = try file.readToEndAlloc(self.allocator, 10 * 1024 * 1024);
         defer self.allocator.free(content);
 
@@ -425,9 +604,151 @@ pub const Parser = struct {
         }
     }
 
+    fn hexNibble(byte: u8) ?u8 {
+        if (byte >= '0' and byte <= '9') return byte - '0';
+        if (byte >= 'a' and byte <= 'f') return byte - 'a' + 10;
+        if (byte >= 'A' and byte <= 'F') return byte - 'A' + 10;
+        return null;
+    }
+
+    fn writeHex(writer: std.io.AnyWriter, bytes: []const u8) !void {
+        const alphabet = "0123456789abcdef";
+        for (bytes) |byte| {
+            try writer.writeByte(alphabet[byte >> 4]);
+            try writer.writeByte(alphabet[byte & 0x0f]);
+        }
+    }
+
+    fn decodeHex(self: *Parser, encoded: []const u8) ![]u8 {
+        if (encoded.len % 2 != 0) return error.InvalidPreprocessCache;
+        const out = try self.allocator.alloc(u8, encoded.len / 2);
+        errdefer self.allocator.free(out);
+        var idx: usize = 0;
+        while (idx < out.len) : (idx += 1) {
+            const hi = hexNibble(encoded[idx * 2]) orelse return error.InvalidPreprocessCache;
+            const lo = hexNibble(encoded[idx * 2 + 1]) orelse return error.InvalidPreprocessCache;
+            out[idx] = (hi << 4) | lo;
+        }
+        return out;
+    }
+
+    fn cachePathForMain(self: *Parser, cache_root: []const u8, canonical_main: []const u8) ![]const u8 {
+        const hash = std.hash.Wyhash.hash(0, canonical_main);
+        const name = try std.fmt.allocPrint(self.allocator, "{x}.pre", .{hash});
+        defer self.allocator.free(name);
+        return try std.fs.path.join(self.allocator, &.{ cache_root, name });
+    }
+
+    fn validateCacheDependency(self: *Parser, line: []const u8) !bool {
+        var it = std.mem.splitScalar(u8, line, '\t');
+        const tag = it.next() orelse return error.InvalidPreprocessCache;
+        if (!std.mem.eql(u8, tag, "dep")) return error.InvalidPreprocessCache;
+        const size_raw = it.next() orelse return error.InvalidPreprocessCache;
+        const mtime_raw = it.next() orelse return error.InvalidPreprocessCache;
+        const path_hex = it.next() orelse return error.InvalidPreprocessCache;
+        const expected_size = try std.fmt.parseInt(u64, size_raw, 10);
+        const expected_mtime = try std.fmt.parseInt(i128, mtime_raw, 10);
+        const path = try self.decodeHex(path_hex);
+        defer self.allocator.free(path);
+        const file = std.fs.cwd().openFile(path, .{}) catch return false;
+        defer file.close();
+        const stat = file.stat() catch return false;
+        return stat.size == expected_size and stat.mtime == expected_mtime;
+    }
+
+    fn loadPreprocessCache(self: *Parser, cache_path: []const u8) !?[][]const u8 {
+        const file = std.fs.cwd().openFile(cache_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return null,
+        };
+        defer file.close();
+        const content = file.readToEndAlloc(self.allocator, 32 * 1024 * 1024) catch return null;
+        defer self.allocator.free(content);
+
+        var first_pass = std.mem.splitScalar(u8, content, '\n');
+        const magic = first_pass.next() orelse return null;
+        if (!std.mem.eql(u8, magic, PREPROCESS_CACHE_MAGIC)) return null;
+        while (first_pass.next()) |line| {
+            if (line.len == 0) continue;
+            if (!std.mem.startsWith(u8, line, "dep\t")) break;
+            if (!(try self.validateCacheDependency(line))) {
+                self.preprocess_cache_status = .stale;
+                return null;
+            }
+        }
+
+        var lines = std.ArrayList([]const u8).init(self.allocator);
+        errdefer {
+            for (lines.items) |l| self.allocator.free(l);
+            lines.deinit();
+        }
+
+        var second_pass = std.mem.splitScalar(u8, content, '\n');
+        _ = second_pass.next();
+        while (second_pass.next()) |line| {
+            if (line.len == 0 or std.mem.startsWith(u8, line, "dep\t")) continue;
+            if (std.mem.startsWith(u8, line, "const\t")) {
+                var it = std.mem.splitScalar(u8, line, '\t');
+                _ = it.next();
+                const key_hex = it.next() orelse return null;
+                const value_hex = it.next() orelse return null;
+                const key = try self.decodeHex(key_hex);
+                errdefer self.allocator.free(key);
+                const value = try self.decodeHex(value_hex);
+                errdefer self.allocator.free(value);
+                try self.constants.put(key, value);
+            } else if (std.mem.startsWith(u8, line, "line\t")) {
+                const encoded = line["line\t".len..];
+                try lines.append(try self.decodeHex(encoded));
+            } else {
+                return null;
+            }
+        }
+        self.preprocess_cache_status = .hit;
+        return try lines.toOwnedSlice();
+    }
+
+    fn writePreprocessCache(self: *Parser, cache_root: []const u8, cache_path: []const u8, lines: [][]const u8) !void {
+        try std.fs.cwd().makePath(cache_root);
+        const file = try std.fs.cwd().createFile(cache_path, .{});
+        defer file.close();
+        const writer = file.writer().any();
+        try writer.print("{s}\n", .{PREPROCESS_CACHE_MAGIC});
+        for (self.dependencies.items) |dep| {
+            try writer.print("dep\t{d}\t{d}\t", .{ dep.size, dep.mtime });
+            try writeHex(writer, dep.path);
+            try writer.writeByte('\n');
+        }
+        var const_it = self.constants.iterator();
+        while (const_it.next()) |entry| {
+            try writer.writeAll("const\t");
+            try writeHex(writer, entry.key_ptr.*);
+            try writer.writeByte('\t');
+            try writeHex(writer, entry.value_ptr.*);
+            try writer.writeByte('\n');
+        }
+        for (lines) |line| {
+            try writer.writeAll("line\t");
+            try writeHex(writer, line);
+            try writer.writeByte('\n');
+        }
+    }
+
     pub fn preprocess(self: *Parser, main_file: []const u8) ![][]const u8 {
+        return self.preprocessWithCache(main_file, null);
+    }
+
+    pub fn preprocessWithCache(self: *Parser, main_file: []const u8, cache_root: ?[]const u8) ![][]const u8 {
         const canonical_main = try std.fs.path.resolve(self.allocator, &.{main_file});
         defer self.allocator.free(canonical_main);
+
+        if (cache_root) |root| {
+            const cache_path = try self.cachePathForMain(root, canonical_main);
+            defer self.allocator.free(cache_path);
+            if (try self.loadPreprocessCache(cache_path)) |cached| return cached;
+        } else {
+            self.preprocess_cache_status = .disabled;
+        }
 
         const base_dir = std.fs.path.dirname(canonical_main) orelse ".";
         self.main_root_dir = try self.allocator.dupe(u8, base_dir);
@@ -460,7 +781,16 @@ pub const Parser = struct {
         for (all_lines.items) |l| self.allocator.free(l);
         all_lines.deinit();
 
-        return try final_lines.toOwnedSlice();
+        const final = try final_lines.toOwnedSlice();
+        if (cache_root) |root| {
+            if (self.preprocess_cache_status != .stale) self.preprocess_cache_status = .miss;
+            const write_cache_path = try self.cachePathForMain(root, canonical_main);
+            defer self.allocator.free(write_cache_path);
+            self.writePreprocessCache(root, write_cache_path, final) catch {
+                self.preprocess_cache_status = .write_failed;
+            };
+        }
+        return final;
     }
 
     fn collectDefinedNames(self: *Parser, body: [][]const u8, defined_names: *std.StringHashMap(void)) !void {

@@ -121,7 +121,7 @@ zig build test
 zig build -Doptimize=ReleaseFast
 
 # Run a simple VM smoke test
-SA_PLUGIN_DEV=1 SA_PLUGINS_PATH="$PWD/zig-out/lib" sa vm run tests/hello_world.sa
+SA_PLUGIN_DEV=1 SA_PLUGINS_PATH="$PWD/zig-out/lib/libvm.so" sa vm run tests/hello_world.sa
 ```
 
 Representative external compatibility check used during current work:
@@ -129,7 +129,8 @@ Representative external compatibility check used during current work:
 | Status | Count | Notes |
 |---|---|---|
 | ✅ PASS | 35/35 | `/home/vscode/projects/TheAlgorithms/Sa/tests/*.sa` under `sa vm test` |
-| ✅ PASS | 4/4 | `bench_search.sa`, `bench_bst_1000.sa`, `bench_merge.sa`, `bench_sorting.sa` ran without VM crashes |
+| ✅ PASS | 6/6 | `bench_bst.sa`, `bench_search.sa`, `bench_linear.sa`, `bench_bubble.sa`, `bench_merge.sa`, and `bench_sorting.sa` run without VM crashes |
+| ✅ PASS | 1/1 | `tests/vm_tail_arena.sa` covers tail self-calls in functions that need arena-backed `stack_alloc` frames |
 
 This repository also includes regression fixtures for `@test` fallback mode and dead pure instruction elimination under [`tests/`](</home/vscode/projects/sa_plugins/sa_plugin_vm/tests>).
 
@@ -146,14 +147,55 @@ zig build -Doptimize=ReleaseFast
 ### Install
 ```bash
 zig build -Doptimize=ReleaseFast
+../scripts/plugin-manager.sh install vm
 ```
 
 ### Verify
 ```bash
 sa plugin list
-sa vm run /path/to/demo/main.sa
-sa vm test /path/to/tests.sa
+SA_PLUGIN_DEV=1 sa vm run /path/to/demo/main.sa
+SA_PLUGIN_DEV=1 sa vm test /path/to/tests.sa
 ```
+
+The current host blocks privileged plugins in formal runtime mode unless a sandbox-enforced `permissions.lock` is present. Because `vm` declares project filesystem, cache, environment, and optional process permissions, installed command dispatch currently requires `SA_PLUGIN_DEV=1` for trusted local verification.
+
+### Runtime Stats and Profiling
+```bash
+sa vm run --stats /path/to/file.sa
+sa vm run --profile=10 /path/to/file.sa
+```
+
+`--stats` prints preprocess, persistent preprocess-cache status, parse, in-process parse-cache status, FFI loading, binding, execution, bytecode, call-cache, frame-pool, and tail-restart counters to stderr. `--profile=N` includes the same stats plus the top interpreted functions by inclusive VM time.
+
+Preprocess cache entries are stored under `$SA_CACHE/vm/preprocess` when `SA_CACHE` is set, otherwise under `$HOME/.cache/sa/vm/preprocess`. The cache stores expanded source lines plus `@const` data and validates all imported dependencies by size and mtime before reuse.
+
+Parsed Program templates are cached in-process behind a fixed-size LRU. The VM stores only an unbound parsed AST template and clones it before binding/bytecode quickening, so cached templates are not mutated by execution. This improves repeated plugin dispatches in the same `sa` process and is a safe stepping stone toward a future serialized persistent AST cache; separate CLI invocations still pay parse/bind startup cost.
+
+Debug toggles for isolating optimization impact:
+
+```bash
+SA_VM_DISABLE_CALL_CACHE=1 sa vm run --stats /path/to/file.sa
+SA_VM_DISABLE_TAIL_RESTART=1 sa vm run --stats /path/to/file.sa
+SA_VM_DISABLE_BLOCK_FASTPATH=1 sa vm run --stats /path/to/file.sa
+SA_VM_DISABLE_INTERPRETED_FASTPATH=1 sa vm run --stats /path/to/file.sa
+SA_VM_DISABLE_PREPROCESS_CACHE=1 sa vm run --stats /path/to/file.sa
+SA_VM_DISABLE_PARSE_CACHE=1 sa vm run --stats /path/to/file.sa
+```
+
+### TheAlgorithms Benchmark Runner
+```bash
+RUNS=3 tools/bench_thealgorithms.sh /home/vscode/projects/TheAlgorithms/Sa
+
+# Include execute-only VM timings parsed from `sa vm run --stats`:
+RUNS=3 VM_STATS=1 tools/bench_thealgorithms.sh /home/vscode/projects/TheAlgorithms/Sa
+
+# Benchmark a local, not-yet-installed build:
+RUNS=3 SA_VM_LIB="$PWD/zig-out/lib/libvm.so" tools/bench_thealgorithms.sh /home/vscode/projects/TheAlgorithms/Sa
+```
+
+The runner reports native/VM mean and median times, mean and median ratios, benchmark exit payloads, and the VM plugin hash used for the run. With `VM_STATS=1`, it also reports execute-only VM mean/median times and execute-only median ratio. Non-zero benchmark exit statuses are timing payloads for these benchmark files; signal exits and VM diagnostics should still be treated as failures.
+
+The current completion assessment and remaining improvement plan are tracked in [`docs/vm_completion_assessment.md`](</home/vscode/projects/sa_plugins/sa_plugin_vm/docs/vm_completion_assessment.md>).
 
 ---
 
@@ -162,3 +204,4 @@ sa vm test /path/to/tests.sa
 - `panic` / `panic_msg` instructions print `PANIC` / `PANIC[code]` and terminate with the SA-compatible exit code `128 + (code & 0x7f)`, but they still do not print a backtrace.
 - `f32`/`f64` floating-point arithmetic is still represented as raw bits internally; floating-point comparisons are not a supported execution path yet.
 - The thread model is synchronous inside the VM. It is sufficient for the current demos and benchmarks, but it is not a host-level pthread scheduler.
+- Very small native baselines are noisy at process-level timing granularity. Use the benchmark runner's median columns and `sa vm run --stats` execute-time counters when judging whether a case is inside the 10x target.

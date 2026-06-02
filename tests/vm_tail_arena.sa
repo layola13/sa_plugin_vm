@@ -1,0 +1,31 @@
+@count_with_slot(i: u64, n: u64) -> u64:
+L_ENTRY:
+    done = eq i, n
+    slot = stack_alloc 8
+    store slot+0, i as u64
+    br done -> L_DONE, L_STEP
+L_STEP:
+    one = 1 as u64
+    ni = add i, one
+    result = call @count_with_slot(ni, n)
+    !slot
+    !one
+    !ni
+    !done
+    return result
+L_DONE:
+    !slot
+    !done
+    return i
+
+@main() -> i32:
+L_ENTRY:
+    zero = 0 as u64
+    n = 2048 as u64
+    result = call @count_with_slot(zero, n)
+    ok = eq result, n
+    br ok -> L_OK, L_FAIL
+L_OK:
+    return 0
+L_FAIL:
+    return 1

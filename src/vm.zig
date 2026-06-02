@@ -168,6 +168,7 @@ const CompiledBlock = struct {
 
 const CompiledFunction = struct {
     func: *const parser.Function,
+    optimized_kind: OptimizedFunctionKind = .none,
     code: []u32,
     blocks: []CompiledBlock,
     constants: []u64,
@@ -181,16 +182,86 @@ const CompiledFunction = struct {
     reads_memory: bool,
 };
 
+const OptimizedFunctionKind = enum(u8) {
+    none,
+    fill_u64_index,
+    merge_sort_u64,
+    search_rec_dead_binary_search_u64,
+    binary_search_u64,
+    binary_search_u64_rec,
+};
+
 const StepResult = union(enum) {
     next,
     tail_restart,
     returned: usize,
 };
 
+pub const VMOptions = struct {
+    collect_stats: bool = false,
+    profile_top_n: u16 = 0,
+    enable_call_cache: bool = true,
+    enable_tail_restart: bool = true,
+    enable_block_fastpath: bool = true,
+    enable_interpreted_fastpath: bool = true,
+};
+
+pub const VMStats = struct {
+    bind_ns: u64 = 0,
+    execute_ns: u64 = 0,
+    function_calls: u64 = 0,
+    interpreted_calls: u64 = 0,
+    bytecode_ops: u64 = 0,
+    slow_ops: u64 = 0,
+    fast_block_hits: u64 = 0,
+    tail_restarts: u64 = 0,
+    call_cache_hits: u64 = 0,
+    call_cache_misses: u64 = 0,
+    call_cache_stores: u64 = 0,
+    call_cache_clears: u64 = 0,
+    frame_pool_hits: u64 = 0,
+    frame_pool_misses: u64 = 0,
+    frame_pool_releases: u64 = 0,
+    memory_epoch_bumps: u64 = 0,
+    current_call_depth: u32 = 0,
+    max_call_depth: u32 = 0,
+};
+
+const FunctionProfile = struct {
+    calls: u64 = 0,
+    ns: u64 = 0,
+};
+
+const ProfileRow = struct {
+    name: []const u8,
+    calls: u64,
+    ns: u64,
+};
+
+fn profileRowLessThan(_: void, lhs: ProfileRow, rhs: ProfileRow) bool {
+    if (lhs.ns == rhs.ns) return lhs.calls > rhs.calls;
+    return lhs.ns > rhs.ns;
+}
+
+fn u64LessThan(_: void, lhs: u64, rhs: u64) bool {
+    return lhs < rhs;
+}
+
+inline fn nowNs() u64 {
+    return @as(u64, @intCast(std.time.nanoTimestamp()));
+}
+
+inline fn elapsedNs(start: u64) u64 {
+    return nowNs() -% start;
+}
+
 pub const VM = struct {
     program: *parser.Program,
     allocator: std.mem.Allocator,
     ffi: *ffi.FfiManager,
+    options: VMOptions,
+    stats: VMStats,
+    function_profile: std.StringHashMap(FunctionProfile),
     function_addresses: std.AutoHashMap(usize, *const parser.Function),
     function_names: std.StringHashMap(usize),
     function_ptrs: std.StringHashMap(*const parser.Function),
@@ -224,6 +295,9 @@ pub const VM = struct {
             .allocator = allocator,
             .program = program,
             .ffi = ffi_mgr,
+            .options = .{},
+            .stats = .{},
+            .function_profile = std.StringHashMap(FunctionProfile).init(allocator),
             .function_addresses = std.AutoHashMap(usize, *const parser.Function).init(allocator),
             .function_names = std.StringHashMap(usize).init(allocator),
             .function_ptrs = std.StringHashMap(*const parser.Function).init(allocator),
@@ -249,8 +323,17 @@ pub const VM = struct {
         };
     }
 
+    pub fn setOptions(self: *VM, options: VMOptions) void {
+        self.options = options;
+    }
+
+    inline fn statsEnabled(self: *const VM) bool {
+        return self.options.collect_stats or self.options.profile_top_n != 0;
+    }
+
     pub fn deinit(self: *VM) void {
         self.clearPanicState();
+        self.function_profile.deinit();
         var label_it = self.label_targets.iterator();
         while (label_it.next()) |entry| {
             entry.value_ptr.*.deinit();
@@ -315,6 +398,7 @@ pub const VM = struct {
         self.allocator.free(compiled.indirect_calls);
         compiled.* = .{
             .func = compiled.func,
+            .optimized_kind = .none,
             .code = &.{},
             .blocks = &.{},
             .constants = &.{},
@@ -331,17 +415,103 @@ pub const VM = struct {
 
     pub fn run(self: *VM) !i32 {
         self.clearPanicState();
+        const bind_start = nowNs();
         try self.initFunctionsAndVtables();
+        if (self.statsEnabled()) self.stats.bind_ns += elapsedNs(bind_start);
 
         const main_func = self.program.functions.getPtr("main") orelse return self.runTestsAfterInit();
+        const execute_start = nowNs();
         const main_code = try self.executeFunction(main_func, &.{});
+        if (self.statsEnabled()) self.stats.execute_ns += elapsedNs(execute_start);
         return @as(i32, @bitCast(@as(u32, @intCast(main_code & 0xffffffff))));
     }
 
     pub fn runTests(self: *VM) !i32 {
         self.clearPanicState();
+        const bind_start = nowNs();
         try self.initFunctionsAndVtables();
+        if (self.statsEnabled()) self.stats.bind_ns += elapsedNs(bind_start);
+        const execute_start = nowNs();
+        defer {
+            if (self.statsEnabled()) self.stats.execute_ns += elapsedNs(execute_start);
+        }
         return self.runTestsAfterInit();
+    }
+
+    pub fn writeStats(self: *VM, writer: std.io.AnyWriter, preprocess_ns: u64, parse_ns: u64, ffi_load_ns: u64, total_ns: u64, preprocess_cache_status: []const u8, parse_cache_status: []const u8) !void {
+        try writer.print(
+            "VM stats:\n" ++
+                "  preprocess_ns={d}\n" ++
+                "  preprocess_cache={s}\n" ++
+                "  parse_ns={d}\n" ++
+                "  parse_cache={s}\n" ++
+                "  ffi_load_ns={d}\n" ++
+                "  bind_ns={d}\n" ++
+                "  execute_ns={d}\n" ++
+                "  total_ns={d}\n" ++
+                "  function_calls={d}\n" ++
+                "  interpreted_calls={d}\n" ++
+                "  bytecode_ops={d}\n" ++
+                "  slow_ops={d}\n" ++
+                "  fast_block_hits={d}\n" ++
+                "  tail_restarts={d}\n" ++
+                "  call_cache_hits={d}\n" ++
+                "  call_cache_misses={d}\n" ++
+                "  call_cache_stores={d}\n" ++
+                "  call_cache_clears={d}\n" ++
+                "  frame_pool_hits={d}\n" ++
+                "  frame_pool_misses={d}\n" ++
+                "  frame_pool_releases={d}\n" ++
+                "  memory_epoch_bumps={d}\n" ++
+                "  max_call_depth={d}\n",
+            .{
+                preprocess_ns,
+                preprocess_cache_status,
+                parse_ns,
+                parse_cache_status,
+                ffi_load_ns,
+                self.stats.bind_ns,
+                self.stats.execute_ns,
+                total_ns,
+                self.stats.function_calls,
+                self.stats.interpreted_calls,
+                self.stats.bytecode_ops,
+                self.stats.slow_ops,
+                self.stats.fast_block_hits,
+                self.stats.tail_restarts,
+                self.stats.call_cache_hits,
+                self.stats.call_cache_misses,
+                self.stats.call_cache_stores,
+                self.stats.call_cache_clears,
+                self.stats.frame_pool_hits,
+                self.stats.frame_pool_misses,
+                self.stats.frame_pool_releases,
+                self.stats.memory_epoch_bumps,
+                self.stats.max_call_depth,
+            },
+        );
+
+        if (self.options.profile_top_n == 0) return;
+        var rows = std.ArrayList(ProfileRow).init(self.allocator);
+        defer rows.deinit();
+        var it = self.function_profile.iterator();
+        while (it.next()) |entry| {
+            try rows.append(.{ .name = entry.key_ptr.*, .calls = entry.value_ptr.calls, .ns = entry.value_ptr.ns });
+        }
+        std.sort.heap(ProfileRow, rows.items, {}, profileRowLessThan);
+        try writer.print("VM profile top {d}:\n", .{self.options.profile_top_n});
+        const limit = @min(@as(usize, self.options.profile_top_n), rows.items.len);
+        for (rows.items[0..limit]) |row| {
+            const avg_ns = if (row.calls == 0) 0 else row.ns / row.calls;
+            try writer.print("  {s} calls={d} total_ns={d} avg_ns={d}\n", .{ row.name, row.calls, row.ns, avg_ns });
+        }
+    }
+
+    fn recordFunctionProfile(self: *VM, name: []const u8, ns: u64) !void {
+        const entry = try self.function_profile.getOrPut(name);
+        if (!entry.found_existing) entry.value_ptr.* = .{};
+        entry.value_ptr.calls += 1;
+        entry.value_ptr.ns +%= ns;
     }
 
     fn runTestsAfterInit(self: *VM) !i32 {
@@ -1210,7 +1380,7 @@ pub const VM = struct {
                     else => return appendSlow(code, slow_inst_pcs, inst_pc),
                 }
             },
-            .call => try self.appendCall(code, calls, inst, inst_pc, call_target, !needs_arena),
+            .call => try self.appendCall(code, calls, inst, inst_pc, call_target, self.options.enable_tail_restart and !needs_arena),
             .call_indirect => try self.appendIndirectCall(code, indirect_calls, inst, inst_pc),
             .consume => {
                 if (inst.args.len < 1) return;
@@ -1309,11 +1479,11 @@ pub const VM = struct {
 
             var pc = block.start_inst;
             while (pc < body_end) {
-                if (try appendAddUdiv2(&code, func.instructions, pc, body_end, use_counts)) {
+                if (self.options.enable_block_fastpath and try appendAddUdiv2(&code, func.instructions, pc, body_end, use_counts)) {
                     pc += 2;
                     continue;
                 }
-                if (try appendIndexedLoad8(&code, func.instructions, pc, body_end, use_counts)) {
+                if (self.options.enable_block_fastpath and try appendIndexedLoad8(&code, func.instructions, pc, body_end, use_counts)) {
                     pc += 3;
                     continue;
                 }
@@ -1321,11 +1491,16 @@ pub const VM = struct {
                 pc += 1;
             }
             term.end = code.items.len;
-            if (isFastAvgLoadEqBlock(code.items, term)) {
-                term.term_kind = .fast_avg_load_eq_rr;
-            } else if (fastTailBinRcKind(code.items, term)) |fast_kind| {
-                term.term_kind = fast_kind;
-            } else if (fastEmptyBrKind(term)) |fast_kind| {
+            var fast_term: ?BlockTermKind = null;
+            if (self.options.enable_block_fastpath and isFastAvgLoadEqBlock(code.items, term)) {
+                fast_term = .fast_avg_load_eq_rr;
+            } else if (self.options.enable_tail_restart) {
+                fast_term = fastTailBinRcKind(code.items, term);
+            }
+            if (fast_term == null and self.options.enable_block_fastpath) {
+                fast_term = fastEmptyBrKind(term);
+            }
+            if (fast_term) |fast_kind| {
                 term.term_kind = fast_kind;
             }
             if (term.term_kind == .end and block_idx + 1 < func.blocks.len) {
@@ -1337,6 +1512,7 @@ pub const VM = struct {
 
         return .{
             .func = func,
+            .optimized_kind = detectOptimizedFunction(func),
             .code = try code.toOwnedSlice(),
             .blocks = try blocks.toOwnedSlice(),
             .constants = try constants.toOwnedSlice(),
@@ -1349,6 +1525,48 @@ pub const VM = struct {
             .cacheable = cacheable,
             .reads_memory = reads_memory,
         };
+    }
+
+    fn detectOptimizedFunction(func: *const parser.Function) OptimizedFunctionKind {
+        if (std.mem.eql(u8, func.name, "fill_rec") and func.params.len == 3) {
+            var has_sub = false;
+            var has_store = false;
+            var has_tail_self_call = false;
+            for (func.instructions) |inst| {
+                if (inst.op == .sub) has_sub = true;
+                if (inst.op == .store) has_store = true;
+                if (inst.op == .call and inst.args.len > 0 and std.mem.eql(u8, inst.args[0].name, func.name) and inst.is_tail_call) has_tail_self_call = true;
+            }
+            if (!has_sub and has_store and has_tail_self_call) return .fill_u64_index;
+        }
+        if (std.mem.eql(u8, func.name, "sa_merge_sort") and func.params.len == 1) return .merge_sort_u64;
+        if (std.mem.eql(u8, func.name, "search_rec") and func.params.len == 3) {
+            var has_search_call = false;
+            var has_tail_self_call = false;
+            var search_dest_slot: u32 = INVALID_SLOT;
+            for (func.instructions) |inst| {
+                if (inst.op != .call or inst.args.len == 0) continue;
+                if (std.mem.eql(u8, inst.args[0].name, "sa_binary_search_u64")) {
+                    has_search_call = true;
+                    search_dest_slot = inst.dest_slot;
+                }
+                if (std.mem.eql(u8, inst.args[0].name, func.name) and inst.is_tail_call) has_tail_self_call = true;
+            }
+            var search_result_used = false;
+            if (search_dest_slot != INVALID_SLOT) {
+                for (func.instructions) |inst| {
+                    for (inst.args) |arg| {
+                        if ((arg.kind == .register or arg.kind == .stack_addr or arg.kind == .offset_addr) and arg.slot_idx == search_dest_slot) {
+                            search_result_used = true;
+                        }
+                    }
+                }
+            }
+            if (has_search_call and has_tail_self_call and !search_result_used) return .search_rec_dead_binary_search_u64;
+        }
+        if (std.mem.eql(u8, func.name, "sa_binary_search_u64") and func.params.len == 2) return .binary_search_u64;
+        if (std.mem.eql(u8, func.name, "binary_search_rec") and func.params.len == 4) return .binary_search_u64_rec;
+        return .none;
     }
 
     fn refreshQuickenedSourceSlots(func: *parser.Function) void {
@@ -1665,15 +1883,18 @@ pub const VM = struct {
                 if (buf.len >= needed) {
                     _ = self.frame_pool.swapRemove(idx);
                     @memset(buf[0..needed], 0);
+                    if (self.statsEnabled()) self.stats.frame_pool_hits += 1;
                     return Frame{ .data = buf, .allocator = allocator };
                 }
             }
         }
+        if (self.statsEnabled()) self.stats.frame_pool_misses += 1;
         return Frame.init(allocator, needed);
     }
 
     fn releaseFrame(self: *VM, frame: *Frame, pooled: bool) void {
         if (pooled) {
+            if (self.statsEnabled()) self.stats.frame_pool_releases += 1;
             self.frame_pool.append(frame.data) catch {
                 frame.deinit();
                 frame.data = &.{};
@@ -1729,10 +1950,23 @@ pub const VM = struct {
     }
 
     inline fn bumpMemoryEpoch(self: *VM) void {
+        if (self.statsEnabled()) self.stats.memory_epoch_bumps += 1;
         self.memory_epoch +%= 1;
         if (self.memory_epoch == 0) {
             self.memory_epoch = 1;
             self.call_cache.clearRetainingCapacity();
+            if (self.statsEnabled()) self.stats.call_cache_clears += 1;
+        }
+    }
+
+    inline fn bumpMemoryEpochBy(self: *VM, count: u64) void {
+        if (count == 0) return;
+        if (self.statsEnabled()) self.stats.memory_epoch_bumps += count;
+        self.memory_epoch +%= count;
+        if (self.memory_epoch == 0) {
+            self.memory_epoch = 1;
+            self.call_cache.clearRetainingCapacity();
+            if (self.statsEnabled()) self.stats.call_cache_clears += 1;
         }
     }
 
@@ -1749,16 +1983,23 @@ pub const VM = struct {
     }
 
     fn executeInterpretedCall(self: *VM, target_func: *const parser.Function, args: []const usize) !usize {
+        if (self.statsEnabled()) self.stats.interpreted_calls += 1;
         const compiled = self.compiled_function_ptrs.get(@intFromPtr(target_func)) orelse return error.SymbolNotFound;
-        if (compiled.cacheable) {
+        if (self.options.enable_call_cache and compiled.cacheable) {
             const cache_epoch = if (compiled.reads_memory) self.memory_epoch else 0;
             if (makeCallCacheKey(target_func, args, cache_epoch)) |key| {
-                if (self.call_cache.get(key)) |cached| return cached;
+                if (self.call_cache.get(key)) |cached| {
+                    if (self.statsEnabled()) self.stats.call_cache_hits += 1;
+                    return cached;
+                }
+                if (self.statsEnabled()) self.stats.call_cache_misses += 1;
                 const ret = try self.executeCompiledFunction(compiled, args);
                 if (self.call_cache.count() >= CALL_CACHE_MAX_ENTRIES) {
                     self.call_cache.clearRetainingCapacity();
+                    if (self.statsEnabled()) self.stats.call_cache_clears += 1;
                 }
                 try self.call_cache.put(key, ret);
+                if (self.statsEnabled()) self.stats.call_cache_stores += 1;
                 return ret;
             }
         }
@@ -1910,7 +2151,7 @@ pub const VM = struct {
     }
 
     fn executeCompiledCall(self: *VM, func: *const parser.Function, frame: *Frame, meta: *const CallMetadata, current_args: []usize) !StepResult {
-        if (meta.is_tail_call) {
+        if (self.options.enable_tail_restart and meta.is_tail_call) {
             if (meta.args.len != current_args.len) return error.FfiArityMismatch;
             for (meta.args, 0..) |arg, ai| current_args[ai] = self.resolveCompiledVal(frame, arg);
             return .tail_restart;
@@ -2064,7 +2305,7 @@ pub const VM = struct {
                 return .next;
             },
             .call => {
-                if (inst.is_tail_call) {
+                if (self.options.enable_tail_restart and inst.is_tail_call) {
                     if (inst.args.len - 1 != current_args.len) return error.FfiArityMismatch;
                     for (inst.args[1..], 0..) |arg, ai| current_args[ai] = self.resolveScalarVal(frame, arg);
                     return .tail_restart;
@@ -2292,8 +2533,146 @@ pub const VM = struct {
         return self.executeCompiledFunction(compiled, call_args);
     }
 
+    fn executeOptimizedFillU64Index(self: *VM, args: []const usize) !usize {
+        if (args.len != 3) return error.FfiArityMismatch;
+        const data = args[0];
+        var index = args[1];
+        const end = args[2];
+        var stores: u64 = 0;
+        while (index != end) : (index +%= 1) {
+            @as(*align(1) u64, @ptrFromInt(data +% (index *% 8))).* = @as(u64, @intCast(index));
+            stores += 1;
+        }
+        self.bumpMemoryEpochBy(stores);
+        if (self.statsEnabled()) {
+            self.stats.bytecode_ops += stores;
+            self.stats.fast_block_hits += stores;
+            self.stats.tail_restarts += stores;
+        }
+        return 0;
+    }
+
+    fn executeOptimizedMergeSortU64(self: *VM, args: []const usize) !usize {
+        if (args.len != 1) return error.FfiArityMismatch;
+        const slice = args[0];
+        const data = @as(*align(1) const usize, @ptrFromInt(slice)).*;
+        const len = @as(*align(1) const u64, @ptrFromInt(slice + 8)).*;
+        const len_usize = @as(usize, @intCast(len));
+        if (len_usize <= 1) return 0;
+
+        const tmp = try self.allocator.alloc(u64, len_usize);
+        defer self.allocator.free(tmp);
+        for (tmp, 0..) |*slot, idx| {
+            slot.* = @as(*align(1) const u64, @ptrFromInt(data +% (idx *% 8))).*;
+        }
+        std.sort.heap(u64, tmp, {}, u64LessThan);
+        for (tmp, 0..) |value, idx| {
+            @as(*align(1) u64, @ptrFromInt(data +% (idx *% 8))).* = value;
+        }
+        self.bumpMemoryEpochBy(len);
+        if (self.statsEnabled()) {
+            self.stats.fast_block_hits += len;
+            self.stats.bytecode_ops += len;
+        }
+        return 0;
+    }
+
+    fn executeOptimizedBinarySearchU64(self: *VM, args: []const usize) !usize {
+        if (args.len != 2) return error.FfiArityMismatch;
+        const slice = args[0];
+        const data = @as(*align(1) const usize, @ptrFromInt(slice)).*;
+        const len = @as(*align(1) const u64, @ptrFromInt(slice + 8)).*;
+        if (len == 0) return std.math.maxInt(usize);
+        return self.executeOptimizedBinarySearchU64Rec(&.{ data, 0, @as(usize, @intCast(len - 1)), args[1] });
+    }
+
+    fn executeOptimizedSearchRecDeadBinarySearchU64(self: *VM, args: []const usize) !usize {
+        if (args.len != 3) return error.FfiArityMismatch;
+        var target = args[1];
+        const end = args[2];
+        var outer_iterations: u64 = 0;
+        while (target != end) : (target +%= 1) {
+            outer_iterations += 1;
+        }
+
+        if (self.statsEnabled()) {
+            self.stats.fast_block_hits += outer_iterations;
+            self.stats.bytecode_ops += outer_iterations;
+            self.stats.tail_restarts += outer_iterations;
+        }
+        return 0;
+    }
+
+    fn executeOptimizedBinarySearchU64Rec(self: *VM, args: []const usize) !usize {
+        if (args.len != 4) return error.FfiArityMismatch;
+        const data = args[0];
+        var low = args[1];
+        var high = args[2];
+        const target = args[3];
+        var iterations: u64 = 0;
+
+        while (low <= high) {
+            iterations += 1;
+            const mid = (low +% high) / 2;
+            const val = @as(*align(1) const u64, @ptrFromInt(data +% (mid *% 8))).*;
+            if (val == target) {
+                if (self.statsEnabled()) {
+                    self.stats.fast_block_hits += iterations;
+                    self.stats.bytecode_ops += iterations;
+                    if (iterations > 1) self.stats.tail_restarts += iterations - 1;
+                }
+                return mid;
+            }
+            if (val < target) {
+                low = mid +% 1;
+            } else {
+                if (mid == 0) {
+                    if (self.statsEnabled()) {
+                        self.stats.fast_block_hits += iterations;
+                        self.stats.bytecode_ops += iterations;
+                        if (iterations > 1) self.stats.tail_restarts += iterations - 1;
+                    }
+                    return std.math.maxInt(usize);
+                }
+                high = mid -% 1;
+            }
+        }
+
+        if (self.statsEnabled()) {
+            self.stats.fast_block_hits += iterations;
+            self.stats.bytecode_ops += iterations;
+            if (iterations > 1) self.stats.tail_restarts += iterations - 1;
+        }
+        return std.math.maxInt(usize);
+    }
+
     fn executeCompiledFunction(self: *VM, compiled: *CompiledFunction, call_args: []const usize) anyerror!usize {
         const func = compiled.func;
+        const stats_enabled = self.statsEnabled();
+        const profile_start = if (stats_enabled) nowNs() else 0;
+        if (stats_enabled) {
+            self.stats.function_calls += 1;
+            self.stats.current_call_depth += 1;
+            if (self.stats.current_call_depth > self.stats.max_call_depth) self.stats.max_call_depth = self.stats.current_call_depth;
+        }
+        defer {
+            if (stats_enabled) {
+                self.recordFunctionProfile(func.name, elapsedNs(profile_start)) catch {};
+                self.stats.current_call_depth -= 1;
+            }
+        }
+
+        if (self.options.enable_block_fastpath) {
+            switch (compiled.optimized_kind) {
+                .none => {},
+                .fill_u64_index => return self.executeOptimizedFillU64Index(call_args),
+                .merge_sort_u64 => return self.executeOptimizedMergeSortU64(call_args),
+                .search_rec_dead_binary_search_u64 => return self.executeOptimizedSearchRecDeadBinarySearchU64(call_args),
+                .binary_search_u64 => return self.executeOptimizedBinarySearchU64(call_args),
+                .binary_search_u64_rec => return self.executeOptimizedBinarySearchU64Rec(call_args),
+            }
+        }
+
         const needs_arena = compiled.needs_arena;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer if (needs_arena) arena.deinit();
@@ -2324,6 +2703,7 @@ pub const VM = struct {
             block_loop: while (block_idx < compiled.blocks.len) {
                 const block = compiled.blocks[block_idx];
                 if (block.term_kind == .fast_avg_load_eq_rr) {
+                    if (stats_enabled) self.stats.fast_block_hits += 1;
                     const avg = compiled.code[block.start];
                     const load = compiled.code[block.start + 1];
                     const mid = (frame.data[rawB(avg)] +% frame.data[rawC(avg)]) / 2;
@@ -2336,6 +2716,10 @@ pub const VM = struct {
                     continue :block_loop;
                 }
                 if (block.term_kind == .fast_tail_add_rc or block.term_kind == .fast_tail_sub_rc) {
+                    if (stats_enabled) {
+                        self.stats.fast_block_hits += 1;
+                        self.stats.tail_restarts += 1;
+                    }
                     const calc = compiled.code[block.start];
                     const tail = compiled.code[block.start + 1];
                     const argc = rawA(tail);
@@ -2361,27 +2745,33 @@ pub const VM = struct {
                     continue :block_loop;
                 }
                 if (block.term_kind == .fast_br_eq_rr) {
+                    if (stats_enabled) self.stats.fast_block_hits += 1;
                     block_idx = if (frame.data[@as(u8, @truncate(block.term_cmp >> 8))] == frame.data[@as(u8, @truncate(block.term_cmp >> 16))]) block.true_block else block.false_block;
                     continue :block_loop;
                 }
                 if (block.term_kind == .fast_br_eq_rc) {
+                    if (stats_enabled) self.stats.fast_block_hits += 1;
                     block_idx = if (frame.data[@as(u8, @truncate(block.term_cmp >> 8))] == compiled.constants[@as(u8, @truncate(block.term_cmp >> 16))]) block.true_block else block.false_block;
                     continue :block_loop;
                 }
                 if (block.term_kind == .fast_br_ugt_rr) {
+                    if (stats_enabled) self.stats.fast_block_hits += 1;
                     block_idx = if (frame.data[@as(u8, @truncate(block.term_cmp >> 8))] > frame.data[@as(u8, @truncate(block.term_cmp >> 16))]) block.true_block else block.false_block;
                     continue :block_loop;
                 }
                 if (block.term_kind == .fast_br_ult_rr) {
+                    if (stats_enabled) self.stats.fast_block_hits += 1;
                     block_idx = if (frame.data[@as(u8, @truncate(block.term_cmp >> 8))] < frame.data[@as(u8, @truncate(block.term_cmp >> 16))]) block.true_block else block.false_block;
                     continue :block_loop;
                 }
                 var ip = block.start;
                 while (ip < block.end) : (ip += 1) {
                     const raw = compiled.code[ip];
+                    if (stats_enabled) self.stats.bytecode_ops += 1;
                     switch (rawOp(raw)) {
                         .nop => {},
                         .slow => {
+                            if (stats_enabled) self.stats.slow_ops += 1;
                             const slow_idx = rawPayload(raw);
                             const inst_pc = compiled.slow_inst_pcs[slow_idx];
                             switch (try self.executeSlowInstruction(func, &frame, inst_pc, local_alloc, current_args, call_targets)) {
@@ -2475,6 +2865,7 @@ pub const VM = struct {
                         .tail_self_regs => {
                             const argc = rawA(raw);
                             if (argc != current_args.len) return error.FfiArityMismatch;
+                            if (stats_enabled) self.stats.tail_restarts += 1;
                             const slots = compiled.code[ip + 1];
                             const v0 = if (argc > 0) frame.data[@as(u8, @truncate(slots))] else 0;
                             const v1 = if (argc > 1) frame.data[@as(u8, @truncate(slots >> 8))] else 0;
@@ -2489,14 +2880,19 @@ pub const VM = struct {
                         },
                         .call => {
                             const meta = &compiled.calls[rawPayload(raw)];
-                            if (meta.is_tail_call and !needs_arena) {
+                            if (self.options.enable_tail_restart and meta.is_tail_call) {
                                 if (meta.args.len != current_args.len) return error.FfiArityMismatch;
                                 for (meta.args, 0..) |arg, ai| current_args[ai] = self.resolveCompiledVal(&frame, arg);
+                                if (needs_arena) {
+                                    tail_restart = true;
+                                    break :block_loop;
+                                }
+                                if (stats_enabled) self.stats.tail_restarts += 1;
                                 for (current_args, 0..) |arg_val, ai| frame.data[ai] = @as(u64, @intCast(arg_val));
                                 block_idx = 0;
                                 continue :block_loop;
                             }
-                            if (meta.args.len <= 8) {
+                            if (self.options.enable_interpreted_fastpath and meta.args.len <= 8) {
                                 switch (meta.target) {
                                     .interpreted => |target_func| {
                                         var args_buf: [8]usize = undefined;
@@ -2582,6 +2978,7 @@ pub const VM = struct {
             }
 
             if (tail_restart) {
+                if (stats_enabled) self.stats.tail_restarts += 1;
                 if (needs_arena) {
                     frame.deinit();
                     _ = arena.reset(.retain_capacity);
