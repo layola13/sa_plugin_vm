@@ -1,14 +1,107 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const parser = @import("parser.zig");
-const c = @cImport({
+const c = if (builtin.os.tag == .windows) struct {
+    const ffi_type = extern struct {
+        size: usize,
+        alignment: u16,
+        type: u16,
+        elements: ?[*]*ffi_type,
+    };
+    const ffi_cif = extern struct {
+        abi: c_uint,
+        nargs: c_uint,
+        arg_types: ?[*]*ffi_type,
+        rtype: *ffi_type,
+        bytes: c_uint,
+        flags: c_uint,
+    };
+    var ffi_type_void: ffi_type = undefined;
+    var ffi_type_uint8: ffi_type = undefined;
+    var ffi_type_sint8: ffi_type = undefined;
+    var ffi_type_uint16: ffi_type = undefined;
+    var ffi_type_sint16: ffi_type = undefined;
+    var ffi_type_uint32: ffi_type = undefined;
+    var ffi_type_uint64: ffi_type = undefined;
+    var ffi_type_sint32: ffi_type = undefined;
+    var ffi_type_sint64: ffi_type = undefined;
+    var ffi_type_float: ffi_type = undefined;
+    var ffi_type_double: ffi_type = undefined;
+    var ffi_type_pointer: ffi_type = undefined;
+    const FFI_DEFAULT_ABI: c_uint = 1;
+    const FFI_OK: c_uint = 0;
+    var ffi_prep_cif_ptr: ?*const fn (*ffi_cif, c_uint, c_uint, *ffi_type, [*c][*c]ffi_type) callconv(.c) c_uint = null;
+    var ffi_call_ptr: ?*const fn (*ffi_cif, ?*const fn () callconv(.c) void, ?*anyopaque, [*c]?*anyopaque) callconv(.c) void = null;
+    var libffi_handle: ?*anyopaque = null;
+} else @cImport({
     @cInclude("ffi.h");
 });
 
-extern fn dlopen(filename: ?[*:0]const u8, flags: c_int) ?*anyopaque;
-extern fn dlsym(handle: ?*anyopaque, symbol: ?[*:0]const u8) ?*anyopaque;
-extern fn dlclose(handle: ?*anyopaque) c_int;
-extern fn dlerror() ?[*:0]const u8;
-
+const dlopen = if (builtin.os.tag == .windows) struct {
+    fn call(filename: ?[*:0]const u8, flags: c_int) ?*anyopaque {
+        _ = flags;
+        const path = filename orelse return null;
+        const path_w = std.os.windows.cStrToPrefixedFileW(null, path) catch return null;
+        const module = std.os.windows.LoadLibraryExW(path_w.span().ptr, .none) catch return null;
+        return @ptrCast(module);
+    }
+}.call else struct { extern fn call(filename: ?[*:0]const u8, flags: c_int) ?*anyopaque; }.call;
+const dlsym = if (builtin.os.tag == .windows) struct {
+    fn call(handle: ?*anyopaque, symbol: ?[*:0]const u8) ?*anyopaque {
+        const module: std.os.windows.HMODULE = @ptrCast(handle orelse return null);
+        const name = symbol orelse return null;
+        const proc = std.os.windows.kernel32.GetProcAddress(module, name) orelse return null;
+        return @ptrCast(proc);
+    }
+}.call else struct { extern fn call(handle: ?*anyopaque, symbol: ?[*:0]const u8) ?*anyopaque; }.call;
+const dlclose = if (builtin.os.tag == .windows) struct {
+    fn call(handle: ?*anyopaque) c_int {
+        const module: std.os.windows.HMODULE = @ptrCast(handle orelse return -1);
+        return if (std.os.windows.kernel32.FreeLibrary(module) != 0) 0 else -1;
+    }
+}.call else struct { extern fn call(handle: ?*anyopaque) c_int; }.call;
+const dlerror = if (builtin.os.tag == .windows) struct { fn call() ?[*:0]const u8 { return null; } }.call else struct { extern fn call() ?[*:0]const u8; }.call;
+fn ensureWindowsLibffi() bool {
+    if (builtin.os.tag != .windows) return true;
+    if (c.ffi_prep_cif_ptr != null and c.ffi_call_ptr != null and c.libffi_handle != null) return true;
+    const names = [_][]const u8{ "libffi-8.dll", "libffi-7.dll", "ffi.dll" };
+    for (names) |name| {
+        var name_buf: [32]u8 = undefined;
+        const name_z = std.fmt.bufPrintZ(&name_buf, "{s}", .{name}) catch continue;
+        const handle = dlopen(name_z, 0) orelse continue;
+        const prep = dlsym(handle, "ffi_prep_cif") orelse { _ = dlclose(handle); continue; };
+        const call = dlsym(handle, "ffi_call") orelse { _ = dlclose(handle); continue; };
+        const type_void = dlsym(handle, "ffi_type_void") orelse { _ = dlclose(handle); continue; };
+        const type_uint8 = dlsym(handle, "ffi_type_uint8") orelse { _ = dlclose(handle); continue; };
+        const type_sint8 = dlsym(handle, "ffi_type_sint8") orelse { _ = dlclose(handle); continue; };
+        const type_uint16 = dlsym(handle, "ffi_type_uint16") orelse { _ = dlclose(handle); continue; };
+        const type_sint16 = dlsym(handle, "ffi_type_sint16") orelse { _ = dlclose(handle); continue; };
+        const type_uint32 = dlsym(handle, "ffi_type_uint32") orelse { _ = dlclose(handle); continue; };
+        const type_sint32 = dlsym(handle, "ffi_type_sint32") orelse { _ = dlclose(handle); continue; };
+        const type_uint64 = dlsym(handle, "ffi_type_uint64") orelse { _ = dlclose(handle); continue; };
+        const type_sint64 = dlsym(handle, "ffi_type_sint64") orelse { _ = dlclose(handle); continue; };
+        const type_float = dlsym(handle, "ffi_type_float") orelse { _ = dlclose(handle); continue; };
+        const type_double = dlsym(handle, "ffi_type_double") orelse { _ = dlclose(handle); continue; };
+        const type_pointer = dlsym(handle, "ffi_type_pointer") orelse { _ = dlclose(handle); continue; };
+        c.ffi_prep_cif_ptr = @ptrCast(prep);
+        c.ffi_call_ptr = @ptrCast(call);
+        c.ffi_type_void = @as(*c.ffi_type, @ptrCast(@alignCast(type_void))).*;
+        c.ffi_type_uint8 = @as(*c.ffi_type, @ptrCast(@alignCast(type_uint8))).*;
+        c.ffi_type_sint8 = @as(*c.ffi_type, @ptrCast(@alignCast(type_sint8))).*;
+        c.ffi_type_uint16 = @as(*c.ffi_type, @ptrCast(@alignCast(type_uint16))).*;
+        c.ffi_type_sint16 = @as(*c.ffi_type, @ptrCast(@alignCast(type_sint16))).*;
+        c.ffi_type_uint32 = @as(*c.ffi_type, @ptrCast(@alignCast(type_uint32))).*;
+        c.ffi_type_sint32 = @as(*c.ffi_type, @ptrCast(@alignCast(type_sint32))).*;
+        c.ffi_type_uint64 = @as(*c.ffi_type, @ptrCast(@alignCast(type_uint64))).*;
+        c.ffi_type_sint64 = @as(*c.ffi_type, @ptrCast(@alignCast(type_sint64))).*;
+        c.ffi_type_float = @as(*c.ffi_type, @ptrCast(@alignCast(type_float))).*;
+        c.ffi_type_double = @as(*c.ffi_type, @ptrCast(@alignCast(type_double))).*;
+        c.ffi_type_pointer = @as(*c.ffi_type, @ptrCast(@alignCast(type_pointer))).*;
+        c.libffi_handle = handle;
+        return true;
+    }
+    return false;
+}
 pub const FfiFn = *const fn (
     arg0: usize,
     arg1: usize,
@@ -138,15 +231,25 @@ pub const FfiManager = struct {
             _ = dlclose(handle);
         }
         self.handles.deinit();
+        if (builtin.os.tag == .windows) {
+            if (c.libffi_handle) |handle| {
+                _ = dlclose(handle);
+                c.libffi_handle = null;
+            }
+            c.ffi_prep_cif_ptr = null;
+            c.ffi_call_ptr = null;
+        }
         self.freeDependencyNames(self.dependencies);
     }
 
     fn pluginsHome(self: *FfiManager) ![]u8 {
-        if (std.posix.getenv("SA_PLUGINS_HOME")) |home| {
-            return try self.allocator.dupe(u8, home);
+        if (std.process.getEnvVarOwned(self.allocator, "SA_PLUGINS_HOME")) |home| return home else |_| {}
+        if (std.process.getEnvVarOwned(self.allocator, "HOME")) |home_dir| {
+            defer self.allocator.free(home_dir);
+            return try std.fmt.allocPrint(self.allocator, "{s}/.local/share/sa_plugins", .{home_dir});
+        } else |_| {
+            return try self.allocator.dupe(u8, if (builtin.os.tag == .windows) "C:/Users/Public/.sa_plugins" else "/home/vscode/.local/share/sa_plugins");
         }
-        const home_dir = std.posix.getenv("HOME") orelse "/home/vscode";
-        return try std.fmt.allocPrint(self.allocator, "{s}/.local/share/sa_plugins", .{home_dir});
     }
 
     fn readDeclaredDependencyNames(self: *FfiManager, plugins_home: []const u8) ![][]u8 {
@@ -196,7 +299,7 @@ pub const FfiManager = struct {
     fn loadInstalledPlugin(self: *FfiManager, plugins_home: []const u8, plugin_name: []const u8) !?*anyopaque {
         const lib_path = try std.fmt.allocPrint(
             self.allocator,
-            "{s}/installed/{s}/current/lib{s}.so",
+            if (builtin.os.tag == .windows) "{s}/installed/{s}/current/{s}.dll" else "{s}/installed/{s}/current/lib{s}.so",
             .{ plugins_home, plugin_name, plugin_name },
         );
         defer self.allocator.free(lib_path);
@@ -242,7 +345,7 @@ pub const FfiManager = struct {
                 const plugin_name = entry.name;
                 // E.g., ~/.local/share/sa_plugins/installed/deno/current/libdeno.so
                 var lib_path_buf: [1024]u8 = undefined;
-                const lib_path = try std.fmt.bufPrint(&lib_path_buf, "{s}/{s}/current/lib{s}.so", .{ plugins_installed_path, plugin_name, plugin_name });
+                const lib_path = try std.fmt.bufPrint(&lib_path_buf, if (builtin.os.tag == .windows) "{s}/{s}/current/{s}.dll" else "{s}/{s}/current/lib{s}.so", .{ plugins_installed_path, plugin_name, plugin_name });
 
                 // Try to load
                 const path_z = try self.allocator.dupeZ(u8, lib_path);
@@ -314,6 +417,7 @@ pub const FfiManager = struct {
     /// Call an FFI function using a pre-resolved symbol pointer (skips resolveSymbol).
     /// Used by the VM binding pass to avoid repeated dlsym lookups on the hot path.
     pub fn callSymbolWithPtr(self: *FfiManager, sym: *anyopaque, signature: parser.ExternSignature, args: []const usize) !usize {
+        if (builtin.os.tag == .windows and !ensureWindowsLibffi()) return error.WindowsLibffiUnavailable;
         if (args.len != signature.arg_types.len) return error.FfiArityMismatch;
 
         var ffi_arg_types = try self.allocator.alloc([*c]c.ffi_type, args.len);
@@ -332,19 +436,16 @@ pub const FfiManager = struct {
         }
 
         var cif: c.ffi_cif = undefined;
-        const status = c.ffi_prep_cif(
-            &cif,
-            c.FFI_DEFAULT_ABI,
-            @as(c_uint, @intCast(args.len)),
-            ffiTypeFor(signature.return_type),
-            ffi_arg_types.ptr,
-        );
+        const status = if (builtin.os.tag == .windows)
+            c.ffi_prep_cif_ptr.?(&cif, c.FFI_DEFAULT_ABI, @as(c_uint, @intCast(args.len)), ffiTypeFor(signature.return_type), ffi_arg_types.ptr)
+        else
+            c.ffi_prep_cif(&cif, c.FFI_DEFAULT_ABI, @as(c_uint, @intCast(args.len)), ffiTypeFor(signature.return_type), ffi_arg_types.ptr);
         if (status != c.FFI_OK) return error.FfiPrepFailed;
 
         var ret = FfiValue{ .u64_value = 0 };
         const ret_ptr: ?*anyopaque = if (signature.return_type == .void) null else @ptrCast(&ret);
         const fn_ptr: ?*const fn () callconv(.c) void = @ptrCast(sym);
-        c.ffi_call(&cif, fn_ptr, ret_ptr, ffi_arg_ptrs.ptr);
+        if (builtin.os.tag == .windows) c.ffi_call_ptr.?(&cif, fn_ptr, ret_ptr, ffi_arg_ptrs.ptr) else c.ffi_call(&cif, fn_ptr, ret_ptr, ffi_arg_ptrs.ptr);
         return readReturnValue(ret, signature.return_type);
     }
 

@@ -20,13 +20,13 @@ pub fn build(b: *std.Build) void {
         .root_module = root_module,
         .linkage = .dynamic,
     });
-    lib.linkSystemLibrary("ffi");
+    if (target.result.os.tag != .windows) lib.linkSystemLibrary("ffi");
     b.installArtifact(lib);
 
     const tests = b.addTest(.{
         .root_module = root_module,
     });
-    tests.linkSystemLibrary("ffi");
+    if (target.result.os.tag != .windows) tests.linkSystemLibrary("ffi");
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run plugin tests");
     test_step.dependOn(&run_tests.step);

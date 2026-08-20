@@ -2164,7 +2164,7 @@ pub const VM = struct {
         const ret = switch (meta.target) {
             .builtin_print => blk: {
                 const slice = @as([*]const u8, @ptrFromInt(args.items[0]))[0..args.items[1]];
-                _ = std.posix.write(std.posix.STDOUT_FILENO, slice) catch {};
+                std.io.getStdOut().writeAll(slice) catch {};
                 break :blk @as(usize, 0);
             },
             .builtin_time_ms => @as(usize, @intCast(@as(u64, @bitCast(std.time.milliTimestamp())))),
@@ -2316,7 +2316,7 @@ pub const VM = struct {
                 const ret = switch (call_targets[inst_pc]) {
                     .builtin_print => blk: {
                         const slice = @as([*]const u8, @ptrFromInt(args.items[0]))[0..args.items[1]];
-                        _ = std.posix.write(std.posix.STDOUT_FILENO, slice) catch {};
+                        std.io.getStdOut().writeAll(slice) catch {};
                         break :blk @as(usize, 0);
                     },
                     .builtin_time_ms => @as(usize, @intCast(@as(u64, @bitCast(std.time.milliTimestamp())))),
