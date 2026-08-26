@@ -107,6 +107,29 @@ pub const OpCode = enum {
     return_,
     take,
     try_,
+    // Floating-point arithmetic. Slots carry raw IEEE-754 bits: f64 values as
+    // full u64 patterns, f32 values widened to f64 (see vm.zig float policy).
+    fadd,
+    fsub,
+    fmul,
+    fdiv,
+    fneg,
+    fcmp_eq,
+    fcmp_ne,
+    fcmp_lt,
+    fcmp_le,
+    fcmp_gt,
+    fcmp_ge,
+    // Float <-> int conversions.
+    fptosi,
+    sitofp,
+    uitofp,
+    fptrunc,
+    fpext,
+    // Integer ops that previously had no VM mapping.
+    ashr,
+    neg,
+    not,
 };
 
 pub const Instruction = struct {
@@ -449,6 +472,38 @@ fn canStartInlineExpr(token: []const u8, cursor: *TokenCursor) bool {
     return cursor.remaining() >= min_remaining;
 }
 
+var sa_std_root_cache: ?[]const u8 = null;
+
+fn saStdRootExists(allocator: std.mem.Allocator, root: []const u8) bool {
+    const probe_path = std.fs.path.join(allocator, &.{ root, "core", "sa_core.sa" }) catch return false;
+    defer allocator.free(probe_path);
+    std.fs.cwd().access(probe_path, .{}) catch return false;
+    return true;
+}
+
+fn computeSaStdRoot(allocator: std.mem.Allocator, base_dir: []const u8) ?[]const u8 {
+    if (std.process.getEnvVarOwned(allocator, "SA_STD_DIR")) |env_root| {
+        if (saStdRootExists(allocator, env_root)) return env_root;
+        allocator.free(env_root);
+    } else |_| {}
+
+    const bases = [_][]const u8{ ".", base_dir };
+    const relative_roots = [_][]const u8{
+        "sci/sa_std",
+        "../sci/sa_std",
+        "../../sci/sa_std",
+        "../../../sci/sa_std",
+    };
+    for (bases) |base| {
+        for (relative_roots) |rel| {
+            const root = std.fs.path.join(allocator, &.{ base, rel }) catch continue;
+            if (saStdRootExists(allocator, root)) return root;
+            allocator.free(root);
+        }
+    }
+    return null;
+}
+
 pub const Parser = struct {
     allocator: std.mem.Allocator,
     macros: std.StringHashMap(Macro),
@@ -561,9 +616,16 @@ pub const Parser = struct {
         return try lines.toOwnedSlice();
     }
 
+    fn saStdRoot(self: *Parser, base_dir: []const u8) ?[]const u8 {
+        if (sa_std_root_cache) |cached| return cached;
+        const root = computeSaStdRoot(self.allocator, base_dir) orelse return null;
+        sa_std_root_cache = root;
+        return root;
+    }
+
     fn resolveImportPath(self: *Parser, base_dir: []const u8, import_val: []const u8) ![]const u8 {
         if (std.mem.startsWith(u8, import_val, "sa_std/")) {
-            const std_root = "/home/vscode/.sa/std/";
+            const std_root = self.saStdRoot(base_dir) orelse "/home/vscode/.sa/std/";
             const sub_path = import_val["sa_std/".len..];
             return try std.fs.path.join(self.allocator, &.{ std_root, sub_path });
         }

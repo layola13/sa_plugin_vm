@@ -1,6 +1,10 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const parser = @import("parser.zig");
 const ffi = @import("ffi.zig");
+const sandbox_mod = @import("sandbox.zig");
+const policy_mod = @import("policy.zig");
+const io_classify = @import("io_classify.zig");
 
 /// Sentinel value indicating an unresolved register slot.
 const INVALID_SLOT: u32 = std.math.maxInt(u32);
@@ -15,6 +19,39 @@ fn testFunctionLessThan(_: void, lhs: *const parser.Function, rhs: *const parser
     return std.mem.lessThan(u8, lhs.name, rhs.name);
 }
 
+/// Upper bound for strings read out of guest memory while gating an extern
+/// (path / URL / env name / argv blob). Longer values are refused instead of
+/// partially matched: canonicalization and host matching are meaningless at
+/// that size, and refusing keeps a hostile length argument from turning into a
+/// huge host-side read.
+pub const max_guest_string_bytes: usize = 4096;
+
+/// Read one string-typed extern argument out of guest memory.
+///
+/// `ptr_idx`/`len_idx` are argument positions; when `len_idx` is null the
+/// string is taken as NUL-terminated (legacy shims such as `fd_open`). Returns
+/// null for absent/zero arguments so the caller can deny instead of guessing.
+///
+/// Like every load in this interpreter this dereferences a raw guest pointer
+/// (accepted residual risk, spec §4.2); the cap bounds how far a bad pointer
+/// can be walked, it cannot make the read safe.
+fn guestStringArg(args: []const usize, ptr_idx: ?u8, len_idx: ?u8) ?[]const u8 {
+    const pi = ptr_idx orelse return null;
+    if (pi >= args.len) return null;
+    const base = args[pi];
+    if (base == 0) return null;
+    const bytes = @as([*]const u8, @ptrFromInt(base));
+    var len: usize = 0;
+    if (len_idx) |li| {
+        if (li >= args.len) return null;
+        len = @min(@as(usize, @intCast(args[li])), max_guest_string_bytes);
+    } else {
+        while (len < max_guest_string_bytes and bytes[len] != 0) len += 1;
+    }
+    if (len == 0) return null;
+    return bytes[0..len];
+}
+
 /// Pre-resolved dispatch target for a .call instruction, computed during the binding pass.
 const ResolvedCall = union(enum) {
     builtin_print,
@@ -22,6 +59,9 @@ const ResolvedCall = union(enum) {
     builtin_time_s,
     builtin_time_ns,
     builtin_time_instant_ns,
+    /// sla_std formatting/buffer externs (sa_fmt_*). Capability-gated broker
+    /// integration lands later; these are plain interpreter builtins for now.
+    sla_builtin: SlaBuiltin,
     interpreted: *const parser.Function,
     ffi_typed: struct { sym: *anyopaque, sig: parser.ExternSignature },
     ffi_legacy: *anyopaque,
@@ -30,6 +70,42 @@ const ResolvedCall = union(enum) {
     pthread_join,
     pthread_drop,
     unresolved,
+};
+
+/// sla_std runtime functions the interpreter implements natively.
+const SlaBuiltin = enum {
+    fmt_i64,
+    fmt_u64,
+    fmt_f64,
+    fmt_bool,
+    buffer_data,
+    buffer_len,
+    buffer_free,
+
+    fn byName(name: []const u8) ?SlaBuiltin {
+        return if (std.mem.eql(u8, name, "sa_fmt_i64"))
+            .fmt_i64
+        else if (std.mem.eql(u8, name, "sa_fmt_u64"))
+            .fmt_u64
+        else if (std.mem.eql(u8, name, "sa_fmt_f64"))
+            .fmt_f64
+        else if (std.mem.eql(u8, name, "sa_fmt_bool"))
+            .fmt_bool
+        else if (std.mem.eql(u8, name, "sa_fmt_buffer_data"))
+            .buffer_data
+        else if (std.mem.eql(u8, name, "sa_fmt_buffer_len"))
+            .buffer_len
+        else if (std.mem.eql(u8, name, "sa_fmt_buffer_free"))
+            .buffer_free
+        else
+            null;
+    }
+};
+
+/// Heap-backed byte buffer handed out by the sa_fmt_* builtins. Call sites hold
+/// the handle as an opaque u64 and fetch ptr/len through sa_fmt_buffer_{data,len}.
+const FmtBuffer = struct {
+    data: []u8,
 };
 
 const CallCacheKey = struct {
@@ -176,6 +252,9 @@ const CompiledFunction = struct {
     call_targets: []ResolvedCall,
     calls: []CallMetadata,
     indirect_calls: []IndirectCallMetadata,
+    /// Per-block fuel costs (spec §3.1), populated only while fuel accounting
+    /// is active; empty otherwise so dev-mode memory is unchanged.
+    fuel_costs: []u32 = &.{},
     slot_count: usize,
     needs_arena: bool,
     cacheable: bool,
@@ -289,6 +368,40 @@ pub const VM = struct {
     panic_message: ?[]u8 = null,
     thread_results: std.AutoHashMap(i32, usize),
     next_thread_handle: i32,
+    /// Live sa_fmt_* buffers keyed by handle pointer (freed on free or deinit).
+    fmt_buffers: std.ArrayList(*FmtBuffer),
+    // --- Sandbox / resource limits (spec §3.1, §3.2, §3.6) ------------------
+    /// Non-null while any resource cap (fuel / wall clock / memory quota) is
+    /// active; null in plain dev runs so the hot block loop pays one branch.
+    sandbox: ?*sandbox_mod.State = null,
+    sandbox_state: sandbox_mod.State = .{},
+    /// Parsed `sa.vm.policy/1` when the host supplied one. Capability
+    /// enforcement surface is documented in the README "Sandbox" section;
+    /// gates live at extern dispatch (checkCapabilityForTarget /
+    /// enforceExternCapability / callUnresolved) and on both call_indirect
+    /// paths.
+    policy: ?*const policy_mod.Policy = null,
+    /// Absolute base directory for guest-relative fs paths under a policy.
+    fs_base_dir: ?[]const u8 = null,
+    /// Present when a memory cap is configured (plugin.zig owns the storage).
+    quota: ?*sandbox_mod.QuotaAllocator = null,
+    /// Guest call depth + host-stack guard, active on every run (converts
+    /// runaway recursion into E_STACK_OVERFLOW instead of a 0xC0000005 crash).
+    call_depth: u32 = 0,
+    max_call_depth: u32 = sandbox_mod.default_max_call_depth,
+    stack_headroom_bytes: usize = sandbox_mod.default_stack_headroom_bytes,
+    /// Cached lowest safe stack address (computed once, on first guest call).
+    stack_floor_cache: usize = 0,
+    /// Stack address observed when guest execution starts (non-Windows guard).
+    stack_base_hint: usize = 0,
+    /// Injected sink for `sa-vm-event:` lines (spec §3.6.2). Falls back to the
+    /// process stderr when unset; the host sets it so events land in the same
+    /// stream as its own diagnostics.
+    event_writer: ?std.io.AnyWriter = null,
+
+    pub fn setEventWriter(self: *VM, writer: std.io.AnyWriter) void {
+        self.event_writer = writer;
+    }
 
     pub fn init(allocator: std.mem.Allocator, program: *parser.Program, ffi_mgr: *ffi.FfiManager) VM {
         return .{
@@ -320,11 +433,396 @@ pub const VM = struct {
             .panic_message = null,
             .thread_results = std.AutoHashMap(i32, usize).init(allocator),
             .next_thread_handle = 1,
+            .fmt_buffers = std.ArrayList(*FmtBuffer).init(allocator),
         };
     }
 
     pub fn setOptions(self: *VM, options: VMOptions) void {
         self.options = options;
+    }
+
+    /// Install resource limits (spec §3.1/§3.2). Fuel / wall clock / memory
+    /// quota stay off unless the corresponding member is set; the call-depth
+    /// and host-stack guards are always on (they only turn runaway recursion
+    /// into a clean panic, never affecting terminating programs).
+    pub fn configureSandbox(self: *VM, limits: sandbox_mod.Limits) void {
+        self.max_call_depth = limits.max_call_depth;
+        self.stack_headroom_bytes = limits.stack_headroom_bytes;
+        var state = sandbox_mod.State{
+            .run_start_ns = std.time.nanoTimestamp(),
+            .mem_cap_bytes = limits.mem_cap_bytes orelse 0,
+        };
+        if (limits.fuel) |fuel| {
+            state.fuel_total = fuel;
+            state.fuel_remaining = fuel;
+        }
+        if (limits.wall_clock_ms) |ms| {
+            state.deadline_ns = @as(i128, std.time.nanoTimestamp()) + @as(i128, ms) * std.time.ns_per_ms;
+        }
+        self.sandbox_state = state;
+        // Null-gate: only point `sandbox` at the state when a hot-loop cap is
+        // active so unconfigured dev runs keep today's dispatch cost.
+        self.sandbox = if (limits.anyResourceCap()) &self.sandbox_state else null;
+    }
+
+    /// Attach a parsed policy for capability decisions (spec §3.3). The host
+    /// keeps ownership; the policy must outlive the VM.
+    pub fn setPolicy(self: *VM, policy: *const policy_mod.Policy) void {
+        self.policy = policy;
+    }
+
+    /// Absolute directory guest-relative fs paths resolve against (the
+    /// broker's project root / process CWD). null => relative paths are
+    /// refused by canonicalization (`fs_path_invalid`), which fails closed.
+    pub fn setFsBaseDir(self: *VM, dir: ?[]const u8) void {
+        self.fs_base_dir = dir;
+    }
+
+    // ------------------------------------------------------------------
+    // Sandbox violation plumbing (spec §3.6)
+    // ------------------------------------------------------------------
+
+    fn sandboxSnapshot(self: *const VM) sandbox_mod.Snapshot {
+        var snap = sandbox_mod.Snapshot{ .mem_peak_bytes = 0 };
+        if (self.sandbox) |sb| {
+            snap.fuel_used = sb.fuelUsed();
+            snap.wall_ms = sb.wallMsElapsed();
+        }
+        if (self.quota) |quota| snap.mem_peak_bytes = quota.peak_bytes;
+        return snap;
+    }
+
+    /// Emit one `sa-vm-event:` JSON line (spec §3.6.2) to the injected writer
+    /// or the process stderr. Best effort: a failing write must never mask
+    /// the panic itself.
+    fn emitViolationEvent(self: *VM, code: u8, detail: []const u8) void {
+        const snap = self.sandboxSnapshot();
+        var line_buf: [1024]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&line_buf);
+        sandbox_mod.writeViolationEvent(fbs.writer(), code, detail, snap) catch {
+            // Detail longer than one line: emit truncated but still valid JSON
+            // by retrying without it.
+            fbs.reset();
+            sandbox_mod.writeViolationEvent(fbs.writer(), code, "", snap) catch return;
+        };
+        const line = fbs.getWritten();
+        if (self.event_writer) |w| {
+            w.writeAll(line) catch {};
+            return;
+        }
+        std.io.getStdErr().writeAll(line) catch {};
+    }
+
+    /// Raise a sandbox violation through the ordinary panic channel so host
+    /// handling (`PANIC[code]: msg` + exit code mapping) works unchanged.
+    fn sandboxPanic(self: *VM, code: u8, detail: []const u8) anyerror {
+        self.clearPanicState();
+        self.panic_code = code;
+        // The human-readable PANIC line carries "<NAME>: <detail>"; the event
+        // carries the same detail so harness and human see one reason.
+        const named = std.fmt.allocPrint(
+            self.allocator,
+            "{s}: {s}",
+            .{ sandbox_mod.nameForCode(code), detail },
+        ) catch null;
+        if (named) |msg| {
+            self.panic_message = msg;
+            self.emitViolationEvent(code, detail);
+        } else {
+            // OOM while composing the message must not mask the violation.
+            self.emitViolationEvent(code, detail);
+        }
+        return error.Panic;
+    }
+
+    fn panicFuelExhausted(self: *VM, sb: *sandbox_mod.State) anyerror {
+        var buf: [128]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        fbs.writer().print("block-cost budget of {d} units exhausted (wall {d} ms)", .{
+            sb.fuel_total, sb.wallMsElapsed(),
+        }) catch {};
+        return self.sandboxPanic(sandbox_mod.code_fuel_exhausted, fbs.getWritten());
+    }
+
+    fn panicTimeout(self: *VM) anyerror {
+        const wall_ms = if (self.sandbox) |sb| sb.wallMsElapsed() else 0;
+        var buf: [96]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        fbs.writer().print("wall-clock deadline exceeded after {d} ms", .{wall_ms}) catch {};
+        return self.sandboxPanic(sandbox_mod.code_timeout, fbs.getWritten());
+    }
+
+    fn panicMemQuota(self: *VM) anyerror {
+        var buf: [128]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        if (self.quota) |quota| {
+            fbs.writer().print("memory cap of {d} bytes hit (peak live {d} bytes)", .{
+                quota.cap_bytes, quota.peak_bytes,
+            }) catch {};
+        } else {
+            fbs.writer().writeAll("memory cap hit") catch {};
+        }
+        return self.sandboxPanic(sandbox_mod.code_mem_quota, fbs.getWritten());
+    }
+
+    fn panicStackOverflow(self: *VM) anyerror {
+        var buf: [160]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        fbs.writer().print("call depth {d} would exhaust the host stack (limit {d} frames or {d} bytes headroom)", .{
+            self.call_depth, self.max_call_depth, self.stack_headroom_bytes,
+        }) catch {};
+        return self.sandboxPanic(sandbox_mod.code_stack_overflow, fbs.getWritten());
+    }
+
+    fn panicCapabilityDenied(self: *VM, reason_label: []const u8, subject: []const u8) anyerror {
+        var buf: [256]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        fbs.writer().print("{s} denied by run policy: {s}", .{ subject, reason_label }) catch {};
+        return self.sandboxPanic(policy_mod.panic_code_capability_denied, fbs.getWritten());
+    }
+
+    // ------------------------------------------------------------------
+    // Hot-path limit checks
+    // ------------------------------------------------------------------
+
+    /// Forced deadline checkpoint around FFI / pthread / builtin / broker calls
+    /// (spec §3.1 step 4): blocking syscalls do not burn fuel, so only the wall
+    /// clock can bound them.
+    inline fn sandboxCheckpoint(self: *VM) !void {
+        const sb = self.sandbox orelse return;
+        if (sb.deadlineExceeded()) return self.panicTimeout();
+    }
+
+    /// Lowest stack address guest recursion may still use without endangering
+    /// the host.
+    ///
+    /// Windows: VirtualQuery around the current stack pointer finds the
+    /// thread's stack reservation; its AllocationBase is the true bottom, and
+    /// `AllocationBase + headroom` is the deepest safe frame address. (The TEB
+    /// NtTib.StackLimit value is NOT usable here: it tracks the committed
+    /// bottom, which moves down as the stack grows, so it hugs the current
+    /// frame instead of bounding it.)
+    ///
+    /// Other platforms fall back to a base recorded when guest execution starts
+    /// minus an assumed 8 MiB thread stack.
+    fn recordStackBaseHint(self: *VM) void {
+        self.stack_floor_cache = 0; // recompute for the fresh limits
+        var marker: u8 = 0;
+        self.stack_base_hint = @intFromPtr(&marker);
+    }
+
+    fn computeStackFloor(self: *VM) usize {
+        var marker: u8 = 0;
+        const sp = @intFromPtr(&marker);
+        if (comptime builtin.os.tag == .windows) {
+            var mbi: std.os.windows.MEMORY_BASIC_INFORMATION = undefined;
+            if (std.os.windows.VirtualQuery(@ptrFromInt(sp), &mbi, @sizeOf(std.os.windows.MEMORY_BASIC_INFORMATION))) |_| {
+                const alloc_base = @intFromPtr(mbi.AllocationBase);
+                // Sanity: the allocation base must sit below the current frame.
+                if (alloc_base != 0 and alloc_base < sp) {
+                    return alloc_base + self.stack_headroom_bytes;
+                }
+            } else |_| {}
+            return sp -| (1024 * 1024 -| self.stack_headroom_bytes);
+        }
+        return self.stack_base_hint -| (8 * 1024 * 1024 -| self.stack_headroom_bytes);
+    }
+
+    inline fn stackFloor(self: *VM) usize {
+        if (self.stack_floor_cache == 0) {
+            self.stack_floor_cache = self.computeStackFloor();
+        }
+        return self.stack_floor_cache;
+    }
+
+    /// True when entering another guest frame could cross the guard page.
+    inline fn belowStackFloor(self: *VM) bool {
+        var marker: u8 = 0;
+        return @intFromPtr(&marker) < self.stackFloor();
+    }
+
+    /// Call-entry guard: converts runaway recursion into E_STACK_OVERFLOW
+    /// instead of an access violation in the host process.
+    inline fn enterGuestCall(self: *VM) !void {
+        self.call_depth += 1;
+        if (self.call_depth > self.max_call_depth or self.belowStackFloor()) {
+            return self.panicStackOverflow();
+        }
+    }
+
+    /// Capability gate for bind-time-resolved extern targets.
+    ///
+    /// Native symbols (`ffi_typed` / `ffi_legacy`) always pass the extern
+    /// allowlist first; symbols whose arguments carry a known I/O target are
+    /// then checked against that resource rule, while unclassified native
+    /// symbols additionally need the `ffi` capability (naming an arbitrary
+    /// native symbol is code execution by another name). Threads keep their
+    /// dedicated gate. Runs before any argument is dereferenced for I/O.
+    fn checkCapabilityForTarget(self: *VM, target: ResolvedCall, name_for_diagnostic: []const u8, args: []const usize) !void {
+        switch (target) {
+            .ffi_typed, .ffi_legacy => {
+                try self.enforceExternCapability(name_for_diagnostic, args, true);
+            },
+            .pthread_spawn, .pthread_spawn_detached, .pthread_join, .pthread_drop => {
+                const pol = self.policy orelse return;
+                if (!pol.checkThreads().isAllowed()) return self.panicCapabilityDenied("threads", name_for_diagnostic);
+            },
+            else => {},
+        }
+    }
+
+    /// Capability enforcement for one named extern call (spec §3.3/§3.4).
+    ///
+    /// Layer 1 — `policy.extern.allow` decides whether the symbol may be called
+    /// at all. Absent from the allowlist => E_CAPABILITY_DENIED
+    /// (`extern_not_allowed`) BEFORE any dlopen/dlsym work happens. With no
+    /// policy loaded this function returns immediately: developer mode keeps
+    /// its historical behavior (documented in README "Sandbox").
+    ///
+    /// Layer 2 — allowed symbols whose arguments carry an I/O target are routed
+    /// through policy.zig using the declarative table in io_classify.zig:
+    /// file paths -> checkFsRead/checkFsWrite, URLs (+ method) -> checkHttp,
+    /// env names -> checkEnv, argv blobs -> checkProcessSpawn, socket families
+    /// -> checkNetRaw. Those calls therefore need NO `ffi` grant: the policy
+    /// bounds what the call may touch, whatever the exporting DLL also does
+    /// internally (plugins are trusted host-side components, spec §4.1).
+    ///
+    /// `native_target` marks calls that will execute exported machine code:
+    /// an allowed-but-unclassified symbol then additionally requires the `ffi`
+    /// capability, so listing random native names never becomes a code-exec
+    /// primitive.
+    fn enforceExternCapability(self: *VM, func_name: []const u8, args: []const usize, native_target: bool) !void {
+        const pol = self.policy orelse return;
+
+        // --- Layer 1: symbol allowlist (default deny) ----------------------
+        if (!pol.checkExtern(func_name).isAllowed())
+            return self.panicCapabilityDenied("extern_not_allowed", func_name);
+
+        // Raw sockets have per-address rather than per-URL semantics: one
+        // wholesale flag instead of a URL rule.
+        if (io_classify.isNetRawFamily(func_name)) {
+            const raw = pol.checkNetRaw();
+            if (raw.denyReason()) |reason| return self.panicCapabilityDenied(reason.label(), func_name);
+            return;
+        }
+
+        // --- Layer 2: what do the arguments point at? ----------------------
+        const cls = io_classify.classify(func_name);
+        switch (cls.kind) {
+            .none => {
+                if (native_target and !pol.checkFfi().isAllowed())
+                    return self.panicCapabilityDenied("ffi", func_name);
+            },
+            .fs_read => try self.gateFsPath(pol, .read, cls.spec, args),
+            .fs_write => try self.gateFsPath(pol, .write, cls.spec, args),
+            .fs_transfer => {
+                const spec = cls.spec;
+                try self.gateFsPath(pol, .read, .{ .path = spec.path, .path_len = spec.path_len }, args);
+                try self.gateFsPath(pol, .write, .{ .path = spec.path2, .path_len = spec.path2_len }, args);
+            },
+            .http_request => try self.gateHttp(pol, cls.spec, args),
+            .env_get, .env_set => try self.gateEnvName(pol, cls.spec, args),
+            .process_spawn => try self.gateProcessSpawn(pol, cls.spec, args),
+            .net_raw => unreachable, // handled by the family check above
+        }
+    }
+
+    /// Canonicalize + match one path argument against the fs section of the
+    /// policy. The subject of the violation event is the offending path so
+    /// harnesses see exactly which target was refused.
+    fn gateFsPath(self: *VM, pol: *const policy_mod.Policy, op: policy_mod.FsOp, spec: io_classify.Spec, args: []const usize) !void {
+        const path = guestStringArg(args, spec.path, spec.path_len) orelse
+            return self.panicCapabilityDenied("fs_path_invalid", "unreadable path argument");
+        const verdict = try pol.checkFs(self.allocator, op, path, self.fs_base_dir);
+        if (verdict.denyReason()) |reason| return self.panicCapabilityDenied(reason.label(), path);
+    }
+
+    /// Validate URL (+ optional method) arguments against the http section.
+    /// NOTE: redirects followed inside native plugin code cannot be observed
+    /// here yet — see README "What is not enforced".
+    fn gateHttp(self: *VM, pol: *const policy_mod.Policy, spec: io_classify.Spec, args: []const usize) !void {
+        const url = guestStringArg(args, spec.url, spec.url_len) orelse
+            return self.panicCapabilityDenied("bad_url", "unreadable url argument");
+        const method_text: []const u8 = blk: {
+            if (spec.method_str) |idx| {
+                if (guestStringArg(args, idx, spec.method_str_len)) |text| break :blk text;
+                break :blk "";
+            }
+            if (spec.method_enum) |idx| {
+                if (idx < args.len) {
+                    if (io_classify.methodNameFromEnum(args[idx])) |name| break :blk name;
+                    // Unknown method code: fail closed rather than guess.
+                    return self.panicCapabilityDenied("method_not_allowed", url);
+                }
+                break :blk "";
+            }
+            break :blk "GET";
+        };
+        const verdict = try pol.checkHttp(self.allocator, method_text, url);
+        if (verdict.denyReason()) |reason| return self.panicCapabilityDenied(reason.label(), url);
+    }
+
+    /// Env lookups/mutations compare the variable name against `env.allow`.
+    fn gateEnvName(self: *VM, pol: *const policy_mod.Policy, spec: io_classify.Spec, args: []const usize) !void {
+        const name = blk: {
+            if (spec.name_literal) |literal| break :blk literal;
+            break :blk guestStringArg(args, spec.name, spec.name_len) orelse
+                return self.panicCapabilityDenied("env_not_allowed", "unreadable env name");
+        };
+        const verdict = pol.checkEnv(name);
+        if (verdict.denyReason()) |reason| return self.panicCapabilityDenied(reason.label(), name);
+    }
+
+    /// Spawn gate: the argv blob must be a JSON array of strings whose first
+    /// element is the executable; anything unparseable denies (fail closed).
+    fn gateProcessSpawn(self: *VM, pol: *const policy_mod.Policy, spec: io_classify.Spec, args: []const usize) !void {
+        const blob = guestStringArg(args, spec.name, spec.name_len) orelse
+            return self.panicCapabilityDenied("process_spawn_disabled", "unreadable argv argument");
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), blob, .{}) catch
+            return self.panicCapabilityDenied("exec_not_allowed", blob);
+        const arr = switch (parsed) {
+            .array => |a| a,
+            else => return self.panicCapabilityDenied("exec_not_allowed", blob),
+        };
+        if (arr.items.len == 0) return self.panicCapabilityDenied("exec_not_allowed", blob);
+
+        var argv = try self.allocator.alloc([]const u8, arr.items.len - 1);
+        defer self.allocator.free(argv);
+        var executable: []const u8 = "";
+        for (arr.items, 0..) |item, idx| {
+            const text = switch (item) {
+                .string => |s| s,
+                else => return self.panicCapabilityDenied("exec_not_allowed", blob),
+            };
+            if (idx == 0) {
+                executable = text;
+            } else {
+                argv[idx - 1] = text;
+            }
+        }
+
+        const verdict = try pol.checkProcessSpawn(self.allocator, executable, argv);
+        if (verdict.denyReason()) |reason| return self.panicCapabilityDenied(reason.label(), executable);
+    }
+
+    /// Best-effort symbol name for diagnostics on the compiled fast path. The
+    /// callee name is always available for `.call` instructions (appendCall
+    /// rejects calls without operands), so violations can name the symbol.
+    fn callTargetDiagnosticName(self: *VM, func: *const parser.Function, meta: *const CallMetadata) []const u8 {
+        _ = self;
+        if (func.instructions[meta.inst_pc].args.len > 0)
+            return func.instructions[meta.inst_pc].args[0].name;
+        return switch (meta.target) {
+            .unresolved => "unresolved",
+            .pthread_spawn => "pthread_spawn",
+            .pthread_spawn_detached => "pthread_spawn_detached",
+            .pthread_join => "pthread_join",
+            .pthread_drop => "pthread_drop",
+            else => "extern",
+        };
     }
 
     inline fn statsEnabled(self: *const VM) bool {
@@ -376,6 +874,11 @@ pub const VM = struct {
         }
         self.result_allocs.deinit();
         self.result_alloc_index.deinit();
+        for (self.fmt_buffers.items) |buffer| {
+            self.allocator.free(buffer.data);
+            self.allocator.destroy(buffer);
+        }
+        self.fmt_buffers.deinit();
     }
 
     fn clearPanicState(self: *VM) void {
@@ -391,6 +894,7 @@ pub const VM = struct {
         self.allocator.free(compiled.blocks);
         self.allocator.free(compiled.constants);
         self.allocator.free(compiled.slow_inst_pcs);
+        if (compiled.fuel_costs.len != 0) self.allocator.free(compiled.fuel_costs);
         self.allocator.free(compiled.call_targets);
         for (compiled.calls) |meta| self.allocator.free(meta.args);
         self.allocator.free(compiled.calls);
@@ -415,6 +919,7 @@ pub const VM = struct {
 
     pub fn run(self: *VM) !i32 {
         self.clearPanicState();
+        self.recordStackBaseHint();
         const bind_start = nowNs();
         try self.initFunctionsAndVtables();
         if (self.statsEnabled()) self.stats.bind_ns += elapsedNs(bind_start);
@@ -428,6 +933,7 @@ pub const VM = struct {
 
     pub fn runTests(self: *VM) !i32 {
         self.clearPanicState();
+        self.recordStackBaseHint();
         const bind_start = nowNs();
         try self.initFunctionsAndVtables();
         if (self.statsEnabled()) self.stats.bind_ns += elapsedNs(bind_start);
@@ -582,6 +1088,7 @@ pub const VM = struct {
     /// Resolve a named call target to its ResolvedCall variant at binding time.
     fn resolveCallTarget(self: *VM, call_name: []const u8) ResolvedCall {
         if (std.mem.eql(u8, call_name, "sa_print_bytes")) return .builtin_print;
+        if (SlaBuiltin.byName(call_name)) |sla_builtin| return .{ .sla_builtin = sla_builtin };
         if (std.mem.eql(u8, call_name, "sa_time_unix_ms")) return .builtin_time_ms;
         if (std.mem.eql(u8, call_name, "sa_time_unix_s")) return .builtin_time_s;
         if (std.mem.eql(u8, call_name, "sa_time_unix_ns")) return .builtin_time_ns;
@@ -781,6 +1288,7 @@ pub const VM = struct {
                 .builtin_time_s,
                 .builtin_time_ns,
                 .builtin_time_instant_ns,
+                .sla_builtin,
                 .pthread_spawn,
                 .pthread_spawn_detached,
                 .pthread_join,
@@ -1510,6 +2018,14 @@ pub const VM = struct {
             try blocks.append(term);
         }
 
+        // Per-block fuel cost table (spec §3.1 step 1). Built whenever any
+        // hot-loop cap is active: it both prices blocks for fuel and acts as
+        // the dispatch hook for lazy wall-clock sampling when fuel is off.
+        var fuel_costs: []u32 = &.{};
+        if (self.sandbox != null) {
+            fuel_costs = try self.computeBlockFuelCosts(blocks.items, code.items);
+        }
+
         return .{
             .func = func,
             .optimized_kind = detectOptimizedFunction(func),
@@ -1520,11 +2036,56 @@ pub const VM = struct {
             .call_targets = call_targets,
             .calls = try calls.toOwnedSlice(),
             .indirect_calls = try indirect_calls.toOwnedSlice(),
+            .fuel_costs = fuel_costs,
             .slot_count = slot_count,
             .needs_arena = needs_arena,
             .cacheable = cacheable,
             .reads_memory = reads_memory,
         };
+    }
+
+    /// Price every compiled basic block: plain words cost 1 unit, slow
+    /// (interpreted-source) instructions 15 extra, calls 31 extra; super-
+    /// instruction fast arms are a flat 4. Calls are additionally charged
+    /// recursively at their own block, which keeps tail-restart loops from
+    /// getting free calls.
+    ///
+    /// When fuel is disabled but another hot-loop cap is active (wall-clock
+    /// only), every entry is priced 0: the dispatch hook must still run for
+    /// lazy clock sampling, and charging 0 is a no-op that cannot trip the
+    /// wraparound exhaustion check.
+    fn computeBlockFuelCosts(self: *VM, blocks: []const CompiledBlock, code: []const u32) ![]u32 {
+        const costs = try self.allocator.alloc(u32, blocks.len);
+        errdefer self.allocator.free(costs);
+        const price_fuel = self.sandbox.?.fuelEnabled();
+        for (blocks, 0..) |block, idx| {
+            var slow_words: usize = 0;
+            var call_words: usize = 0;
+            var pc = block.start;
+            while (pc < block.end) : (pc += 1) {
+                switch (rawOp(code[pc])) {
+                    .slow => slow_words += 1,
+                    .call, .call_indirect, .tail_self_regs => call_words += 1,
+                    else => {},
+                }
+            }
+            const fast_arm = switch (block.term_kind) {
+                .fast_avg_load_eq_rr,
+                .fast_tail_add_rc,
+                .fast_tail_sub_rc,
+                .fast_br_eq_rr,
+                .fast_br_eq_rc,
+                .fast_br_ugt_rr,
+                .fast_br_ult_rr,
+                => true,
+                else => false,
+            };
+            costs[idx] = if (price_fuel)
+                sandbox_mod.blockCost(block.end - block.start, slow_words, call_words, fast_arm)
+            else
+                0;
+        }
+        return costs;
     }
 
     fn detectOptimizedFunction(func: *const parser.Function) OptimizedFunctionKind {
@@ -1643,7 +2204,27 @@ pub const VM = struct {
                 // Resolve operand slot indices and label pc targets.
                 for (inst.args) |*arg| {
                     switch (arg.kind) {
-                        .register, .stack_addr, .offset_addr => {
+                        .register => {
+                            if (reg_map.get(arg.name)) |slot| {
+                                arg.slot_idx = @intCast(slot);
+                            } else if (self.program.constants.get(arg.name)) |bytes| {
+                                // Bare operand naming a module constant: read it
+                                // as the constant's base address, exactly like
+                                // sci/src/interp.zig readValue() falls back to
+                                // constPointerValue() when a register has no
+                                // frame value. Folding `str_eq` of two literals
+                                // emits `borrow tmp, CONST` + `eq res, tmp,
+                                // @CONST`, and without this the borrow resolved
+                                // to a never-written slot (always 0), so every
+                                // literal comparison came out false.
+                                arg.kind = .constant_addr;
+                                arg.imm_val = @intFromPtr(bytes.ptr);
+                                arg.slot_idx = INVALID_SLOT;
+                            } else {
+                                arg.slot_idx = INVALID_SLOT;
+                            }
+                        },
+                        .stack_addr, .offset_addr => {
                             arg.slot_idx = @intCast(reg_map.get(arg.name) orelse INVALID_SLOT);
                         },
                         .constant_addr => {
@@ -1746,6 +2327,15 @@ pub const VM = struct {
                 }
                 for (inst.args) |arg| {
                     if (arg.kind == .register or arg.kind == .stack_addr or arg.kind == .offset_addr) {
+                        // A bare operand naming a module constant is a
+                        // constant-pointer read (SAB encodes `borrow tmp, CONST`
+                        // without the '&' address marker). It never names a
+                        // writable slot, so leave it unmapped; bindingPass turns
+                        // it into a constant_addr below. A name that is also a
+                        // destination/parameter of this function keeps its slot
+                        // — the real register wins, matching the interpreter's
+                        // "frame value first" rule in sci/src/interp.zig.
+                        if (arg.kind == .register and !reg_map.contains(arg.name) and self.program.constants.contains(arg.name)) continue;
                         if (!reg_map.contains(arg.name)) {
                             try reg_map.put(arg.name, reg_idx);
                             reg_idx += 1;
@@ -1889,7 +2479,15 @@ pub const VM = struct {
             }
         }
         if (self.statsEnabled()) self.stats.frame_pool_misses += 1;
-        return Frame.init(allocator, needed);
+        return Frame.init(allocator, needed) catch |err| switch (err) {
+            // Spec §3.2(3): frame allocation is one of the two OOM catch points
+            // translated into a clean E_MEM_QUOTA panic.
+            error.OutOfMemory => {
+                if (self.quota != null) return self.panicMemQuota();
+                return err;
+            },
+            else => return err,
+        };
     }
 
     fn releaseFrame(self: *VM, frame: *Frame, pooled: bool) void {
@@ -2038,8 +2636,126 @@ pub const VM = struct {
         return error.SymbolNotFound;
     }
 
+    // --- sla_std builtins (sa_fmt_*) ----------------------------------------
+
+    fn fmtBufferHandle(self: *VM, data: []u8) !usize {
+        const buffer = try self.allocator.create(FmtBuffer);
+        errdefer self.allocator.destroy(buffer);
+        buffer.* = .{ .data = data };
+        try self.fmt_buffers.append(buffer);
+        return @intFromPtr(buffer);
+    }
+
+    fn lookupFmtBuffer(handle: usize) !*FmtBuffer {
+        if (handle == 0) return error.FfiArityMismatch;
+        return @as(*FmtBuffer, @ptrFromInt(handle));
+    }
+
+    fn freeFmtBuffer(self: *VM, handle: usize) bool {
+        for (self.fmt_buffers.items, 0..) |buffer, idx| {
+            if (@intFromPtr(buffer) == handle) {
+                _ = self.fmt_buffers.swapRemove(idx);
+                self.allocator.free(buffer.data);
+                self.allocator.destroy(buffer);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn formatUnsignedDigits(value: u64, base: u32, out: *[24]u8) usize {
+        var digits: [24]u8 = undefined;
+        var count: usize = 0;
+        const radix: u64 = if (base >= 2 and base <= 36) base else 10;
+        const alphabet = "0123456789abcdefghijklmnopqrstuvwxyz";
+        var remaining = value;
+        while (true) {
+            digits[count] = alphabet[@intCast(remaining % radix)];
+            count += 1;
+            remaining /= radix;
+            if (remaining == 0) break;
+        }
+        for (0..count) |idx| out[idx] = digits[count - 1 - idx];
+        return count;
+    }
+
+    fn executeSlaBuiltin(self: *VM, sla_builtin: SlaBuiltin, args: []const usize) !usize {
+        switch (sla_builtin) {
+            .fmt_i64, .fmt_u64 => {
+                if (args.len < 2) return error.FfiArityMismatch;
+                const raw: u64 = @intCast(args[0]);
+                const base: u32 = @intCast(args[1] & 0xffffffff);
+                var text_buf: [64]u8 = undefined;
+                var digits_buf: [24]u8 = undefined;
+                var len: usize = 0;
+                if (sla_builtin == .fmt_i64 and @as(i64, @bitCast(raw)) < 0) {
+                    text_buf[0] = '-';
+                    len = 1;
+                    const digit_count = formatUnsignedDigits(~raw +% 1, base, &digits_buf);
+                    @memcpy(text_buf[len..][0..digit_count], digits_buf[0..digit_count]);
+                    len += digit_count;
+                } else {
+                    const digit_count = formatUnsignedDigits(raw, base, &digits_buf);
+                    @memcpy(text_buf[len..][0..digit_count], digits_buf[0..digit_count]);
+                    len += digit_count;
+                }
+                const data = try self.allocator.dupe(u8, text_buf[0..len]);
+                errdefer self.allocator.free(data);
+                return try self.fmtBufferHandle(data);
+            },
+            .fmt_f64 => {
+                if (args.len < 2) return error.FfiArityMismatch;
+                const value: f64 = @bitCast(@as(u64, @intCast(args[0])));
+                const precision: usize = @intCast(@min(args[1] & 0xffffffff, @as(usize, 17)));
+                const data = try std.fmt.allocPrint(self.allocator, "{d:.[1]}", .{ value, precision });
+                errdefer self.allocator.free(data);
+                return try self.fmtBufferHandle(data);
+            },
+            .fmt_bool => {
+                if (args.len < 1) return error.FfiArityMismatch;
+                const text: []const u8 = if ((args[0] & 1) != 0) "true" else "false";
+                const data = try self.allocator.dupe(u8, text);
+                errdefer self.allocator.free(data);
+                return try self.fmtBufferHandle(data);
+            },
+            .buffer_data => {
+                if (args.len < 1) return error.FfiArityMismatch;
+                const buffer = try lookupFmtBuffer(args[0]);
+                return @intFromPtr(buffer.data.ptr);
+            },
+            .buffer_len => {
+                if (args.len < 1) return error.FfiArityMismatch;
+                const buffer = try lookupFmtBuffer(args[0]);
+                return buffer.data.len;
+            },
+            .buffer_free => {
+                if (args.len < 1) return error.FfiArityMismatch;
+                // Call sites pass "^buffer"; freeing an unknown handle is a no-op.
+                _ = self.freeFmtBuffer(args[0]);
+                self.bumpMemoryEpoch();
+                return 0;
+            },
+        }
+    }
+
     /// Runtime fallback for calls that couldn't be resolved at binding time.
+    ///
+    /// This is the choke point where every unresolved extern reaches the host,
+    /// so the capability gate runs FIRST: a symbol the policy does not allow is
+    /// refused with E_CAPABILITY_DENIED before any dlopen/dlsym resolution is
+    /// attempted for it (spec §3.3/§3.4). Without a policy the historical
+    /// developer-mode behavior is preserved unchanged.
+    ///
+    /// Still true and documented: this only decides whether the call may be
+    /// MADE. The operation itself still executes inside whatever plugin DLL
+    /// exports the symbol — there is no broker routing yet, so redirects
+    /// followed inside native HTTP code and post-check/pre-use filesystem
+    /// races remain outside the enforcement boundary (README "Sandbox").
     fn callUnresolved(self: *VM, func_name: []const u8, args: []const usize) !usize {
+        try self.sandboxCheckpoint();
+        // `true`: from here the call can only end in exported machine code
+        // (interpreted targets are bound at bind time and never reach this).
+        try self.enforceExternCapability(func_name, args, true);
         if (self.program.externs.get(func_name)) |signature| {
             return try self.ffi.callSymbol(func_name, signature, args);
         } else if (self.ffi.resolveSymbol(func_name)) |sym| {
@@ -2064,6 +2780,18 @@ pub const VM = struct {
         return if ((narrowed & sign_bit) != 0) narrowed | ~mask else narrowed;
     }
 
+    /// Truncate to the declared width, sign-extending signed types so a narrow
+    /// result keeps the slot encoding the typed loads produce.
+    fn signExtendToType(value: usize, ty: parser.PrimType) u64 {
+        return switch (ty) {
+            .i8 => signExtend(value, 8),
+            .i16 => signExtend(value, 16),
+            .i32 => signExtend(value, 32),
+            .i1, .u8, .u16, .u32 => truncToType(value, ty),
+            else => @as(u64, @intCast(value)),
+        };
+    }
+
     fn truncToType(value: usize, ty: parser.PrimType) u64 {
         const raw = @as(u64, @intCast(value));
         return switch (ty) {
@@ -2073,6 +2801,31 @@ pub const VM = struct {
             .i32, .u32, .f32 => raw & 0xffffffff,
             else => raw,
         };
+    }
+
+    // --- Float policy -------------------------------------------------------
+    // Slots are untagged u64 words, so float values live in them as raw
+    // IEEE-754 bit patterns, canonically at f64 width: imm_float assigns store
+    // the f64 bits, typed loads widen an f32 memory read up to f64 and typed
+    // stores narrow it back down. Every float op can therefore compute in f64,
+    // which matches the native backend for f64 math and keeps f32 math exact
+    // after the round-trip through its 4-byte stack slot.
+
+    inline fn f64FromSlot(raw: usize) f64 {
+        return @as(f64, @bitCast(@as(u64, @intCast(raw))));
+    }
+
+    inline fn f64ToSlot(value: f64) u64 {
+        return @as(u64, @bitCast(value));
+    }
+
+    /// fptosi is poison in LLVM when the value is NaN or out of range; clamp
+    /// instead of trapping on the host float->int cast.
+    fn f64ToI64Saturating(value: f64) i64 {
+        if (std.math.isNan(value)) return 0;
+        if (value >= @as(f64, @floatFromInt(std.math.maxInt(i64)))) return std.math.maxInt(i64);
+        if (value <= @as(f64, @floatFromInt(std.math.minInt(i64)))) return std.math.minInt(i64);
+        return @intFromFloat(value);
     }
 
     fn finishReturn(self: *VM, func: *const parser.Function, ret: usize) !usize {
@@ -2157,12 +2910,25 @@ pub const VM = struct {
             return .tail_restart;
         }
 
+        // Wall-clock checkpoint around every non-pure dispatch target (spec
+        // §3.1 step 4), then the capability gates, which need the resolved
+        // argument values to classify the call's I/O target.
+        try self.sandboxCheckpoint();
+
         var args_buf: [16]usize = undefined;
         var args = try self.collectCompiledCallArgs(frame, meta.args, args_buf[0..]);
         defer args.deinit(self.allocator);
 
+        try self.checkCapabilityForTarget(meta.target, self.callTargetDiagnosticName(func, meta), args.items);
+
         const ret = switch (meta.target) {
             .builtin_print => blk: {
+                // Layer 3: printing to OUR stdout stays ungated on purpose — it
+                // writes to the host's own console and carries no capability.
+                // Wall clock is adequate here: sandboxCheckpoint() ran one line
+                // above, so every print iteration re-checks the deadline before
+                // the write, and a single writeAll is bounded by the OS writer,
+                // not by guest fuel (README "Sandbox", Layer 3 findings).
                 const slice = @as([*]const u8, @ptrFromInt(args.items[0]))[0..args.items[1]];
                 std.io.getStdOut().writeAll(slice) catch {};
                 break :blk @as(usize, 0);
@@ -2174,6 +2940,7 @@ pub const VM = struct {
                 break :blk @as(usize, @intCast(@as(u64, @bitCast(ns))));
             },
             .builtin_time_instant_ns => @as(usize, @intCast(std.time.nanoTimestamp())),
+            .sla_builtin => |sla_builtin| try self.executeSlaBuiltin(sla_builtin, args.items),
             .interpreted => |target_func| try self.executeInterpretedCall(target_func, args.items),
             .ffi_typed => |ft| blk: {
                 const out = try self.ffi.callSymbolWithPtr(ft.sym, ft.sig, args.items);
@@ -2219,6 +2986,18 @@ pub const VM = struct {
 
     fn executeCompiledIndirectCall(self: *VM, frame: *Frame, meta: *const IndirectCallMetadata) !StepResult {
         const ptr = self.resolveCompiledVal(frame, meta.fn_ptr);
+        try self.sandboxCheckpoint();
+        // Capability gate (spec §3.4): pointers inside the VM's own function
+        // table are ordinary interpreted guest calls and need no capability;
+        // anything else is raw native code reached through callPointerLegacy
+        // and requires the `ffi` capability. Broker routing that would replace
+        // the raw pointer call entirely remains future work.
+        const known_guest_fn = self.function_addresses.contains(ptr);
+        if (!known_guest_fn) {
+            if (self.policy) |pol| {
+                if (!pol.checkFfi().isAllowed()) return self.panicCapabilityDenied("ffi", "call_indirect");
+            }
+        }
         var args_buf: [16]usize = undefined;
         var args = try self.collectCompiledCallArgs(frame, meta.args, args_buf[0..]);
         defer args.deinit(self.allocator);
@@ -2248,10 +3027,27 @@ pub const VM = struct {
             .stack_alloc, .alloc => {
                 const size = self.resolveVal(frame, inst.args[0]);
                 const word_count = (size + 7) / 8;
-                const buf = if (inst.op == .stack_alloc)
-                    try local_alloc.alloc(u64, @max(1, word_count))
-                else
-                    try self.allocator.alloc(u64, @max(1, word_count));
+                const requested = @max(1, word_count);
+                // Spec §3.2(3): quota exhaustion must surface as E_MEM_QUOTA,
+                // never as a silent wrong result.
+                const buf = blk: {
+                    if (inst.op == .stack_alloc) {
+                        break :blk local_alloc.alloc(u64, requested) catch |err| switch (err) {
+                            error.OutOfMemory => {
+                                if (self.quota != null) return self.panicMemQuota();
+                                return err;
+                            },
+                            else => return err,
+                        };
+                    }
+                    break :blk self.allocator.alloc(u64, requested) catch |err| switch (err) {
+                        error.OutOfMemory => {
+                            if (self.quota != null) return self.panicMemQuota();
+                            return err;
+                        },
+                        else => return err,
+                    };
+                };
                 @memset(std.mem.sliceAsBytes(buf), 0);
                 if (inst.op == .alloc) {
                     try self.heap_allocs.append(buf);
@@ -2266,9 +3062,10 @@ pub const VM = struct {
                 if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = ptr_val +% offset_val;
                 return .next;
             },
-            .add, .sub, .mul, .div, .rem, .sdiv, .udiv, .srem, .urem, .shl, .shr => {
+            .add, .sub, .mul, .div, .rem, .sdiv, .udiv, .srem, .urem, .shl, .shr, .ashr, .neg, .not => {
                 const arg1 = self.resolveScalarVal(frame, inst.args[0]);
-                const arg2 = self.resolveScalarVal(frame, inst.args[1]);
+                // Unary forms (.neg/.not) carry a single operand.
+                const arg2 = if (inst.args.len > 1) self.resolveScalarVal(frame, inst.args[1]) else 0;
                 const result: u64 = switch (inst.op) {
                     .add => arg1 +% arg2,
                     .sub => arg1 -% arg2,
@@ -2287,9 +3084,29 @@ pub const VM = struct {
                     .urem, .rem => if (arg2 != 0) arg1 % arg2 else 0,
                     .shl => arg1 << @intCast(arg2 & 63),
                     .shr => arg1 >> @intCast(arg2 & 63),
+                    .ashr => @as(u64, @bitCast(@as(i64, @bitCast(arg1)) >> @intCast(arg2 & 63))),
+                    // Unary forms still read args[0]; args[1] is unused (.none).
+                    .neg => 0 -% arg1,
+                    .not => ~arg1,
                     else => unreachable,
                 };
                 if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = result;
+                return .next;
+            },
+            .fadd, .fsub, .fmul, .fdiv, .fneg => {
+                const lhs = f64FromSlot(self.resolveScalarVal(frame, inst.args[0]));
+                // Unary form (.fneg) carries a single operand.
+                const rhs = if (inst.args.len > 1) f64FromSlot(self.resolveScalarVal(frame, inst.args[1])) else 0;
+                const value: f64 = switch (inst.op) {
+                    .fadd => lhs + rhs,
+                    .fsub => lhs - rhs,
+                    .fmul => lhs * rhs,
+                    .fdiv => lhs / rhs,
+                    // Unary negate; rhs is unused (.none resolves to 0 -> 0.0).
+                    .fneg => -lhs,
+                    else => unreachable,
+                };
+                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = f64ToSlot(value);
                 return .next;
             },
             .and_, .or_, .xor_ => {
@@ -2313,7 +3130,10 @@ pub const VM = struct {
                 var args_buf: [16]usize = undefined;
                 var args = try self.collectCallArgs(frame, inst.args[1..], args_buf[0..]);
                 defer args.deinit(self.allocator);
-                const ret = switch (call_targets[inst_pc]) {
+                try self.sandboxCheckpoint();
+                const target = call_targets[inst_pc];
+                try self.checkCapabilityForTarget(target, if (inst.args.len > 0) inst.args[0].name else "extern", args.items);
+                const ret = switch (target) {
                     .builtin_print => blk: {
                         const slice = @as([*]const u8, @ptrFromInt(args.items[0]))[0..args.items[1]];
                         std.io.getStdOut().writeAll(slice) catch {};
@@ -2326,6 +3146,10 @@ pub const VM = struct {
                         break :blk @as(usize, @intCast(@as(u64, @bitCast(ns))));
                     },
                     .builtin_time_instant_ns => @as(usize, @intCast(std.time.nanoTimestamp())),
+                    .sla_builtin => |sla_builtin| blk: {
+                        const out = try self.executeSlaBuiltin(sla_builtin, args.items);
+                        break :blk out;
+                    },
                     .interpreted => |target_func| try self.executeInterpretedCall(target_func, args.items),
                     .ffi_typed => |ft| blk: {
                         const out = try self.ffi.callSymbolWithPtr(ft.sym, ft.sig, args.items);
@@ -2371,6 +3195,16 @@ pub const VM = struct {
                 var args_buf: [16]usize = undefined;
                 var args = try self.collectCallArgs(frame, inst.args[1..], args_buf[0..]);
                 defer args.deinit(self.allocator);
+                try self.sandboxCheckpoint();
+                // Capability gate, same rule as the compiled path: only
+                // pointers that resolve to an interpreted guest function are
+                // exempt from the `ffi` capability.
+                const known_guest_fn = self.function_addresses.contains(ptr);
+                if (!known_guest_fn) {
+                    if (self.policy) |pol| {
+                        if (!pol.checkFfi().isAllowed()) return self.panicCapabilityDenied("ffi", "call_indirect");
+                    }
+                }
                 const ret = if (self.function_addresses.get(ptr)) |target|
                     try self.executeInterpretedCall(target, args.items)
                 else blk: {
@@ -2391,8 +3225,10 @@ pub const VM = struct {
                     .u16 => @as(u64, @intCast(@as(*align(1) const u16, @ptrFromInt(addr)).*)),
                     .i8 => @as(u64, @bitCast(@as(i64, @as(*align(1) const i8, @ptrFromInt(addr)).*))),
                     .u8 => @as(u64, @intCast(@as(*align(1) const u8, @ptrFromInt(addr)).*)),
+                    // Floats are normalized to f64 bits in the slot (see float
+                    // policy above): an f32 read widens the 4-byte value.
                     .f64 => @bitCast(@as(*align(1) const f64, @ptrFromInt(addr)).*),
-                    .f32 => @as(u64, @intCast(@as(u32, @bitCast(@as(*align(1) const f32, @ptrFromInt(addr)).*)))),
+                    .f32 => @as(u64, @bitCast(@as(f64, @as(*align(1) const f32, @ptrFromInt(addr)).*))),
                     else => return error.UnsupportedLoadType,
                 };
                 if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = val;
@@ -2406,6 +3242,10 @@ pub const VM = struct {
                     .i32, .u32 => @as(*align(1) u32, @ptrFromInt(addr)).* = @as(u32, @intCast(val & 0xffffffff)),
                     .i16, .u16 => @as(*align(1) u16, @ptrFromInt(addr)).* = @as(u16, @intCast(val & 0xffff)),
                     .i8, .u8 => @as(*align(1) u8, @ptrFromInt(addr)).* = @as(u8, @intCast(val & 0xff)),
+                    // Float stores narrow the slot's f64 bits to the declared
+                    // width so memory layout matches the native backend.
+                    .f64 => @as(*align(1) f64, @ptrFromInt(addr)).* = f64FromSlot(val),
+                    .f32 => @as(*align(1) f32, @ptrFromInt(addr)).* = @floatCast(f64FromSlot(val)),
                     else => @as(*align(1) u64, @ptrFromInt(addr)).* = val,
                 }
                 if (!inst.is_local_stack_write) self.bumpMemoryEpoch();
@@ -2460,6 +3300,24 @@ pub const VM = struct {
                 if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = if (is_true) 1 else 0;
                 return .next;
             },
+            // Float comparisons use the same 0/1 result encoding as integer
+            // comparisons; Zig's operators give IEEE-754 semantics, so NaN
+            // compares false everywhere except `!=`.
+            .fcmp_eq, .fcmp_ne, .fcmp_lt, .fcmp_le, .fcmp_gt, .fcmp_ge => {
+                const l = f64FromSlot(self.resolveScalarVal(frame, inst.args[0]));
+                const r = f64FromSlot(self.resolveScalarVal(frame, inst.args[1]));
+                const is_true = switch (inst.op) {
+                    .fcmp_eq => l == r,
+                    .fcmp_ne => l != r,
+                    .fcmp_lt => l < r,
+                    .fcmp_le => l <= r,
+                    .fcmp_gt => l > r,
+                    .fcmp_ge => l >= r,
+                    else => unreachable,
+                };
+                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = if (is_true) 1 else 0;
+                return .next;
+            },
             .assign, .assume_safe, .assume_borrow, .raw_cast, .bitcast => {
                 if (inst.dest_slot != INVALID_SLOT) {
                     frame.data[inst.dest_slot] = if (inst.src_slot != INVALID_SLOT) frame.data[inst.src_slot] else self.resolveVal(frame, inst.args[0]);
@@ -2480,6 +3338,38 @@ pub const VM = struct {
             .zext, .trunc => {
                 const raw = self.resolveVal(frame, inst.args[0]);
                 if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = truncToType(raw, inst.dest_type);
+                return .next;
+            },
+            // Float <-> int conversions operate on the slot's f64 bits (see
+            // float policy). Narrow int results keep the sign-extended slot
+            // encoding the typed loads produce.
+            .fptosi => {
+                const value = f64ToI64Saturating(f64FromSlot(self.resolveVal(frame, inst.args[0])));
+                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = signExtendToType(@as(u64, @bitCast(value)), inst.dest_type);
+                return .next;
+            },
+            .sitofp => {
+                const raw = self.resolveVal(frame, inst.args[0]);
+                const value = @as(f64, @floatFromInt(@as(i64, @bitCast(raw))));
+                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = f64ToSlot(value);
+                return .next;
+            },
+            .uitofp => {
+                const raw = self.resolveVal(frame, inst.args[0]);
+                const value = @as(f64, @floatFromInt(@as(u64, @intCast(raw))));
+                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = f64ToSlot(value);
+                return .next;
+            },
+            .fptrunc => {
+                // Round to f32 precision but keep f64 bits so subsequent float
+                // ops still see a canonical slot value.
+                const value = @as(f64, @as(f32, @floatCast(f64FromSlot(self.resolveVal(frame, inst.args[0])))));
+                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = f64ToSlot(value);
+                return .next;
+            },
+            .fpext => {
+                // Values are already held at f64 precision; this is a copy.
+                if (inst.dest_slot != INVALID_SLOT) frame.data[inst.dest_slot] = self.resolveVal(frame, inst.args[0]);
                 return .next;
             },
             .take => {
@@ -2648,6 +3538,11 @@ pub const VM = struct {
 
     fn executeCompiledFunction(self: *VM, compiled: *CompiledFunction, call_args: []const usize) anyerror!usize {
         const func = compiled.func;
+        // Guest recursion is bounded here (spec: graceful stack overflow): one
+        // counter increment + compare per call, plus a TEB-backed headroom
+        // probe on Windows so the limit adapts to the real frame size.
+        try self.enterGuestCall();
+        defer self.call_depth -= 1;
         const stats_enabled = self.statsEnabled();
         const profile_start = if (stats_enabled) nowNs() else 0;
         if (stats_enabled) {
@@ -2693,6 +3588,10 @@ pub const VM = struct {
         var frame = try self.acquireFrame(local_alloc, compiled.slot_count, !needs_arena);
         defer self.releaseFrame(&frame, !needs_arena);
         const call_targets = compiled.call_targets;
+        // Hoisted once per activation: one null-check per dispatched block is
+        // the entire default-off cost of the sandbox layer (mirrors the
+        // stats_enabled idiom).
+        const sandbox_state = self.sandbox;
 
         while (true) {
             for (current_args, 0..) |arg_val, i| frame.data[i] = arg_val;
@@ -2701,6 +3600,26 @@ pub const VM = struct {
             var tail_restart = false;
 
             block_loop: while (block_idx < compiled.blocks.len) {
+                // Resource accounting (spec §3.1): charged once per dispatched
+                // basic block, fused inline so the enabled path is a subtract,
+                // a compare and a counter bump. `sandbox_state` is non-null
+                // iff any hot-loop cap is active; with fuel disabled the table
+                // is all zeros, so charging is a no-op and only clock sampling
+                // runs.
+                if (sandbox_state) |sb| {
+                    const cost = compiled.fuel_costs[block_idx];
+                    const before = sb.fuel_remaining;
+                    sb.fuel_remaining -%= cost;
+                    if (sb.fuel_remaining > before) {
+                        sb.fuel_remaining = 0; // snapshot reports exact usage
+                        return self.panicFuelExhausted(sb);
+                    }
+                    sb.blocks_since_clock_check +%= 1;
+                    if (sb.blocks_since_clock_check >= sandbox_mod.clock_check_interval_blocks) {
+                        sb.blocks_since_clock_check = 0;
+                        if (sb.deadlineExceeded()) return self.panicTimeout();
+                    }
+                }
                 const block = compiled.blocks[block_idx];
                 if (block.term_kind == .fast_avg_load_eq_rr) {
                     if (stats_enabled) self.stats.fast_block_hits += 1;

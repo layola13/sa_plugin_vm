@@ -167,6 +167,73 @@ sa vm run --profile=10 /path/to/file.sa
 
 `--stats` prints preprocess, persistent preprocess-cache status, parse, in-process parse-cache status, FFI loading, binding, execution, bytecode, call-cache, frame-pool, and tail-restart counters to stderr. `--profile=N` includes the same stats plus the top interpreted functions by inclusive VM time.
 
+### Resource Limits (sandbox hardening)
+
+```bash
+sa vm run --fuel=1000000 /path/to/file.sab            # block-cost budget
+sa vm run --deadline-ms=5000 /path/to/file.sab        # wall-clock cap
+sa vm run --mem-cap-bytes=134217728 /path/to/file.sab # heap quota
+sa vm run --max-call-depth=50000 /path/to/file.sab    # guest recursion ceiling
+sa vm run --policy policy.json /path/to/file.sab      # sa.vm.policy/1 run policy
+```
+
+Semantics:
+
+- **Default off.** Without flags/policy, dev ergonomics are unchanged: no fuel
+  accounting, no deadline, unlimited memory. The call-depth + host-stack guard
+  is always active — runaway recursion ends as a clean panic instead of a
+  `0xC0000005` abort.
+- **Fuel is charged per compiled basic block** (`1` per word, `+15` per slow op,
+  `+31` per call, fast superinstruction arms flat `4`, minimum `1`). Exhaustion
+  raises `E_FUEL_EXHAUSTED`.
+- **Wall clock** is sampled lazily every ~1024 blocks and forced around every
+  FFI/pthread/builtin dispatch; exceeding the cap raises `E_TIMEOUT`. A blocking
+  syscall inside a single FFI call cannot be interrupted mid-call.
+- **Memory quota** wraps the VM's execution allocator (not the parse arena);
+  exhaustion at `.alloc`/frame allocation raises `E_MEM_QUOTA`.
+- **Policy**: parsed before any VM work; an invalid file exits `E_POLICY_INVALID`
+  without executing guest code. An explicit CLI flag OVERRIDES the matching
+  `limits` entry of the policy (the operator typing the flag wins); effective
+  values are echoed on the `start` event for auditability.
+- Env fallbacks (flag wins): `SA_VM_POLICY`, `SA_VM_FUEL`, `SA_VM_DEADLINE_MS`,
+  `SA_VM_MEM_CAP_BYTES`.
+
+Violation exit codes are `128 + code`; all reserved codes are <= 127 so they map
+to distinct process exit codes:
+
+| Code | Name | Exit |
+|------|------|------|
+| 100 | E_CAPABILITY_DENIED | 228 |
+| 101 | E_FUEL_EXHAUSTED | 229 |
+| 102 | E_TIMEOUT | 230 |
+| 103 | E_MEM_QUOTA | 231 |
+| 104 | E_VERIFY_FAILED | 232 (reserved) |
+| 105 | E_POLICY_INVALID | 233 |
+| 106 | E_SANDBOX_MISCONFIG | 234 (reserved) |
+| 107 | E_STACK_OVERFLOW | 235 |
+
+Every violation also emits one grep-friendly line on stderr:
+
+```
+sa-vm-event: {"v":1,"event":"violation","code":101,"name":"E_FUEL_EXHAUSTED","detail":"...","fuel_used":N,"wall_ms":M,"mem_peak_bytes":B}
+```
+
+plus a lifecycle line `{"event":"start", ...}` echoing the effective limits
+whenever any limit or policy is configured.
+
+Capability enforcement over fs/http/env/process IS wired at the extern dispatch
+point: `src/io_classify.zig` maps known symbol families (file/http/env/process
+shims such as `fd_open`) onto policy checks, and `src/vm.zig` consults the run
+policy before any I/O shim or FFI resolution happens. Layer 1 is the policy
+`extern.allow` name list (default deny; unlisted externs are rejected before
+dlopen), Layer 2 routes argument-borne targets through
+`policy.checkFs/checkHttp/checkEnv/checkProcessSpawn`. Denials surface as
+`E_CAPABILITY_DENIED` (exit 228) with a violation event naming the reason and
+target. Residual limits (documented honestly): redirects performed inside
+native plugin code are not intercepted, and the check-to-use window inside a
+single shim call is not TOCTOU-free. A runnable walkthrough lives in
+`../scratch/docs/policy_demo/`.
+
 Preprocess cache entries are stored under `$SA_CACHE/vm/preprocess` when `SA_CACHE` is set, otherwise under `$HOME/.cache/sa/vm/preprocess`. The cache stores expanded source lines plus `@const` data and validates all imported dependencies by size and mtime before reuse.
 
 Parsed Program templates are cached in-process behind a fixed-size LRU. The VM stores only an unbound parsed AST template and clones it before binding/bytecode quickening, so cached templates are not mutated by execution. This improves repeated plugin dispatches in the same `sa` process and is a safe stepping stone toward a future serialized persistent AST cache; separate CLI invocations still pay parse/bind startup cost.
