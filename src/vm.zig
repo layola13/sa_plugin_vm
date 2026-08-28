@@ -1804,10 +1804,20 @@ pub const VM = struct {
         for (inst.args[1..], 0..) |arg, idx| args[idx] = compiledOperand(arg);
         const idx = indirect_calls.items.len;
         if (idx > BYTECODE_PAYLOAD_MAX) return error.BytecodeIndexTooLarge;
+        // A callee operand that never bound to a register slot must not compile
+        // to `frame.data[INVALID_SLOT]` — fold it to null so the executor raises
+        // a clean error instead of reading a wild slot.
+        const fn_ptr: CompiledOperand = blk: {
+            const arg = inst.args[0];
+            if ((arg.kind == .register or arg.kind == .stack_addr) and arg.slot_idx == INVALID_SLOT) {
+                break :blk CompiledOperand{ .kind = .immediate, .imm = 0 };
+            }
+            break :blk compiledOperand(arg);
+        };
         try indirect_calls.append(.{
             .inst_pc = inst_pc,
             .dest_slot = inst.dest_slot,
-            .fn_ptr = compiledOperand(inst.args[0]),
+            .fn_ptr = fn_ptr,
             .args = args,
         });
         try code.append(try packPayload(.call_indirect, @as(u32, @intCast(idx))));
@@ -2244,6 +2254,27 @@ pub const VM = struct {
                     const addr_arg = inst.args[1];
                     if (addr_arg.kind == .offset_addr and addr_arg.slot_idx != INVALID_SLOT and stack_alloc_slots.contains(addr_arg.slot_idx)) {
                         inst.is_local_stack_write = true;
+                    }
+                }
+                // An indirect callee that names a function (or declared extern)
+                // instead of a register slot is a direct call in disguise — the
+                // SAB bridge emits `call_indirect r = @foo(args)` when SLA folds
+                // a statically known target. Left alone it would bind to no
+                // register slot and be executed as a wild pointer call.
+                if (inst.op == .call_indirect and inst.args.len > 0) {
+                    const callee = &inst.args[0];
+                    const unbound_slot =
+                        (callee.kind == .register or callee.kind == .stack_addr) and
+                        callee.slot_idx == INVALID_SLOT;
+                    if (unbound_slot and !self.program.constants.contains(callee.name)) {
+                        if (self.function_ptrs.contains(callee.name) or self.program.externs.contains(callee.name)) {
+                            const bound_name = try self.allocator.dupe(u8, callee.name);
+                            callee.* = .{ .kind = .label, .name = bound_name };
+                            if (self.label_targets.get(func_name)) |lmap| {
+                                if (lmap.get(bound_name)) |tpc| callee.pc_target = tpc;
+                            }
+                            inst.op = .call;
+                        }
                     }
                 }
                 // Pre-resolve call targets and tail-call flag.
@@ -2986,6 +3017,7 @@ pub const VM = struct {
 
     fn executeCompiledIndirectCall(self: *VM, frame: *Frame, meta: *const IndirectCallMetadata) !StepResult {
         const ptr = self.resolveCompiledVal(frame, meta.fn_ptr);
+        if (ptr == 0) return error.NullCallTarget;
         try self.sandboxCheckpoint();
         // Capability gate (spec §3.4): pointers inside the VM's own function
         // table are ordinary interpreted guest calls and need no capability;
@@ -3191,7 +3223,12 @@ pub const VM = struct {
                 return .next;
             },
             .call_indirect => {
-                const ptr = self.resolveAddrVal(frame, inst.args[0]);
+                const fn_arg = inst.args[0];
+                const ptr = if ((fn_arg.kind == .register or fn_arg.kind == .stack_addr) and fn_arg.slot_idx == INVALID_SLOT)
+                    @as(usize, 0)
+                else
+                    self.resolveAddrVal(frame, fn_arg);
+                if (ptr == 0) return error.NullCallTarget;
                 var args_buf: [16]usize = undefined;
                 var args = try self.collectCallArgs(frame, inst.args[1..], args_buf[0..]);
                 defer args.deinit(self.allocator);

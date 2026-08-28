@@ -539,6 +539,14 @@ fn convertInstruction(ctx: Ctx, item: *const sci_inst.Instruction, out: *std.Arr
             const parts = try callBodyParts(body);
             if (item.kind == .call) {
                 try args.append(parser.Operand{ .kind = .label, .name = try allocator.dupe(u8, parts.target) });
+            } else {
+                // Indirect calls keep the callee expression as args[0]: the VM
+                // resolves it to a function pointer at run time (vm.executeSlow
+                // `.call_indirect` / appendIndirectCall both read inst.args[0]
+                // as the callee). Dropping it used to leave the first *argument*
+                // in that slot, so the interpreter called through an arbitrary
+                // data pointer and crashed (rosetta 007/032/114/163).
+                try args.append(try operandFromName(ctx, parts.target));
             }
             const arg_texts = try splitTopLevelCommas(allocator, parts.args_text);
             defer allocator.free(arg_texts);
