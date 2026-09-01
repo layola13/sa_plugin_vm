@@ -1,6 +1,7 @@
 const std = @import("std");
 const plugin_api = @import("plugin_api");
 const parser = @import("parser.zig");
+const sla_frontend = @import("sla_frontend.zig");
 const ffi = @import("ffi.zig");
 const vm = @import("vm.zig");
 const sab_loader = @import("sab_loader.zig");
@@ -47,6 +48,33 @@ inline fn nowNs() u64 {
 
 inline fn elapsedNs(start: u64) u64 {
     return nowNs() -% start;
+}
+
+fn writeGeneratedSaFile(allocator: std.mem.Allocator, source_file: []const u8, sa_code: []const u8) ![]u8 {
+    const source_dir = std.fs.path.dirname(source_file) orelse ".";
+    var attempt: usize = 0;
+    while (attempt < 16) : (attempt += 1) {
+        const path = try std.fmt.allocPrint(allocator, "{s}{c}.sa-vm-generated-{x}-{d}.sa", .{
+            source_dir,
+            std.fs.path.sep,
+            nowNs(),
+            attempt,
+        });
+        const file = std.fs.cwd().createFile(path, .{ .exclusive = true }) catch |err| {
+            allocator.free(path);
+            if (err == error.PathAlreadyExists) continue;
+            return err;
+        };
+        file.writeAll(sa_code) catch |err| {
+            file.close();
+            std.fs.cwd().deleteFile(path) catch {};
+            allocator.free(path);
+            return err;
+        };
+        file.close();
+        return path;
+    }
+    return error.TempFileUnavailable;
 }
 
 fn envFlagSet(allocator: std.mem.Allocator, name: []const u8) bool {
@@ -391,6 +419,11 @@ pub fn runVmCommand(allocator: std.mem.Allocator, ctx: *const plugin_api.Context
     var parse_ns: u64 = 0;
     var preprocess_cache_label: []const u8 = "disabled";
     var parse_cache_label: []const u8 = "disabled";
+    var generated_sa_path: ?[]u8 = null;
+    defer if (generated_sa_path) |path| {
+        if (!envFlagSet(allocator, "SA_VM_KEEP_LOWERED")) std.fs.cwd().deleteFile(path) catch {};
+        parse_allocator.free(path);
+    };
 
     const prog = blk: {
         if (input_is_sab) {
@@ -407,14 +440,31 @@ pub fn runVmCommand(allocator: std.mem.Allocator, ctx: *const plugin_api.Context
             break :blk loaded;
         }
 
+        var parser_input_path = file_path.?;
+        if (std.ascii.endsWithIgnoreCase(parser_input_path, ".sla")) {
+            const lower_start = nowNs();
+            const sa_code = sla_frontend.compileToSa(parse_allocator, parser_input_path, stderr, .{}) catch |err| {
+                try stderr.print("SLA lowering failed: {}\n", .{err});
+                return 1;
+            };
+            if (sa_code == null) return 1;
+            generated_sa_path = writeGeneratedSaFile(parse_allocator, parser_input_path, sa_code.?) catch |err| {
+                try stderr.print("SLA lowering output failed: {}\n", .{err});
+                return 1;
+            };
+            if (envFlagSet(allocator, "SA_VM_KEEP_LOWERED")) try stderr.print("SLA lowered SA: {s}\n", .{generated_sa_path.?});
+            parser_input_path = generated_sa_path.?;
+            parse_ns = elapsedNs(lower_start);
+        }
+
         var parser_inst = parser.Parser.init(parse_allocator);
         defer parser_inst.deinit();
 
-        const preprocess_cache_root = if (envFlagSet(allocator, "SA_VM_DISABLE_PREPROCESS_CACHE")) null else try vmPreprocessCacheRoot(allocator);
+        const preprocess_cache_root = if (generated_sa_path != null or envFlagSet(allocator, "SA_VM_DISABLE_PREPROCESS_CACHE")) null else try vmPreprocessCacheRoot(allocator);
         defer if (preprocess_cache_root) |root| allocator.free(root);
 
         const preprocess_start = nowNs();
-        const preprocessed = parser_inst.preprocessWithCache(file_path.?, preprocess_cache_root) catch |err| {
+        const preprocessed = parser_inst.preprocessWithCache(parser_input_path, preprocess_cache_root) catch |err| {
             try stderr.print("Preprocessing failed: {}\n", .{err});
             return 1;
         };
@@ -453,9 +503,7 @@ pub fn runVmCommand(allocator: std.mem.Allocator, ctx: *const plugin_api.Context
         parse_cache_label = parse_cache_status.label();
         break :blk parsed;
     };
-    defer {
-        prog.deinit();
-    }
+    defer prog.deinit();
 
     var ffi_mgr = ffi.FfiManager.init(parse_allocator);
     ffi_mgr.allow_ffi = allow_ffi;
@@ -1104,7 +1152,6 @@ test "capability: --sandboxed conflicts with --allow-ffi and --policy" {
     try std.testing.expect(std.mem.indexOf(u8, stderr_policy.items, "E_SANDBOX_MISCONFIG") != null);
 }
 
-
 test "vm run falls back to @test functions when @main is absent" {
     const file_path = try std.fs.path.resolve(std.testing.allocator, &.{"tests/vm_test_mode.sa"});
     defer std.testing.allocator.free(file_path);
@@ -1280,7 +1327,7 @@ fn buildSabE2E(allocator: std.mem.Allocator) ![]u8 {
 // --- SAB float execution -----------------------------------------------------
 
 const FLOAT_REG_SYMBOLS = [_][]const u8{
-    "main", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+    "main", "v0", "v1",  "v2",  "v3",  "v4",  "v5",  "v6",  "v7",
     "v8",   "v9", "v10", "v11", "v12", "v13", "v14", "v15",
 };
 
@@ -1418,7 +1465,6 @@ test "vm run SAB float division, NaN and signed zero match IEEE semantics" {
     try std.testing.expectEqual(@as(u8, 4), try runVmCommandForTest("run", sab_path));
 }
 
-
 test "vm run executes a SAB bytecode file end to end" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1455,7 +1501,7 @@ const sci_const = sab.const_decl;
 fn encodeFoldedStrEqProgram(allocator: std.mem.Allocator, same_literal: bool) ![]u8 {
     // 0=main 1=tmp_lhs 2=tmp_out 3=bare const name 4/5="&CONST" address forms.
     const symbols = [_][]const u8{
-        "main",          "tmp_lhs",       "tmp_out",
+        "main",          "tmp_lhs",        "tmp_out",
         "SLA_STR_ALPHA", "&SLA_STR_ALPHA", "&SLA_STR_BETA",
     };
     const rhs_symbol: u32 = if (same_literal) 4 else 5;
@@ -1605,7 +1651,7 @@ fn buildMoveMarkerReuseProgram(allocator: std.mem.Allocator) ![]u8 {
         .is_ffi_wrapper = false,
     }};
     const insts = [_]sci_inst.Instruction{
-        decl,      label,      assign,     first_use,
+        decl,        label,          assign, first_use,
         move_marker, release_marker, fence,  second_use,
         ret,
     };

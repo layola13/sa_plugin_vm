@@ -1,0 +1,35 @@
+@import "sa_std/io/print.sai"
+
+// Pattern A: bare expression in async fn.
+// The VM's lowerAsyncAwait pass rewrites this into a plain `@main -> ptr`
+// function returning a ReadyFuture wrapping the literal `42`.
+//
+// Expected output: a single `Z` character (42 + 48 = ASCII 90).
+async fn make_42() -> i32 {
+    42
+}
+
+@main() -> i32:
+L_ENTRY:
+    f1 = call @make_42()
+    v1 = load f1+8 as u64
+    v1b = add v1, 48
+    v1p = stack_alloc 8
+    store v1p+0, v1b as u64
+    call @sa_print_bytes(&v1p, 1)
+    return 0
+
+@test "vm async/await pattern A bare expression"():
+L_TEST_ENTRY:
+    f1 = call @make_42()
+    v1 = load f1+8 as u64
+    ok = eq v1, 42
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return
+
+L_FAIL:
+    !ok
+    panic(101)

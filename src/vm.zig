@@ -59,6 +59,8 @@ const ResolvedCall = union(enum) {
     builtin_time_s,
     builtin_time_ns,
     builtin_time_instant_ns,
+    builtin_time_sleep_ms,
+    builtin_time_sleep_ns,
     /// sla_std formatting/buffer externs (sa_fmt_*). Capability-gated broker
     /// integration lands later; these are plain interpreter builtins for now.
     sla_builtin: SlaBuiltin,
@@ -1093,6 +1095,8 @@ pub const VM = struct {
         if (std.mem.eql(u8, call_name, "sa_time_unix_s")) return .builtin_time_s;
         if (std.mem.eql(u8, call_name, "sa_time_unix_ns")) return .builtin_time_ns;
         if (std.mem.eql(u8, call_name, "sa_time_instant_ns")) return .builtin_time_instant_ns;
+        if (std.mem.eql(u8, call_name, "sa_time_sleep_ms")) return .builtin_time_sleep_ms;
+        if (std.mem.eql(u8, call_name, "sa_time_sleep_ns")) return .builtin_time_sleep_ns;
         if (std.mem.eql(u8, call_name, "pthread_spawn")) return .pthread_spawn;
         if (std.mem.eql(u8, call_name, "pthread_spawn_detached")) return .pthread_spawn_detached;
         if (std.mem.eql(u8, call_name, "pthread_join")) return .pthread_join;
@@ -1288,6 +1292,8 @@ pub const VM = struct {
                 .builtin_time_s,
                 .builtin_time_ns,
                 .builtin_time_instant_ns,
+                .builtin_time_sleep_ms,
+                .builtin_time_sleep_ns,
                 .sla_builtin,
                 .pthread_spawn,
                 .pthread_spawn_detached,
@@ -2971,6 +2977,16 @@ pub const VM = struct {
                 break :blk @as(usize, @intCast(@as(u64, @bitCast(ns))));
             },
             .builtin_time_instant_ns => @as(usize, @intCast(std.time.nanoTimestamp())),
+            .builtin_time_sleep_ms => blk: {
+                if (args.items.len < 1) return error.FfiArityMismatch;
+                std.Thread.sleep(@as(u64, @intCast(args.items[0])) * std.time.ns_per_ms);
+                break :blk 0;
+            },
+            .builtin_time_sleep_ns => blk: {
+                if (args.items.len < 1) return error.FfiArityMismatch;
+                std.Thread.sleep(@as(u64, @intCast(args.items[0])));
+                break :blk 0;
+            },
             .sla_builtin => |sla_builtin| try self.executeSlaBuiltin(sla_builtin, args.items),
             .interpreted => |target_func| try self.executeInterpretedCall(target_func, args.items),
             .ffi_typed => |ft| blk: {
@@ -3178,6 +3194,16 @@ pub const VM = struct {
                         break :blk @as(usize, @intCast(@as(u64, @bitCast(ns))));
                     },
                     .builtin_time_instant_ns => @as(usize, @intCast(std.time.nanoTimestamp())),
+                    .builtin_time_sleep_ms => blk: {
+                        if (args.items.len < 1) return error.FfiArityMismatch;
+                        std.Thread.sleep(@as(u64, @intCast(args.items[0])) * std.time.ns_per_ms);
+                        break :blk 0;
+                    },
+                    .builtin_time_sleep_ns => blk: {
+                        if (args.items.len < 1) return error.FfiArityMismatch;
+                        std.Thread.sleep(@as(u64, @intCast(args.items[0])));
+                        break :blk 0;
+                    },
                     .sla_builtin => |sla_builtin| blk: {
                         const out = try self.executeSlaBuiltin(sla_builtin, args.items);
                         break :blk out;

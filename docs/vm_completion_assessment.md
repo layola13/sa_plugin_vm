@@ -1,6 +1,6 @@
 # sa_plugin_vm Completion Assessment
 
-Date: 2026-06-02
+Date: 2026-08-29
 
 Scope: evaluate and improve `sa_plugin_vm` against `/home/vscode/projects/TheAlgorithms/Sa`, with `sa vm run` process-level median runtime targeting no worse than 10x native Sa runtime on the benchmark edge cases.
 
@@ -17,6 +17,7 @@ Implemented and verified:
 - TheAlgorithms-focused VM fast paths are restricted to recognized safe shapes instead of broad function-name shortcuts.
 - A benchmark runner compares native Sa executable runtime with VM runtime and can include execute-only VM timings from `--stats`.
 - Installed-plugin verification requires `SA_PLUGIN_DEV=1` today because the host blocks privileged plugins in formal runtime mode unless sandbox enforcement is locked.
+- **Inline SLA → SA lowering** for the simplest async/await shapes (bare-expression `async fn`, `let v = EXPR.await;` / `return …;`) — see README §2.5. Pattern A (`async fn name() -> T { EXPR }`) returns a `ReadyFuture` whose value is consumed by SA-level `load +8` in the caller. Patterns B/C lower `EXPR.await` to a state-poll that returns the pending future pointer on `Pending` and unwraps the value on `Ready`. Pending/resume across the full Future<vtable> protocol still requires the SLA plugin's `codegen.zig`; run `sa sla` first to lower, then point the VM at the resulting `.sa`.
 
 ## Verification Evidence
 

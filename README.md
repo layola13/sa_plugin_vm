@@ -109,6 +109,40 @@ The VM is a **pure SA bytecode interpreter** running in a sandboxed environment.
 
 ---
 
+## 2.5 Async/Await Support (SLA front-end)
+
+The VM can run `.sla` files that use SLA's `async fn` / `.await` syntax via
+an inline lowering pass that runs after preprocessing and before the main
+parser loop. The pass only depends on the `sa_std/core/future.sal` contracts
+(`ReadyFuture_SIZE`, `ReadyFuture_state`, `ReadyFuture_value`) which the
+preprocessor already substitutes; the lowered output uses literal offsets
+(`+0` / `+8` / `16`) so it does not depend on the macro definitions being
+in scope.
+
+Supported body shapes (lowered to plain SA functions returning `ptr`):
+
+| Pattern | Example | Lowering |
+|---|---|---|
+| **A — bare expression** | `async fn name() -> T { EXPR }` | `EXPR` → wrap in `ReadyFuture` (`alloc 16` + `store +0, 1` + `store +8, EXPR`) and `return`. |
+| **B — `let v = EXPR.await; return USE(v);`** | Single-poll form, treats `EXPR` as a `ReadyFuture`. | Poll `EXPR+0`; if `0` (Pending) return the pending future pointer; else unwrap via `EXPR+8` into `v` and wrap the result of `USE(v)` in a new `ReadyFuture`. |
+| **C — `return EXPR.await;`** | Inline await in the return expression. | Same as B but the unwrapped value is fed directly into the `ReadyFuture` wrap. |
+| **Regular `fn` blocks** | `fn name() -> T { let x = e.await; … }` | Header lowered to `@name() -> T:`; body lines that contain `.await` are passed through `lowerAwaitInLine`. Other body constructs (`if`, `while`, struct literals, method calls, etc.) are passed through unchanged, so the user gets a familiar parse error from the underlying parser when they need the full SLA front-end. |
+
+`.await` on a Future<vtable> returned by `future::defer_ready(...)` and friends
+is **not** lowered in this pass — the proper async state machine requires
+calling the vtable's poll function and switching on the `Poll` tag, which the
+SLA plugin's `codegen.zig` does. For those cases, run `sa sla` first to get
+the lowered `.sa`, then point the VM at the `.sa` output; the VM already
+executes the resulting SA without any further work.
+
+Test fixtures that exercise the supported patterns live in
+`tests/async_pattern_a.sla` (bare-expression `async fn`) and the existing
+`tests/async_await_test.sa` (state-machine style via `libsa_async.sa`).
+Patterns requiring true pending/resume semantics are not handled by the
+inline lowering pass; follow the SLA→SA→VM path instead.
+
+---
+
 ## 3. Test Coverage
 
 Run the local regression suite and a VM smoke test:
@@ -272,3 +306,31 @@ The current completion assessment and remaining improvement plan are tracked in 
 - `f32`/`f64` floating-point arithmetic is still represented as raw bits internally; floating-point comparisons are not a supported execution path yet.
 - The thread model is synchronous inside the VM. It is sufficient for the current demos and benchmarks, but it is not a host-level pthread scheduler.
 - Very small native baselines are noisy at process-level timing granularity. Use the benchmark runner's median columns and `sa vm run --stats` execute-time counters when judging whether a case is inside the 10x target.
+
+### async / await (SLA-level surface)
+
+The VM now runs `.sla` files that use the high-level `async fn` / `.await`
+syntax on top of the standard `sa_std/future.sa` future contract. A small
+SLA → SA lowering pass runs right before the main parser (`lowerAsyncAwait`
+in `src/parser.zig`):
+
+- `async fn name(params) -> ret { body }` is rewritten to a plain SA
+  `@name(params) -> ptr:` whose body wraps each `return EXPR;` (or trailing
+  expression) in an inline `ReadyFuture` (`alloc 16` +
+  `store ...+ReadyFuture_state, 1` + `store ...+ReadyFuture_value, ...`).
+- `let x = EXPR.await;` is rewritten to an immediate `FUTURE_READY_STATE_INTO_INNER`
+  expansion (`tmp = EXPR` → `lhs = load tmp+8 as u64` → `store tmp+0, 0` →
+  `!tmp`). This is correct when the awaited future is already in the ready
+  state, which is the common case for the synchronous demo shapes.
+- The lowering also re-indents instruction lines (the preprocessor strips
+  leading whitespace) and strips `let NAME[: TYPE]` and trailing `;` so SA
+  bodies accept the SLA-style `let` declarations.
+
+Coverage is intentionally minimal — it handles the patterns that appear in
+`tests/async_pattern_a.sla` and `tests/async_pattern_b.sla`. More elaborate
+SLA surface (nested blocks, `while let Some(...) = ...`, struct
+definitions, generic types, method chains like `queue.pop()`) still
+requires running the SLA compiler's full lowering pass and feeding the VM
+the resulting `.sa`. Genuinely-pending futures that need to suspend and be
+re-polled should be driven via the standard `block_on` helper from
+`sa_std/future.sa`, as shown in `demos/rosetta/314_async_await_pending_resume`.

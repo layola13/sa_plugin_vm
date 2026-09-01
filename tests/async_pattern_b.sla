@@ -1,0 +1,42 @@
+@import "sa_std/io/print.sai"
+
+// Pattern B: async fn returning ReadyFuture, then unwrap and use the value.
+// The VM's lowerAsyncAwait pass rewrites the bare-expression body into a
+// ReadyFuture wrap and the caller loads offset +8 to extract the value.
+//
+// Expected output: 'q' (17 + 48 + 48 = 113 = ASCII 'q').
+async fn make_value() -> i32 {
+    return 17;
+}
+
+async fn make_64() -> i32 {
+    return 48;
+}
+
+@main() -> i32:
+L_ENTRY:
+    f1 = call @make_value()
+    a = load f1+8 as u64
+    f2 = call @make_64()
+    b = load f2+8 as u64
+    sum = add a, b
+    sum_b = add sum, 48
+    p = stack_alloc 8
+    store p+0, sum_b as u64
+    call @sa_print_bytes(&p, 1)
+    return 0
+
+@test "vm async/await pattern B bare return in async fn"():
+L_TEST_ENTRY:
+    f1 = call @make_value()
+    v = load f1+8 as u64
+    ok = eq v, 17
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return
+
+L_FAIL:
+    !ok
+    panic(102)
