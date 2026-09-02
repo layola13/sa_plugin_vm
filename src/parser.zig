@@ -1479,6 +1479,82 @@ pub const Parser = struct {
         return try tokens.toOwnedSlice();
     }
 
+    fn isOperandPrefix(ch: u8) bool {
+        return ch == '&' or ch == '^' or ch == '*';
+    }
+
+    fn isOperandPrefixBoundary(ch: u8) bool {
+        return std.ascii.isWhitespace(ch) or ch == ',' or ch == '(';
+    }
+
+    fn hasSeparatedOperandPrefix(raw: []const u8) bool {
+        var in_string = false;
+        var escaped = false;
+        for (raw, 0..) |ch, idx| {
+            if (in_string) {
+                if (escaped) {
+                    escaped = false;
+                } else if (ch == '\\') {
+                    escaped = true;
+                } else if (ch == '"') {
+                    in_string = false;
+                }
+                continue;
+            }
+            if (ch == '"') {
+                in_string = true;
+                continue;
+            }
+            if (!isOperandPrefix(ch)) continue;
+            if (idx != 0 and !isOperandPrefixBoundary(raw[idx - 1])) continue;
+            if (idx + 1 < raw.len and std.ascii.isWhitespace(raw[idx + 1])) return true;
+        }
+        return false;
+    }
+
+    fn normalizeSeparatedOperandPrefixes(self: *Parser, raw: []const u8) !?[]u8 {
+        if (!hasSeparatedOperandPrefix(raw)) return null;
+
+        var normalized = std.ArrayList(u8).init(self.allocator);
+        errdefer normalized.deinit();
+
+        var in_string = false;
+        var escaped = false;
+        var idx: usize = 0;
+        while (idx < raw.len) {
+            const ch = raw[idx];
+            try normalized.append(ch);
+
+            if (in_string) {
+                if (escaped) {
+                    escaped = false;
+                } else if (ch == '\\') {
+                    escaped = true;
+                } else if (ch == '"') {
+                    in_string = false;
+                }
+                idx += 1;
+                continue;
+            }
+            if (ch == '"') {
+                in_string = true;
+                idx += 1;
+                continue;
+            }
+            if (isOperandPrefix(ch) and
+                (idx == 0 or isOperandPrefixBoundary(raw[idx - 1])) and
+                idx + 1 < raw.len and std.ascii.isWhitespace(raw[idx + 1]))
+            {
+                idx += 1;
+                while (idx < raw.len and std.ascii.isWhitespace(raw[idx])) : (idx += 1) {}
+                continue;
+            }
+            idx += 1;
+        }
+
+        return try normalized.toOwnedSlice();
+    }
+
     fn makeTempName(self: *Parser) ![]const u8 {
         const name = try std.fmt.allocPrint(self.allocator, "__sa_expr{d}", .{self.expr_counter});
         self.expr_counter += 1;
@@ -1505,6 +1581,15 @@ pub const Parser = struct {
 
     fn parseExprOperand(self: *Parser, cursor: *TokenCursor, out: *std.ArrayList(Instruction)) !Operand {
         const tok = cursor.next() orelse return error.EmptyOperand;
+
+        if (tok.len == 1 and isOperandPrefix(tok[0])) {
+            const operand = cursor.next() orelse return error.EmptyOperand;
+            const combined = try self.allocator.alloc(u8, operand.len + 1);
+            defer self.allocator.free(combined);
+            combined[0] = tok[0];
+            @memcpy(combined[1..], operand);
+            return try self.parseOperand(combined);
+        }
 
         if (!canStartInlineExpr(tok, cursor)) {
             return try self.parseOperand(tok);
@@ -2297,6 +2382,10 @@ pub const Parser = struct {
             args_raw = std.mem.trim(u8, line[eq_idx + 1 ..], " \t");
         }
 
+        const normalized_args_raw = try self.normalizeSeparatedOperandPrefixes(args_raw);
+        defer if (normalized_args_raw) |normalized| self.allocator.free(normalized);
+        if (normalized_args_raw) |normalized| args_raw = normalized;
+
         var token_it = std.mem.tokenizeAny(u8, args_raw, " \t");
         const first_token = token_it.next() orelse return error.EmptyInstruction;
 
@@ -2862,3 +2951,52 @@ pub const Parser = struct {
         return Operand{ .kind = .register, .name = try self.allocator.dupe(u8, raw) };
     }
 };
+
+test "parser joins separated operand prefixes" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    const cases = [_]struct {
+        prefix: []const u8,
+        kind: OperandKind,
+    }{
+        .{ .prefix = "&", .kind = .stack_addr },
+        .{ .prefix = "^", .kind = .register },
+        .{ .prefix = "*", .kind = .register },
+    };
+
+    for (cases) |case| {
+        const tokens = [_][]const u8{ case.prefix, "value" };
+        var cursor = TokenCursor{ .tokens = &tokens };
+        var instructions = std.ArrayList(Instruction).init(allocator);
+        defer instructions.deinit();
+
+        const operand = try parser.parseExprOperand(&cursor, &instructions);
+        defer allocator.free(operand.name);
+        try std.testing.expectEqual(case.kind, operand.kind);
+        try std.testing.expectEqualStrings("value", operand.name);
+        try std.testing.expectEqual(tokens.len, cursor.index);
+    }
+}
+
+test "parser normalizes separated prefixes in regular instructions" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    var instructions = std.ArrayList(Instruction).init(allocator);
+    defer {
+        for (instructions.items) |instruction| {
+            if (instruction.dest) |dest| allocator.free(dest);
+            for (instruction.args) |operand| allocator.free(operand.name);
+            allocator.free(instruction.args);
+        }
+        instructions.deinit();
+    }
+
+    try parser.parseInstruction("dst = & value", &instructions);
+    try std.testing.expectEqual(@as(usize, 1), instructions.items.len);
+    try std.testing.expectEqual(OperandKind.stack_addr, instructions.items[0].args[0].kind);
+    try std.testing.expectEqualStrings("value", instructions.items[0].args[0].name);
+}
