@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const sa_std_windows = if (builtin.os.tag == .windows) @import("sa_std_windows") else struct {};
 const parser = @import("parser.zig");
 const c = if (builtin.os.tag == .windows) struct {
     const ffi_type = extern struct {
@@ -45,7 +46,9 @@ const dlopen = if (builtin.os.tag == .windows) struct {
         const module = std.os.windows.LoadLibraryExW(path_w.span().ptr, .none) catch return null;
         return @ptrCast(module);
     }
-}.call else struct { extern fn call(filename: ?[*:0]const u8, flags: c_int) ?*anyopaque; }.call;
+}.call else struct {
+    extern fn call(filename: ?[*:0]const u8, flags: c_int) ?*anyopaque;
+}.call;
 const dlsym = if (builtin.os.tag == .windows) struct {
     fn call(handle: ?*anyopaque, symbol: ?[*:0]const u8) ?*anyopaque {
         const module: std.os.windows.HMODULE = @ptrCast(handle orelse return null);
@@ -53,14 +56,36 @@ const dlsym = if (builtin.os.tag == .windows) struct {
         const proc = std.os.windows.kernel32.GetProcAddress(module, name) orelse return null;
         return @ptrCast(proc);
     }
-}.call else struct { extern fn call(handle: ?*anyopaque, symbol: ?[*:0]const u8) ?*anyopaque; }.call;
+}.call else struct {
+    extern fn call(handle: ?*anyopaque, symbol: ?[*:0]const u8) ?*anyopaque;
+}.call;
 const dlclose = if (builtin.os.tag == .windows) struct {
     fn call(handle: ?*anyopaque) c_int {
         const module: std.os.windows.HMODULE = @ptrCast(handle orelse return -1);
         return if (std.os.windows.kernel32.FreeLibrary(module) != 0) 0 else -1;
     }
-}.call else struct { extern fn call(handle: ?*anyopaque) c_int; }.call;
-const dlerror = if (builtin.os.tag == .windows) struct { fn call() ?[*:0]const u8 { return null; } }.call else struct { extern fn call() ?[*:0]const u8; }.call;
+}.call else struct {
+    extern fn call(handle: ?*anyopaque) c_int;
+}.call;
+const dlerror = if (builtin.os.tag == .windows) struct {
+    fn call() ?[*:0]const u8 {
+        return null;
+    }
+}.call else struct {
+    extern fn call() ?[*:0]const u8;
+}.call;
+const currentModuleHandle = if (builtin.os.tag == .windows) struct {
+    extern "kernel32" fn GetModuleHandleExA(flags: u32, address: ?[*:0]const u8, module: *std.os.windows.HMODULE) callconv(.winapi) std.os.windows.BOOL;
+    fn call(address: ?[*:0]const u8) ?*anyopaque {
+        var module: std.os.windows.HMODULE = undefined;
+        if (GetModuleHandleExA(0x4, address, &module) == 0) return null;
+        return @ptrCast(module);
+    }
+}.call else struct {
+    fn call(_: ?[*:0]const u8) ?*anyopaque {
+        return null;
+    }
+}.call;
 fn ensureWindowsLibffi() bool {
     if (builtin.os.tag != .windows) return true;
     if (c.ffi_prep_cif_ptr != null and c.ffi_call_ptr != null and c.libffi_handle != null) return true;
@@ -69,20 +94,62 @@ fn ensureWindowsLibffi() bool {
         var name_buf: [32]u8 = undefined;
         const name_z = std.fmt.bufPrintZ(&name_buf, "{s}", .{name}) catch continue;
         const handle = dlopen(name_z, 0) orelse continue;
-        const prep = dlsym(handle, "ffi_prep_cif") orelse { _ = dlclose(handle); continue; };
-        const call = dlsym(handle, "ffi_call") orelse { _ = dlclose(handle); continue; };
-        const type_void = dlsym(handle, "ffi_type_void") orelse { _ = dlclose(handle); continue; };
-        const type_uint8 = dlsym(handle, "ffi_type_uint8") orelse { _ = dlclose(handle); continue; };
-        const type_sint8 = dlsym(handle, "ffi_type_sint8") orelse { _ = dlclose(handle); continue; };
-        const type_uint16 = dlsym(handle, "ffi_type_uint16") orelse { _ = dlclose(handle); continue; };
-        const type_sint16 = dlsym(handle, "ffi_type_sint16") orelse { _ = dlclose(handle); continue; };
-        const type_uint32 = dlsym(handle, "ffi_type_uint32") orelse { _ = dlclose(handle); continue; };
-        const type_sint32 = dlsym(handle, "ffi_type_sint32") orelse { _ = dlclose(handle); continue; };
-        const type_uint64 = dlsym(handle, "ffi_type_uint64") orelse { _ = dlclose(handle); continue; };
-        const type_sint64 = dlsym(handle, "ffi_type_sint64") orelse { _ = dlclose(handle); continue; };
-        const type_float = dlsym(handle, "ffi_type_float") orelse { _ = dlclose(handle); continue; };
-        const type_double = dlsym(handle, "ffi_type_double") orelse { _ = dlclose(handle); continue; };
-        const type_pointer = dlsym(handle, "ffi_type_pointer") orelse { _ = dlclose(handle); continue; };
+        const prep = dlsym(handle, "ffi_prep_cif") orelse {
+            _ = dlclose(handle);
+            continue;
+        };
+        const call = dlsym(handle, "ffi_call") orelse {
+            _ = dlclose(handle);
+            continue;
+        };
+        const type_void = dlsym(handle, "ffi_type_void") orelse {
+            _ = dlclose(handle);
+            continue;
+        };
+        const type_uint8 = dlsym(handle, "ffi_type_uint8") orelse {
+            _ = dlclose(handle);
+            continue;
+        };
+        const type_sint8 = dlsym(handle, "ffi_type_sint8") orelse {
+            _ = dlclose(handle);
+            continue;
+        };
+        const type_uint16 = dlsym(handle, "ffi_type_uint16") orelse {
+            _ = dlclose(handle);
+            continue;
+        };
+        const type_sint16 = dlsym(handle, "ffi_type_sint16") orelse {
+            _ = dlclose(handle);
+            continue;
+        };
+        const type_uint32 = dlsym(handle, "ffi_type_uint32") orelse {
+            _ = dlclose(handle);
+            continue;
+        };
+        const type_sint32 = dlsym(handle, "ffi_type_sint32") orelse {
+            _ = dlclose(handle);
+            continue;
+        };
+        const type_uint64 = dlsym(handle, "ffi_type_uint64") orelse {
+            _ = dlclose(handle);
+            continue;
+        };
+        const type_sint64 = dlsym(handle, "ffi_type_sint64") orelse {
+            _ = dlclose(handle);
+            continue;
+        };
+        const type_float = dlsym(handle, "ffi_type_float") orelse {
+            _ = dlclose(handle);
+            continue;
+        };
+        const type_double = dlsym(handle, "ffi_type_double") orelse {
+            _ = dlclose(handle);
+            continue;
+        };
+        const type_pointer = dlsym(handle, "ffi_type_pointer") orelse {
+            _ = dlclose(handle);
+            continue;
+        };
         c.ffi_prep_cif_ptr = @ptrCast(prep);
         c.ffi_call_ptr = @ptrCast(call);
         c.ffi_type_void = @as(*c.ffi_type, @ptrCast(@alignCast(type_void))).*;
@@ -129,70 +196,73 @@ const FfiValue = extern union {
     usize_value: usize,
 };
 
-pub export fn fd_open(path: ?[*]const u8) callconv(.c) i32 {
+fn fd_open(path: ?[*]const u8) callconv(.c) i32 {
     _ = path;
     return 3;
 }
-pub export fn fd_read(fd: i32) callconv(.c) i32 {
+fn fd_read(fd: i32) callconv(.c) i32 {
     _ = fd;
     return 3;
 }
-pub export fn fd_close(fd: i32) callconv(.c) i32 {
+fn fd_close(fd: i32) callconv(.c) i32 {
     _ = fd;
     return 0;
 }
-pub export fn mmap(fd: i32, len: usize) callconv(.c) ?*anyopaque {
+fn mmap(fd: i32, len: usize) callconv(.c) ?*anyopaque {
     _ = fd;
     // Real mmap would be better, but for Rosetta shim this is often enough
     const ptr = std.heap.page_allocator.alloc(u8, len) catch return null;
     return ptr.ptr;
 }
-pub export fn munmap(ptr: ?*anyopaque, len: usize) callconv(.c) i32 {
+fn munmap(ptr: ?*anyopaque, len: usize) callconv(.c) i32 {
     _ = ptr;
     _ = len;
     return 0;
 }
-pub export fn signal(sig: i32, handler: ?*anyopaque) callconv(.c) i32 {
+fn signal(sig: i32, handler: ?*anyopaque) callconv(.c) i32 {
     _ = handler;
     return sig;
 }
-pub export fn pthread_spawn(func: ?*anyopaque, arg: ?*anyopaque) callconv(.c) i32 {
+fn pthread_spawn(func: ?*anyopaque, arg: ?*anyopaque) callconv(.c) i32 {
     _ = func;
     _ = arg;
     return 0;
 }
-pub export fn pthread_spawn_detached(func: ?*anyopaque, arg: ?*anyopaque) callconv(.c) i32 {
+fn pthread_spawn_detached(func: ?*anyopaque, arg: ?*anyopaque) callconv(.c) i32 {
     _ = func;
     _ = arg;
     return 0;
 }
-pub export fn pthread_join(id: i32, out: ?*anyopaque) callconv(.c) i32 {
+fn pthread_join(id: i32, out: ?*anyopaque) callconv(.c) i32 {
     _ = id;
     _ = out;
     return 0;
 }
-pub export fn pthread_drop(id: i32) callconv(.c) void {
+fn pthread_drop(id: i32) callconv(.c) void {
     _ = id;
 }
-pub export fn sqlite3_prepare(db: ?*anyopaque, sql: ?[*]const u8, sql_len: i32, stmt_out: ?*anyopaque) callconv(.c) i32 {
-    _ = db; _ = sql; _ = sql_len; _ = stmt_out;
+fn sqlite3_prepare(db: ?*anyopaque, sql: ?[*]const u8, sql_len: i32, stmt_out: ?*anyopaque) callconv(.c) i32 {
+    _ = db;
+    _ = sql;
+    _ = sql_len;
+    _ = stmt_out;
     return 0;
 }
-pub export fn sqlite3_step(stmt: ?*anyopaque) callconv(.c) i32 {
+fn sqlite3_step(stmt: ?*anyopaque) callconv(.c) i32 {
     _ = stmt;
     return 100; // SQLITE_DONE
 }
-pub export fn sqlite3_finalize(stmt: ?*anyopaque) callconv(.c) i32 {
+fn sqlite3_finalize(stmt: ?*anyopaque) callconv(.c) i32 {
     _ = stmt;
     return 0;
 }
 
-pub export fn sa_time_sleep_ms(ms: u64) callconv(.c) i32 {
+fn sa_time_sleep_ms(ms: u64) callconv(.c) i32 {
     std.time.sleep(ms * std.time.ns_per_ms);
     return 0;
 }
 
-pub export fn sa_time_sleep_ns(ns: u64) callconv(.c) i32 {
+fn sa_time_sleep_ns(ns: u64) callconv(.c) i32 {
     std.time.sleep(ns);
     return 0;
 }
@@ -219,12 +289,18 @@ pub const FfiManager = struct {
     fn ensureGlobalNamespace(self: *FfiManager) void {
         if (self.global_loaded) return;
         self.global_loaded = true;
-        // Load the global namespace (the sa binary itself and its dependencies) lazily.
+        // Search the host executable and this VM DLL. Windows does not
+        // support dlopen(null) as a process-wide namespace, so explicitly
+        // obtain the module containing one of our own functions.
         if (dlopen(null, 2)) |global_handle| {
             self.handles.append(global_handle) catch {};
         }
+        if (builtin.os.tag == .windows) {
+            if (currentModuleHandle(@ptrCast(&fd_open))) |module_handle| {
+                self.handles.append(module_handle) catch {};
+            }
+        }
     }
-
 
     pub fn deinit(self: *FfiManager) void {
         for (self.handles.items) |handle| {
@@ -417,6 +493,9 @@ pub const FfiManager = struct {
     /// Call an FFI function using a pre-resolved symbol pointer (skips resolveSymbol).
     /// Used by the VM binding pass to avoid repeated dlsym lookups on the hot path.
     pub fn callSymbolWithPtr(self: *FfiManager, sym: *anyopaque, signature: parser.ExternSignature, args: []const usize) !usize {
+        if (builtin.os.tag == .windows) {
+            if (callEmbeddedWindowsSymbol(sym, args)) |value| return value;
+        }
         if (builtin.os.tag == .windows and !ensureWindowsLibffi()) return error.WindowsLibffiUnavailable;
         if (args.len != signature.arg_types.len) return error.FfiArityMismatch;
 
@@ -449,6 +528,75 @@ pub const FfiManager = struct {
         return readReturnValue(ret, signature.return_type);
     }
 
+    fn callEmbeddedWindowsSymbol(sym: *anyopaque, args: []const usize) ?usize {
+        if (builtin.os.tag != .windows) return null;
+        const address = @intFromPtr(sym);
+        if (address == @intFromPtr(@as(*const anyopaque, @ptrCast(&sa_std_windows.sa_fs_read_to_stdout)))) {
+            if (args.len != 3) return null;
+            return @as(usize, @intCast(sa_std_windows.sa_fs_read_to_stdout(@ptrFromInt(args[0]), args[1], args[2])));
+        }
+        if (address == @intFromPtr(@as(*const anyopaque, @ptrCast(&sa_std_windows.sa_fs_find_files_to_stdout)))) {
+            if (args.len != 6) return null;
+            return @as(usize, @intCast(sa_std_windows.sa_fs_find_files_to_stdout(@ptrFromInt(args[0]), args[1], @ptrFromInt(args[2]), args[3], args[4], args[5])));
+        }
+        if (address == @intFromPtr(@as(*const anyopaque, @ptrCast(&sa_std_windows.sa_fs_read_lines_to_stdout)))) {
+            if (args.len != 5) return null;
+            return @as(usize, @intCast(sa_std_windows.sa_fs_read_lines_to_stdout(@ptrFromInt(args[0]), args[1], args[2], args[3], args[4])));
+        }        if (address == @intFromPtr(@as(*const anyopaque, @ptrCast(&sa_std_windows.sa_fs_append_file)))) {
+            if (args.len != 4) return null;
+            return @as(usize, @intCast(sa_std_windows.sa_fs_append_file(@ptrFromInt(args[0]), args[1], @ptrFromInt(args[2]), args[3])));
+        }
+        if (address == @intFromPtr(@as(*const anyopaque, @ptrCast(&sa_std_windows.sa_fs_write_file)))) {
+            if (args.len != 4) return null;
+            return @as(usize, @intCast(sa_std_windows.sa_fs_write_file(@ptrFromInt(args[0]), args[1], @ptrFromInt(args[2]), args[3])));
+        }
+        if (address == @intFromPtr(@as(*const anyopaque, @ptrCast(&sa_std_windows.sa_fs_edit_file)))) {
+            if (args.len != 8) return null;
+            return @as(usize, @intCast(sa_std_windows.sa_fs_edit_file(@ptrFromInt(args[0]), args[1], @ptrFromInt(args[2]), args[3], @ptrFromInt(args[4]), args[5], @bitCast(args[6]), @intCast(args[7]))));
+        }
+        if (address == @intFromPtr(@as(*const anyopaque, @ptrCast(&sa_std_windows.sa_fs_remove_file)))) {
+            if (args.len != 2) return null;
+            return @as(usize, @intCast(sa_std_windows.sa_fs_remove_file(@ptrFromInt(args[0]), args[1])));
+        }
+        if (address == @intFromPtr(@as(*const anyopaque, @ptrCast(&sa_std_windows.sa_fs_rename)))) {
+            if (args.len != 4) return null;
+            return @as(usize, @intCast(sa_std_windows.sa_fs_rename(@ptrFromInt(args[0]), args[1], @ptrFromInt(args[2]), args[3])));
+        }
+        if (address == @intFromPtr(@as(*const anyopaque, @ptrCast(&sa_std_windows.sa_std_fs_len)))) {
+            if (args.len != 3) return null;
+            return @as(usize, @intCast(sa_std_windows.sa_std_fs_len(@ptrFromInt(args[0]), args[1], @ptrFromInt(args[2]))));
+        }
+        if (address == @intFromPtr(@as(*const anyopaque, @ptrCast(&sa_std_windows.sa_std_fs_read_file)))) {
+            if (args.len != 4) return null;
+            return @as(usize, @intCast(sa_std_windows.sa_std_fs_read_file(@ptrFromInt(args[0]), args[1], args[2], @ptrFromInt(args[3]))));
+        }
+        if (address == @intFromPtr(@as(*const anyopaque, @ptrCast(&sa_std_windows.sa_fs_read_buffer_data)))) {
+            if (args.len != 1) return null;
+            return @intFromPtr(sa_std_windows.sa_fs_read_buffer_data(args[0]) orelse return 0);
+        }
+        if (address == @intFromPtr(@as(*const anyopaque, @ptrCast(&sa_std_windows.sa_fs_read_buffer_len)))) {
+            if (args.len != 1) return null;
+            return @as(usize, @intCast(sa_std_windows.sa_fs_read_buffer_len(args[0])));
+        }
+        if (address == @intFromPtr(@as(*const anyopaque, @ptrCast(&sa_std_windows.sa_fs_read_buffer_free)))) {
+            if (args.len != 1) return null;
+            return @as(usize, @intCast(sa_std_windows.sa_fs_read_buffer_free(args[0])));
+        }
+        if (address == @intFromPtr(@as(*const anyopaque, @ptrCast(&sa_std_windows.sa_std_fs_open_write)))) {
+            if (args.len != 4) return null;
+            return @as(usize, @intCast(sa_std_windows.sa_std_fs_open_write(@ptrFromInt(args[0]), args[1], @intCast(args[2]), @ptrFromInt(args[3]))));
+        }
+        if (address == @intFromPtr(@as(*const anyopaque, @ptrCast(&sa_std_windows.sa_std_fs_file_write_all_at)))) {
+            if (args.len != 4) return null;
+            return @as(usize, @intCast(sa_std_windows.sa_std_fs_file_write_all_at(args[0], @ptrFromInt(args[1]), args[2], args[3])));
+        }
+        if (address == @intFromPtr(@as(*const anyopaque, @ptrCast(&sa_std_windows.sa_std_close)))) {
+            if (args.len != 1) return null;
+            return @as(usize, @intCast(sa_std_windows.sa_std_close(args[0])));
+        }
+        return null;
+    }
+
     pub fn callSymbol(self: *FfiManager, symbol_name: []const u8, signature: parser.ExternSignature, args: []const usize) !usize {
         const sym = self.resolveSymbol(symbol_name) orelse return error.SymbolNotFound;
         return self.callSymbolWithPtr(sym, signature, args);
@@ -458,14 +606,18 @@ pub const FfiManager = struct {
         const sym = self.resolveSymbol(symbol_name) orelse return error.SymbolNotFound;
         const f = @as(FfiFn, @ptrCast(sym));
         var pad = [_]usize{0} ** 9;
-        for (args, 0..) |arg, i| if (i < 9) { pad[i] = arg; };
+        for (args, 0..) |arg, i| if (i < 9) {
+            pad[i] = arg;
+        };
         return f(pad[0], pad[1], pad[2], pad[3], pad[4], pad[5], pad[6], pad[7], pad[8]);
     }
 
     pub fn callPointerLegacy(_: *FfiManager, ptr: usize, args: []const usize) usize {
         const f = @as(FfiFn, @ptrFromInt(ptr));
         var pad = [_]usize{0} ** 9;
-        for (args, 0..) |arg, i| if (i < 9) { pad[i] = arg; };
+        for (args, 0..) |arg, i| if (i < 9) {
+            pad[i] = arg;
+        };
         return f(pad[0], pad[1], pad[2], pad[3], pad[4], pad[5], pad[6], pad[7], pad[8]);
     }
 

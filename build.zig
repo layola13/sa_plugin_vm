@@ -26,6 +26,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     root_module.addImport("sab", sab_module);
+    if (target.result.os.tag == .windows) {
+        const sa_std_module = b.createModule(.{
+            .root_source_file = .{ .cwd_relative = b.pathJoin(&.{ sci_root, "src", "runtime", "sa_std_windows.zig" }) },
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        root_module.addImport("sa_std_windows", sa_std_module);
+    }
 
     const lib = b.addLibrary(.{
         .name = "vm",
@@ -44,6 +53,15 @@ pub fn build(b: *std.Build) void {
     });
     cli_module.addImport("plugin_api", plugin_api);
     cli_module.addImport("sab", sab_module);
+    if (target.result.os.tag == .windows) {
+        const sa_std_cli_module = b.createModule(.{
+            .root_source_file = .{ .cwd_relative = b.pathJoin(&.{ sci_root, "src", "runtime", "sa_std_windows.zig" }) },
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        cli_module.addImport("sa_std_windows", sa_std_cli_module);
+    }
     const vm_cli = b.addExecutable(.{
         .name = "vm_cli",
         .root_module = cli_module,

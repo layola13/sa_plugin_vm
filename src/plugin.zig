@@ -7,6 +7,19 @@ const vm = @import("vm.zig");
 const sab_loader = @import("sab_loader.zig");
 const sandbox_mod = @import("sandbox.zig");
 const policy_mod = @import("policy.zig");
+const sa_std_windows = if (@import("builtin").os.tag == .windows) @import("sa_std_windows") else struct {};
+
+comptime {
+    if (@import("builtin").os.tag == .windows) {
+        _ = sa_std_windows.sa_fs_read_file;
+        _ = sa_std_windows.sa_fs_write_file;
+        _ = sa_std_windows.sa_fs_edit_file;
+        _ = sa_std_windows.sa_fs_rename;
+        _ = sa_std_windows.sa_std_fs_read_file;
+        _ = sa_std_windows.sa_std_fs_open_write;
+        _ = sa_std_windows.sa_std_close;
+    }
+}
 
 const skills = [_]plugin_api.SkillSection{
     .{

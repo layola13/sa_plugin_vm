@@ -94,6 +94,8 @@ pub const entries = [_]Entry{
     // --- filesystem: reads -------------------------------------------------
     .{ .pattern = "sa_fs_read_file", .kind = .fs_read, .spec = .{ .path = 0, .path_len = 1 } },
     .{ .pattern = "sa_fs_read_to_string", .kind = .fs_read, .spec = .{ .path = 0, .path_len = 1 } },
+    .{ .pattern = "sa_fs_find_files_to_stdout", .kind = .fs_read, .spec = .{ .path = 0, .path_len = 1 } },
+    .{ .pattern = "sa_fs_read_lines_to_stdout", .kind = .fs_read, .spec = .{ .path = 0, .path_len = 1 } },
     .{ .pattern = "sa_fs_read_file_base64", .kind = .fs_read, .spec = .{ .path = 0, .path_len = 1 } },
     .{ .pattern = "sa_fs_read_dir_json", .kind = .fs_read, .spec = .{ .path = 0, .path_len = 1 } },
     .{ .pattern = "sa_fs_read_dir_entries", .kind = .fs_read, .spec = .{ .path = 0, .path_len = 1 } },
@@ -120,6 +122,9 @@ pub const entries = [_]Entry{
 
     // --- filesystem: writes ------------------------------------------------
     .{ .pattern = "sa_fs_write_file", .kind = .fs_write, .spec = .{ .path = 0, .path_len = 1 } },
+    .{ .pattern = "sa_fs_append_file", .kind = .fs_write, .spec = .{ .path = 0, .path_len = 1 } },
+    .{ .pattern = "sa_fs_edit_file", .kind = .fs_write, .spec = .{ .path = 0, .path_len = 1 } },
+    .{ .pattern = "sa_fs_read_to_stdout", .kind = .fs_read, .spec = .{ .path = 0, .path_len = 1 } },
     .{ .pattern = "sa_fs_write_file_base64", .kind = .fs_write, .spec = .{ .path = 0, .path_len = 1 } },
     .{ .pattern = "sa_fs_file_create", .kind = .fs_write, .spec = .{ .path = 0, .path_len = 1 } },
     // Mode flags ignored => require write (fail closed).
