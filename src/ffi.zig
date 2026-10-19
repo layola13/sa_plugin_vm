@@ -1,8 +1,40 @@
 const std = @import("std");
+const sio = @import("sio");
 const parser = @import("parser.zig");
-const c = @cImport({
-    @cInclude("ffi.h");
-});
+const c = struct {
+    pub const ffi_type = extern struct {
+        size: usize,
+        alignment: c_ushort,
+        type: c_ushort,
+        elements: [*c][*c]ffi_type,
+    };
+    pub const ffi_cif = extern struct {
+        abi: c_uint,
+        nargs: c_uint,
+        arg_types: [*c][*c]ffi_type,
+        rtype: [*c]ffi_type,
+        bytes: c_uint,
+        flags: c_uint,
+    };
+    pub const FFI_DEFAULT_ABI: c_uint = if (@import("builtin").os.tag == .windows) 7 else 2;
+    pub const FFI_OK: c_uint = 0;
+
+    pub extern var ffi_type_void: ffi_type;
+    pub extern var ffi_type_uint8: ffi_type;
+    pub extern var ffi_type_sint8: ffi_type;
+    pub extern var ffi_type_uint16: ffi_type;
+    pub extern var ffi_type_sint16: ffi_type;
+    pub extern var ffi_type_uint32: ffi_type;
+    pub extern var ffi_type_sint32: ffi_type;
+    pub extern var ffi_type_uint64: ffi_type;
+    pub extern var ffi_type_sint64: ffi_type;
+    pub extern var ffi_type_float: ffi_type;
+    pub extern var ffi_type_double: ffi_type;
+    pub extern var ffi_type_pointer: ffi_type;
+
+    pub extern fn ffi_prep_cif(cif: [*c]ffi_cif, abi: c_uint, nargs: c_uint, rtype: [*c]ffi_type, atypes: [*c][*c]ffi_type) c_uint;
+    pub extern fn ffi_call(cif: [*c]ffi_cif, fn_ptr: ?*const fn () callconv(.c) void, rvalue: ?*anyopaque, avalue: [*c]?*anyopaque) void;
+};
 
 extern fn dlopen(filename: ?[*:0]const u8, flags: c_int) ?*anyopaque;
 extern fn dlsym(handle: ?*anyopaque, symbol: ?[*:0]const u8) ?*anyopaque;
@@ -95,18 +127,18 @@ pub export fn sqlite3_finalize(stmt: ?*anyopaque) callconv(.c) i32 {
 }
 
 pub export fn sa_time_sleep_ms(ms: u64) callconv(.c) i32 {
-    std.time.sleep(ms * std.time.ns_per_ms);
+    std.Io.sleep(sio.io(), .fromMilliseconds(@intCast(ms)), .awake) catch {};
     return 0;
 }
 
 pub export fn sa_time_sleep_ns(ns: u64) callconv(.c) i32 {
-    std.time.sleep(ns);
+    std.Io.sleep(sio.io(), .fromNanoseconds(@intCast(ns)), .awake) catch {};
     return 0;
 }
 
 pub const FfiManager = struct {
     allocator: std.mem.Allocator,
-    handles: std.ArrayList(*anyopaque),
+    handles: std.array_list.Managed(*anyopaque),
     dependencies: [][]u8,
     loaded_dependency_count: usize,
     global_loaded: bool,
@@ -115,7 +147,7 @@ pub const FfiManager = struct {
     pub fn init(allocator: std.mem.Allocator) FfiManager {
         return .{
             .allocator = allocator,
-            .handles = std.ArrayList(*anyopaque).init(allocator),
+            .handles = std.array_list.Managed(*anyopaque).init(allocator),
             .dependencies = &.{},
             .loaded_dependency_count = 0,
             .global_loaded = false,
@@ -142,18 +174,18 @@ pub const FfiManager = struct {
     }
 
     fn pluginsHome(self: *FfiManager) ![]u8 {
-        if (std.posix.getenv("SA_PLUGINS_HOME")) |home| {
-            return try self.allocator.dupe(u8, home);
-        }
-        const home_dir = std.posix.getenv("HOME") orelse "/home/vscode";
-        return try std.fmt.allocPrint(self.allocator, "{s}/.local/share/sa_plugins", .{home_dir});
+        const plugins_home = sio.getEnvVarOwned(self.allocator, "SA_PLUGINS_HOME") catch null;
+        if (plugins_home) |home| return home;
+        const home_dir = sio.getEnvVarOwned(self.allocator, "HOME") catch null;
+        defer if (home_dir) |h| self.allocator.free(h);
+        return try std.fmt.allocPrint(self.allocator, "{s}/.local/share/sa_plugins", .{home_dir orelse "/home/vscode"});
     }
 
     fn readDeclaredDependencyNames(self: *FfiManager, plugins_home: []const u8) ![][]u8 {
         const manifest_path = try std.fs.path.join(self.allocator, &.{ plugins_home, "installed", "vm", "current", "sap.json" });
         defer self.allocator.free(manifest_path);
 
-        const source = std.fs.cwd().readFileAlloc(self.allocator, manifest_path, 1 << 20) catch |err| {
+        const source = sio.cwd().readFileAlloc(self.allocator, manifest_path, 1 << 20) catch |err| {
             std.debug.print("VM manifest not readable at {s}: {}\n", .{ manifest_path, err });
             return try self.allocator.alloc([]u8, 0);
         };
@@ -175,7 +207,7 @@ pub const FfiManager = struct {
             else => return try self.allocator.alloc([]u8, 0),
         };
 
-        var names = std.ArrayList([]u8).init(self.allocator);
+        var names = std.array_list.Managed([]u8).init(self.allocator);
         errdefer {
             for (names.items) |name| self.allocator.free(name);
             names.deinit();
@@ -201,7 +233,7 @@ pub const FfiManager = struct {
         );
         defer self.allocator.free(lib_path);
 
-        const path_z = try self.allocator.dupeZ(u8, lib_path);
+        const path_z = try self.allocator.dupeSentinel(u8, lib_path, 0);
         defer self.allocator.free(path_z);
 
         // RTLD_NOW is 2.
@@ -245,7 +277,7 @@ pub const FfiManager = struct {
                 const lib_path = try std.fmt.bufPrint(&lib_path_buf, "{s}/{s}/current/lib{s}.so", .{ plugins_installed_path, plugin_name, plugin_name });
 
                 // Try to load
-                const path_z = try self.allocator.dupeZ(u8, lib_path);
+                const path_z = try self.allocator.dupeSentinel(u8, lib_path, 0);
                 defer self.allocator.free(path_z);
 
                 // RTLD_NOW is 2
@@ -356,14 +388,14 @@ pub const FfiManager = struct {
     pub fn callSymbolLegacy(self: *FfiManager, symbol_name: []const u8, args: []const usize) !usize {
         const sym = self.resolveSymbol(symbol_name) orelse return error.SymbolNotFound;
         const f = @as(FfiFn, @ptrCast(sym));
-        var pad = [_]usize{0} ** 9;
+        var pad: [9]usize = @splat(0);
         for (args, 0..) |arg, i| if (i < 9) { pad[i] = arg; };
         return f(pad[0], pad[1], pad[2], pad[3], pad[4], pad[5], pad[6], pad[7], pad[8]);
     }
 
     pub fn callPointerLegacy(_: *FfiManager, ptr: usize, args: []const usize) usize {
         const f = @as(FfiFn, @ptrFromInt(ptr));
-        var pad = [_]usize{0} ** 9;
+        var pad: [9]usize = @splat(0);
         for (args, 0..) |arg, i| if (i < 9) { pad[i] = arg; };
         return f(pad[0], pad[1], pad[2], pad[3], pad[4], pad[5], pad[6], pad[7], pad[8]);
     }
@@ -389,7 +421,7 @@ pub const FfiManager = struct {
         if (std.mem.eql(u8, symbol_name, "dlclose")) return if (self.allow_ffi) @constCast(@ptrCast(&dlclose)) else null;
         if (std.mem.eql(u8, symbol_name, "dlerror")) return if (self.allow_ffi) @constCast(@ptrCast(&dlerror)) else null;
 
-        const symbol_name_z = self.allocator.dupeZ(u8, symbol_name) catch return null;
+        const symbol_name_z = self.allocator.dupeSentinel(u8, symbol_name, 0) catch return null;
         defer self.allocator.free(symbol_name_z);
 
         self.ensureGlobalNamespace();

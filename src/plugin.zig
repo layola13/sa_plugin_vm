@@ -1,4 +1,5 @@
 const std = @import("std");
+const sio = @import("sio");
 const plugin_api = @import("plugin_api");
 const parser = @import("parser.zig");
 const ffi = @import("ffi.zig");
@@ -17,15 +18,41 @@ const skills = [_]plugin_api.SkillSection{
     },
 };
 
-const StreamCtx = struct {
+const HostWriter = struct {
+    writer: std.Io.Writer,
     stream: plugin_api.HostStream,
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *HostWriter = @fieldParentPtr("writer", w);
+        const write_all = self.stream.write_all orelse return error.WriteFailed;
+        const ok = @intFromEnum(plugin_api.AbiStatus.ok);
+        if (w.end > 0) {
+            if (write_all(self.stream.ctx, w.buffer.ptr, w.end) != ok) return error.WriteFailed;
+            w.end = 0;
+        }
+        for (data[0 .. data.len - 1]) |slice| {
+            if (write_all(self.stream.ctx, slice.ptr, slice.len) != ok) return error.WriteFailed;
+        }
+        const last = data[data.len - 1];
+        var r: usize = 0;
+        while (r < splat) : (r += 1) {
+            if (write_all(self.stream.ctx, last.ptr, last.len) != ok) return error.WriteFailed;
+        }
+        return std.Io.Writer.countSplat(data, splat);
+    }
+
+    fn init(stream: plugin_api.HostStream) HostWriter {
+        return .{
+            .writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
+            .stream = stream,
+        };
+    }
 };
 
-fn writeAll(ctx: *const anyopaque, bytes: []const u8) anyerror!usize {
-    const self = @as(*const StreamCtx, @ptrCast(@alignCast(ctx)));
-    const write_all = self.stream.write_all orelse return error.WriteFailed;
-    if (write_all(self.stream.ctx, bytes.ptr, bytes.len) != @intFromEnum(plugin_api.AbiStatus.ok)) return error.WriteFailed;
-    return bytes.len;
+fn makeHostWriter(stream: plugin_api.HostStream, storage: *HostWriter) ?*std.Io.Writer {
+    if (stream.write_all == null or stream.ctx == null) return null;
+    storage.* = HostWriter.init(stream);
+    return &storage.writer;
 }
 
 fn cArgvToSlice(argv: []const [*:0]const u8, allocator: std.mem.Allocator) ![]const []const u8 {
@@ -38,7 +65,7 @@ fn cArgvToSlice(argv: []const [*:0]const u8, allocator: std.mem.Allocator) ![]co
 }
 
 inline fn nowNs() u64 {
-    return @as(u64, @intCast(std.time.nanoTimestamp()));
+    return @as(u64, @intCast(sio.nanoTimestamp()));
 }
 
 inline fn elapsedNs(start: u64) u64 {
@@ -46,7 +73,7 @@ inline fn elapsedNs(start: u64) u64 {
 }
 
 fn envFlagSet(allocator: std.mem.Allocator, name: []const u8) bool {
-    const value = std.process.getEnvVarOwned(allocator, name) catch return false;
+    const value = sio.getEnvVarOwned(allocator, name) catch return false;
     defer allocator.free(value);
     if (value.len == 0) return false;
     if (std.mem.eql(u8, value, "0")) return false;
@@ -62,12 +89,12 @@ fn parseProfileTop(raw: []const u8) !u16 {
 }
 
 fn vmPreprocessCacheRoot(allocator: std.mem.Allocator) !?[]const u8 {
-    if (std.process.getEnvVarOwned(allocator, "SA_CACHE")) |cache_root| {
+    if (sio.getEnvVarOwned(allocator, "SA_CACHE")) |cache_root| {
         defer allocator.free(cache_root);
         return try std.fs.path.join(allocator, &.{ cache_root, "vm", "preprocess" });
     } else |_| {}
 
-    if (std.process.getEnvVarOwned(allocator, "HOME")) |home| {
+    if (sio.getEnvVarOwned(allocator, "HOME")) |home| {
         defer allocator.free(home);
         return try std.fs.path.join(allocator, &.{ home, ".cache", "sa", "vm", "preprocess" });
     } else |_| {}
@@ -101,9 +128,9 @@ const ParseCacheEntry = struct {
     program: ?*parser.Program = null,
 };
 
-var parse_cache_mutex: std.Thread.Mutex = .{};
+var parse_cache_mutex: std.Io.Mutex = .init;
 var parse_cache_clock: u64 = 0;
-var parse_cache_entries: [PARSE_CACHE_MAX_ENTRIES]ParseCacheEntry = [_]ParseCacheEntry{.{}} ** PARSE_CACHE_MAX_ENTRIES;
+var parse_cache_entries: [PARSE_CACHE_MAX_ENTRIES]ParseCacheEntry = @splat(.{});
 
 fn mixBytes(seed: u64, bytes: []const u8) u64 {
     return std.hash.Wyhash.hash(seed, bytes);
@@ -143,8 +170,8 @@ fn parseCacheFingerprint(preprocessed: [][]const u8, constants: *std.StringHashM
 }
 
 fn parseCacheLookupClone(allocator: std.mem.Allocator, key: u64) !?*parser.Program {
-    parse_cache_mutex.lock();
-    defer parse_cache_mutex.unlock();
+    parse_cache_mutex.lockUncancelable(sio.io());
+    defer parse_cache_mutex.unlock(sio.io());
 
     for (&parse_cache_entries) |*entry| {
         if (entry.program) |cached| {
@@ -162,8 +189,8 @@ fn parseCacheStore(key: u64, prog: *const parser.Program) !void {
     const cached = try parser.cloneProgram(std.heap.c_allocator, prog);
     errdefer cached.deinit();
 
-    parse_cache_mutex.lock();
-    defer parse_cache_mutex.unlock();
+    parse_cache_mutex.lockUncancelable(sio.io());
+    defer parse_cache_mutex.unlock(sio.io());
 
     parse_cache_clock +%= 1;
     var target = &parse_cache_entries[0];
@@ -191,8 +218,8 @@ fn parseCacheStore(key: u64, prog: *const parser.Program) !void {
 }
 
 fn clearParseCacheForTest() void {
-    parse_cache_mutex.lock();
-    defer parse_cache_mutex.unlock();
+    parse_cache_mutex.lockUncancelable(sio.io());
+    defer parse_cache_mutex.unlock(sio.io());
     for (&parse_cache_entries) |*entry| {
         if (entry.program) |cached| cached.deinit();
         entry.* = .{};
@@ -200,7 +227,7 @@ fn clearParseCacheForTest() void {
     parse_cache_clock = 0;
 }
 
-fn runVmCommand(allocator: std.mem.Allocator, ctx: *const plugin_api.Context, argv: []const []const u8, stdout: std.io.AnyWriter, stderr: std.io.AnyWriter) anyerror!?u8 {
+fn runVmCommand(allocator: std.mem.Allocator, ctx: *const plugin_api.Context, argv: []const []const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) anyerror!?u8 {
     _ = stdout;
     _ = ctx;
     const total_start = nowNs();
@@ -352,10 +379,10 @@ fn runVmCommand(allocator: std.mem.Allocator, ctx: *const plugin_api.Context, ar
 
 fn runVmCommandAbi(ctx: *const plugin_api.Context, argv: [*]const [*:0]const u8, argv_len: usize, stdout: plugin_api.HostStream, stderr: plugin_api.HostStream, out_code: *u8) callconv(.c) u32 {
     out_code.* = 0;
-    var stdout_ctx = StreamCtx{ .stream = stdout };
-    var stderr_ctx = StreamCtx{ .stream = stderr };
-    const stdout_writer = std.io.AnyWriter{ .context = &stdout_ctx, .writeFn = writeAll };
-    const stderr_writer = std.io.AnyWriter{ .context = &stderr_ctx, .writeFn = writeAll };
+    var stdout_storage: HostWriter = undefined;
+    var stderr_storage: HostWriter = undefined;
+    const stdout_writer = makeHostWriter(stdout, &stdout_storage) orelse return @intFromEnum(plugin_api.AbiStatus.failed);
+    const stderr_writer = makeHostWriter(stderr, &stderr_storage) orelse return @intFromEnum(plugin_api.AbiStatus.failed);
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -393,14 +420,14 @@ pub export fn saasm_plugin_descriptor_v1_fn(out: *plugin_api.PluginDescriptor) c
 }
 
 fn runVmCommandForTest(mode: []const u8, file_path: []const u8) !u8 {
-    var stdout_buf = std.ArrayList(u8).init(std.testing.allocator);
+    var stdout_buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer stdout_buf.deinit();
-    var stderr_buf = std.ArrayList(u8).init(std.testing.allocator);
+    var stderr_buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer stderr_buf.deinit();
 
     const ctx = plugin_api.Context{ .allocator = std.testing.allocator };
     const argv = [_][]const u8{ "sa", "vm", mode, file_path };
-    const result = try runVmCommand(std.testing.allocator, &ctx, &argv, stdout_buf.writer().any(), stderr_buf.writer().any());
+    const result = try runVmCommand(std.testing.allocator, &ctx, &argv, &stdout_buf.writer, &stderr_buf.writer);
     try std.testing.expect(result != null);
     return result.?;
 }
@@ -446,9 +473,9 @@ test "vm tail self-call with arena frame does not recurse on host stack" {
 }
 
 test "vm stats option prints runtime counters" {
-    var stdout_buf = std.ArrayList(u8).init(std.testing.allocator);
+    var stdout_buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer stdout_buf.deinit();
-    var stderr_buf = std.ArrayList(u8).init(std.testing.allocator);
+    var stderr_buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer stderr_buf.deinit();
 
     const file_path = try std.fs.path.resolve(std.testing.allocator, &.{"tests/vm_dead_pure.sa"});
@@ -456,10 +483,10 @@ test "vm stats option prints runtime counters" {
 
     const ctx = plugin_api.Context{ .allocator = std.testing.allocator };
     const argv = [_][]const u8{ "sa", "vm", "run", "--stats", file_path };
-    const result = try runVmCommand(std.testing.allocator, &ctx, &argv, stdout_buf.writer().any(), stderr_buf.writer().any());
+    const result = try runVmCommand(std.testing.allocator, &ctx, &argv, &stdout_buf.writer, &stderr_buf.writer);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(@as(u8, 0), result.?);
-    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "VM stats:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.written(), "VM stats:") != null);
 }
 
 test "vm parse cache hits repeated command in one process" {
@@ -467,11 +494,11 @@ test "vm parse cache hits repeated command in one process" {
     clearParseCacheForTest();
     defer clearParseCacheForTest();
 
-    var stdout_buf = std.ArrayList(u8).init(std.testing.allocator);
+    var stdout_buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer stdout_buf.deinit();
-    var stderr_first = std.ArrayList(u8).init(std.testing.allocator);
+    var stderr_first: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer stderr_first.deinit();
-    var stderr_second = std.ArrayList(u8).init(std.testing.allocator);
+    var stderr_second: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer stderr_second.deinit();
 
     const file_path = try std.fs.path.resolve(std.testing.allocator, &.{"tests/vm_parse_cache.sa"});
@@ -480,13 +507,13 @@ test "vm parse cache hits repeated command in one process" {
     const ctx = plugin_api.Context{ .allocator = std.testing.allocator };
     const argv = [_][]const u8{ "sa", "vm", "run", "--stats", file_path };
 
-    const first = try runVmCommand(std.testing.allocator, &ctx, &argv, stdout_buf.writer().any(), stderr_first.writer().any());
+    const first = try runVmCommand(std.testing.allocator, &ctx, &argv, &stdout_buf.writer, &stderr_first.writer);
     try std.testing.expectEqual(@as(u8, 42), first.?);
     stdout_buf.clearRetainingCapacity();
 
-    const second = try runVmCommand(std.testing.allocator, &ctx, &argv, stdout_buf.writer().any(), stderr_second.writer().any());
+    const second = try runVmCommand(std.testing.allocator, &ctx, &argv, &stdout_buf.writer, &stderr_second.writer);
     try std.testing.expectEqual(@as(u8, 42), second.?);
 
-    try std.testing.expect(std.mem.indexOf(u8, stderr_first.items, "parse_cache=miss") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stderr_second.items, "parse_cache=hit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_first.written(), "parse_cache=miss") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_second.written(), "parse_cache=hit") != null);
 }
