@@ -420,14 +420,14 @@ pub export fn saasm_plugin_descriptor_v1_fn(out: *plugin_api.PluginDescriptor) c
 }
 
 fn runVmCommandForTest(mode: []const u8, file_path: []const u8) !u8 {
-    var stdout_buf = std.array_list.Managed(u8).init(std.testing.allocator);
+    var stdout_buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer stdout_buf.deinit();
-    var stderr_buf = std.array_list.Managed(u8).init(std.testing.allocator);
+    var stderr_buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer stderr_buf.deinit();
 
     const ctx = plugin_api.Context{ .allocator = std.testing.allocator };
     const argv = [_][]const u8{ "sa", "vm", mode, file_path };
-    const result = try runVmCommand(std.testing.allocator, &ctx, &argv, stdout_buf.writer().any(), stderr_buf.writer().any());
+    const result = try runVmCommand(std.testing.allocator, &ctx, &argv, &stdout_buf.writer, &stderr_buf.writer);
     try std.testing.expect(result != null);
     return result.?;
 }
@@ -473,9 +473,9 @@ test "vm tail self-call with arena frame does not recurse on host stack" {
 }
 
 test "vm stats option prints runtime counters" {
-    var stdout_buf = std.array_list.Managed(u8).init(std.testing.allocator);
+    var stdout_buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer stdout_buf.deinit();
-    var stderr_buf = std.array_list.Managed(u8).init(std.testing.allocator);
+    var stderr_buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer stderr_buf.deinit();
 
     const file_path = try std.fs.path.resolve(std.testing.allocator, &.{"tests/vm_dead_pure.sa"});
@@ -483,10 +483,10 @@ test "vm stats option prints runtime counters" {
 
     const ctx = plugin_api.Context{ .allocator = std.testing.allocator };
     const argv = [_][]const u8{ "sa", "vm", "run", "--stats", file_path };
-    const result = try runVmCommand(std.testing.allocator, &ctx, &argv, stdout_buf.writer().any(), stderr_buf.writer().any());
+    const result = try runVmCommand(std.testing.allocator, &ctx, &argv, &stdout_buf.writer, &stderr_buf.writer);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(@as(u8, 0), result.?);
-    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "VM stats:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.written(), "VM stats:") != null);
 }
 
 test "vm parse cache hits repeated command in one process" {
@@ -494,11 +494,11 @@ test "vm parse cache hits repeated command in one process" {
     clearParseCacheForTest();
     defer clearParseCacheForTest();
 
-    var stdout_buf = std.array_list.Managed(u8).init(std.testing.allocator);
+    var stdout_buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer stdout_buf.deinit();
-    var stderr_first = std.array_list.Managed(u8).init(std.testing.allocator);
+    var stderr_first: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer stderr_first.deinit();
-    var stderr_second = std.array_list.Managed(u8).init(std.testing.allocator);
+    var stderr_second: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer stderr_second.deinit();
 
     const file_path = try std.fs.path.resolve(std.testing.allocator, &.{"tests/vm_parse_cache.sa"});
@@ -507,13 +507,13 @@ test "vm parse cache hits repeated command in one process" {
     const ctx = plugin_api.Context{ .allocator = std.testing.allocator };
     const argv = [_][]const u8{ "sa", "vm", "run", "--stats", file_path };
 
-    const first = try runVmCommand(std.testing.allocator, &ctx, &argv, stdout_buf.writer().any(), stderr_first.writer().any());
+    const first = try runVmCommand(std.testing.allocator, &ctx, &argv, &stdout_buf.writer, &stderr_first.writer);
     try std.testing.expectEqual(@as(u8, 42), first.?);
     stdout_buf.clearRetainingCapacity();
 
-    const second = try runVmCommand(std.testing.allocator, &ctx, &argv, stdout_buf.writer().any(), stderr_second.writer().any());
+    const second = try runVmCommand(std.testing.allocator, &ctx, &argv, &stdout_buf.writer, &stderr_second.writer);
     try std.testing.expectEqual(@as(u8, 42), second.?);
 
-    try std.testing.expect(std.mem.indexOf(u8, stderr_first.items, "parse_cache=miss") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stderr_second.items, "parse_cache=hit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_first.written(), "parse_cache=miss") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_second.written(), "parse_cache=hit") != null);
 }
