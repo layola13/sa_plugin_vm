@@ -1,5 +1,9 @@
 # Standalone Dynamic VM Interpreter Plugin (`sa_plugin_vm`)
 
+> **Build requirement: Zig 0.17** — this plugin targets and is verified against **Zig 0.17.0**. Build and test with Zig 0.17; older toolchains such as 0.14.x are not supported.
+> 本插件需使用 **Zig 0.17** 编译与测试。
+
+
 This directory contains the standalone, dynamic interpreter virtual machine plugin (`sa_plugin_vm`) for SA.
 
 By registering the `vm` subcommand via SA's dynamic command dispatch ABI (`saasm_plugin_descriptor_v1`), this plugin intercepts any `sa vm ...` calls. It recursively preprocesses, compiles to in-memory bytecode, and interprets SA assembly (`.sa` / `.sal`) files directly on the host OS, supporting internal subroutine recursion and dynamic FFI loading of external plugins without compile-time mainline compiler modifications.
