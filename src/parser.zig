@@ -1,4 +1,5 @@
 const std = @import("std");
+const sio = @import("sio");
 
 pub const PrimType = enum {
     void,
@@ -454,7 +455,7 @@ pub const Parser = struct {
     macros: std.StringHashMap(Macro),
     constants: std.StringHashMap([]const u8),
     def_macros: std.StringHashMap([]const u8),
-    dependencies: std.ArrayList(FileDependency),
+    dependencies: std.array_list.Managed(FileDependency),
     preprocess_cache_status: PreprocessCacheStatus = .disabled,
     macro_counter: usize = 0,
     expansion_counter: u64 = 0,
@@ -467,7 +468,7 @@ pub const Parser = struct {
             .macros = std.StringHashMap(Macro).init(allocator),
             .constants = std.StringHashMap([]const u8).init(allocator),
             .def_macros = std.StringHashMap([]const u8).init(allocator),
-            .dependencies = std.ArrayList(FileDependency).init(allocator),
+            .dependencies = std.array_list.Managed(FileDependency).init(allocator),
             .preprocess_cache_status = .disabled,
             .macro_counter = 0,
             .expansion_counter = 0,
@@ -512,11 +513,11 @@ pub const Parser = struct {
     fn readLines(self: *Parser, file_path: []const u8) ![][]const u8 {
         const resolved_primary = try std.fs.path.resolve(self.allocator, &.{file_path});
         defer self.allocator.free(resolved_primary);
-        const file = std.fs.cwd().openFile(file_path, .{}) catch |err| {
+        const file = sio.cwd().openFile(file_path, .{}) catch |err| {
             if (err == error.FileNotFound and self.main_root_dir != null) {
                 const resolved = std.fs.path.resolve(self.allocator, &.{ self.main_root_dir.?, file_path }) catch return err;
                 defer self.allocator.free(resolved);
-                const file_fallback = std.fs.cwd().openFile(resolved, .{}) catch {
+                const file_fallback = sio.cwd().openFile(resolved, .{}) catch {
                     std.debug.print("Failed to open file: {s}, error: {}\n", .{ file_path, err });
                     return err;
                 };
@@ -528,22 +529,22 @@ pub const Parser = struct {
         return try self.readLinesFromFile(file, resolved_primary);
     }
 
-    fn addDependency(self: *Parser, path: []const u8, stat: std.fs.File.Stat) !void {
+    fn addDependency(self: *Parser, path: []const u8, stat: sio.Stat) !void {
         try self.dependencies.append(.{
             .path = try self.allocator.dupe(u8, path),
             .size = stat.size,
-            .mtime = stat.mtime,
+            .mtime = @intCast(stat.mtime.nanoseconds),
         });
     }
 
-    fn readLinesFromFile(self: *Parser, file: std.fs.File, dep_path: []const u8) ![][]const u8 {
+    fn readLinesFromFile(self: *Parser, file: sio.File, dep_path: []const u8) ![][]const u8 {
         defer file.close();
         const stat = try file.stat();
         try self.addDependency(dep_path, stat);
         const content = try file.readToEndAlloc(self.allocator, 10 * 1024 * 1024);
         defer self.allocator.free(content);
 
-        var lines = std.ArrayList([]const u8).init(self.allocator);
+        var lines = std.array_list.Managed([]const u8).init(self.allocator);
         errdefer {
             for (lines.items) |l| self.allocator.free(l);
             lines.deinit();
@@ -568,7 +569,7 @@ pub const Parser = struct {
             return try std.fs.path.join(self.allocator, &.{ std_root, sub_path });
         }
         const rel_path = try std.fs.path.resolve(self.allocator, &.{ base_dir, import_val });
-        const file = std.fs.cwd().openFile(rel_path, .{});
+        const file = sio.cwd().openFile(rel_path, .{});
         if (file) |f| {
             f.close();
             return rel_path;
@@ -576,7 +577,7 @@ pub const Parser = struct {
             self.allocator.free(rel_path);
             if (self.main_root_dir) |main_root| {
                 const root_path = try std.fs.path.resolve(self.allocator, &.{ main_root, import_val });
-                const file_root = std.fs.cwd().openFile(root_path, .{});
+                const file_root = sio.cwd().openFile(root_path, .{});
                 if (file_root) |f| {
                     f.close();
                     return root_path;
@@ -590,7 +591,7 @@ pub const Parser = struct {
                     }
                     if (trimmed.len > 0) {
                         const root_trimmed = try std.fs.path.join(self.allocator, &.{ main_root, trimmed });
-                        const file_trimmed = std.fs.cwd().openFile(root_trimmed, .{});
+                        const file_trimmed = sio.cwd().openFile(root_trimmed, .{});
                         if (file_trimmed) |f| {
                             f.close();
                             return root_trimmed;
@@ -611,7 +612,7 @@ pub const Parser = struct {
         return null;
     }
 
-    fn writeHex(writer: std.io.AnyWriter, bytes: []const u8) !void {
+    fn writeHex(writer: *std.Io.Writer, bytes: []const u8) !void {
         const alphabet = "0123456789abcdef";
         for (bytes) |byte| {
             try writer.writeByte(alphabet[byte >> 4]);
@@ -650,14 +651,14 @@ pub const Parser = struct {
         const expected_mtime = try std.fmt.parseInt(i128, mtime_raw, 10);
         const path = try self.decodeHex(path_hex);
         defer self.allocator.free(path);
-        const file = std.fs.cwd().openFile(path, .{}) catch return false;
+        const file = sio.cwd().openFile(path, .{}) catch return false;
         defer file.close();
         const stat = file.stat() catch return false;
-        return stat.size == expected_size and stat.mtime == expected_mtime;
+        return stat.size == expected_size and @as(i128, stat.mtime.nanoseconds) == expected_mtime;
     }
 
     fn loadPreprocessCache(self: *Parser, cache_path: []const u8) !?[][]const u8 {
-        const file = std.fs.cwd().openFile(cache_path, .{}) catch |err| switch (err) {
+        const file = sio.cwd().openFile(cache_path, .{}) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return null,
         };
@@ -677,7 +678,7 @@ pub const Parser = struct {
             }
         }
 
-        var lines = std.ArrayList([]const u8).init(self.allocator);
+        var lines = std.array_list.Managed([]const u8).init(self.allocator);
         errdefer {
             for (lines.items) |l| self.allocator.free(l);
             lines.deinit();
@@ -709,10 +710,12 @@ pub const Parser = struct {
     }
 
     fn writePreprocessCache(self: *Parser, cache_root: []const u8, cache_path: []const u8, lines: [][]const u8) !void {
-        try std.fs.cwd().makePath(cache_root);
-        const file = try std.fs.cwd().createFile(cache_path, .{});
+        try sio.cwd().makePath(cache_root);
+        const file = try sio.cwd().createFile(cache_path, .{});
         defer file.close();
-        const writer = file.writer().any();
+        var alloc_writer: std.Io.Writer.Allocating = .init(self.allocator);
+        defer alloc_writer.deinit();
+        const writer = &alloc_writer.writer;
         try writer.print("{s}\n", .{PREPROCESS_CACHE_MAGIC});
         for (self.dependencies.items) |dep| {
             try writer.print("dep\t{d}\t{d}\t", .{ dep.size, dep.mtime });
@@ -732,6 +735,7 @@ pub const Parser = struct {
             try writeHex(writer, line);
             try writer.writeByte('\n');
         }
+        try file.writeAll(alloc_writer.written());
     }
 
     pub fn preprocess(self: *Parser, main_file: []const u8) ![][]const u8 {
@@ -753,7 +757,7 @@ pub const Parser = struct {
         const base_dir = std.fs.path.dirname(canonical_main) orelse ".";
         self.main_root_dir = try self.allocator.dupe(u8, base_dir);
 
-        var all_lines = std.ArrayList([]const u8).init(self.allocator);
+        var all_lines = std.array_list.Managed([]const u8).init(self.allocator);
         errdefer {
             for (all_lines.items) |l| self.allocator.free(l);
             all_lines.deinit();
@@ -762,7 +766,7 @@ pub const Parser = struct {
         try self.preprocessFile(base_dir, main_file, &all_lines);
 
         // Second pass: substitute #def macros
-        var final_lines = std.ArrayList([]const u8).init(self.allocator);
+        var final_lines = std.array_list.Managed([]const u8).init(self.allocator);
         errdefer {
             for (final_lines.items) |l| self.allocator.free(l);
             final_lines.deinit();
@@ -818,7 +822,7 @@ pub const Parser = struct {
     }
 
     fn replaceSubstring(self: *Parser, source: []const u8, target: []const u8, replacement: []const u8) ![]const u8 {
-        var result = std.ArrayList(u8).init(self.allocator);
+        var result = std.array_list.Managed(u8).init(self.allocator);
         errdefer result.deinit();
 
         var i: usize = 0;
@@ -834,7 +838,7 @@ pub const Parser = struct {
         return try result.toOwnedSlice();
     }
 
-    fn preprocessFile(self: *Parser, base_dir: []const u8, file_path: []const u8, out_lines: *std.ArrayList([]const u8)) !void {
+    fn preprocessFile(self: *Parser, base_dir: []const u8, file_path: []const u8, out_lines: *std.array_list.Managed([]const u8)) !void {
         // std.debug.print("Preprocessing file: {s} (base: {s})\n", .{file_path, base_dir});
         const raw_lines = try self.readLines(file_path);
         defer {
@@ -866,7 +870,7 @@ pub const Parser = struct {
                 const macro_name = try self.allocator.dupe(u8, macro_name_raw);
                 errdefer self.allocator.free(macro_name);
 
-                var params = std.ArrayList([]const u8).init(self.allocator);
+                var params = std.array_list.Managed([]const u8).init(self.allocator);
                 errdefer {
                     for (params.items) |p| self.allocator.free(p);
                     params.deinit();
@@ -875,7 +879,7 @@ pub const Parser = struct {
                     try params.append(try self.allocator.dupe(u8, param));
                 }
 
-                var body = std.ArrayList([]const u8).init(self.allocator);
+                var body = std.array_list.Managed([]const u8).init(self.allocator);
                 errdefer {
                     for (body.items) |b| self.allocator.free(b);
                     body.deinit();
@@ -912,7 +916,7 @@ pub const Parser = struct {
         }
     }
 
-    fn preprocessLines(self: *Parser, base_dir: []const u8, raw_lines: [][]const u8, out_lines: *std.ArrayList([]const u8)) anyerror!void {
+    fn preprocessLines(self: *Parser, base_dir: []const u8, raw_lines: [][]const u8, out_lines: *std.array_list.Managed([]const u8)) anyerror!void {
         // Pre-scan to collect all macro definitions and #defs before processing EXPANDs
         try self.prescanMacrosAndDefs(raw_lines);
         var idx: usize = 0;
@@ -943,7 +947,7 @@ pub const Parser = struct {
                 const macro_name = try self.allocator.dupe(u8, macro_name_raw);
                 errdefer self.allocator.free(macro_name);
 
-                var params = std.ArrayList([]const u8).init(self.allocator);
+                var params = std.array_list.Managed([]const u8).init(self.allocator);
                 errdefer {
                     for (params.items) |p| self.allocator.free(p);
                     params.deinit();
@@ -952,7 +956,7 @@ pub const Parser = struct {
                     try params.append(try self.allocator.dupe(u8, param));
                 }
 
-                var body = std.ArrayList([]const u8).init(self.allocator);
+                var body = std.array_list.Managed([]const u8).init(self.allocator);
                 errdefer {
                     for (body.items) |b| self.allocator.free(b);
                     body.deinit();
@@ -1014,7 +1018,7 @@ pub const Parser = struct {
                 var token_it = std.mem.tokenizeAny(u8, parts_str, " \t,");
                 const macro_name = token_it.next() orelse return error.InvalidMacroExpansion;
 
-                var args = std.ArrayList([]const u8).init(self.allocator);
+                var args = std.array_list.Managed([]const u8).init(self.allocator);
                 defer {
                     for (args.items) |a| self.allocator.free(a);
                     args.deinit();
@@ -1038,7 +1042,7 @@ pub const Parser = struct {
                     try self.collectDefinedNames(mac.body, &defined_names);
 
                     // 2. Build hygiene replacements list
-                    var hygiene_repls = std.ArrayList(struct { needle: []const u8, replacement: []const u8 }).init(self.allocator);
+                    var hygiene_repls = std.array_list.Managed(struct { needle: []const u8, replacement: []const u8 }).init(self.allocator);
                     defer {
                         for (hygiene_repls.items) |r| {
                             self.allocator.free(r.needle);
@@ -1089,7 +1093,7 @@ pub const Parser = struct {
                 const count = try std.fmt.parseInt(u64, count_str, 10);
 
                 var rep_nesting: usize = 1;
-                var body_lines = std.ArrayList([]const u8).init(self.allocator);
+                var body_lines = std.array_list.Managed([]const u8).init(self.allocator);
                 defer {
                     for (body_lines.items) |b| self.allocator.free(b);
                     body_lines.deinit();
@@ -1125,7 +1129,7 @@ pub const Parser = struct {
                     }
                     try self.collectDefinedNames(body_lines.items, &defined_names);
 
-                    var hygiene_repls = std.ArrayList(struct { needle: []const u8, replacement: []const u8 }).init(self.allocator);
+                    var hygiene_repls = std.array_list.Managed(struct { needle: []const u8, replacement: []const u8 }).init(self.allocator);
                     defer {
                         for (hygiene_repls.items) |r| {
                             self.allocator.free(r.needle);
@@ -1179,7 +1183,7 @@ pub const Parser = struct {
 
     fn replaceToken(self: *Parser, source: []const u8, target: []const u8, replacement: []const u8) ![]const u8 {
         defer self.allocator.free(source);
-        var result = std.ArrayList(u8).init(self.allocator);
+        var result = std.array_list.Managed(u8).init(self.allocator);
         errdefer result.deinit();
 
         var i: usize = 0;
@@ -1205,7 +1209,7 @@ pub const Parser = struct {
             const quote_end = std.mem.lastIndexOf(u8, raw, "\"") orelse return error.InvalidStringLiteral;
             const content = raw["utf8:\"".len..quote_end];
 
-            var result = std.ArrayList(u8).init(self.allocator);
+            var result = std.array_list.Managed(u8).init(self.allocator);
             errdefer result.deinit();
 
             var i: usize = 0;
@@ -1262,7 +1266,7 @@ pub const Parser = struct {
 
         if (std.mem.startsWith(u8, raw, "hex:")) {
             const content = raw["hex:".len..];
-            var result = std.ArrayList(u8).init(self.allocator);
+            var result = std.array_list.Managed(u8).init(self.allocator);
             errdefer result.deinit();
 
             var i: usize = 0;
@@ -1288,7 +1292,7 @@ pub const Parser = struct {
         // Handle struct literal: struct { fieldname: SIZE = hex:\xNN\xNN..., ... }
         // Decode by extracting all hex:\xNN... segments in order.
         if (std.mem.startsWith(u8, raw, "struct")) {
-            var result = std.ArrayList(u8).init(self.allocator);
+            var result = std.array_list.Managed(u8).init(self.allocator);
             errdefer result.deinit();
 
             var search = raw;
@@ -1330,7 +1334,7 @@ pub const Parser = struct {
         const name_raw = std.mem.trim(u8, body[0..paren_start], " \t");
         if (name_raw.len == 0) return error.InvalidExternSignature;
 
-        var arg_types = std.ArrayList(PrimType).init(self.allocator);
+        var arg_types = std.array_list.Managed(PrimType).init(self.allocator);
         errdefer arg_types.deinit();
 
         const params_str = body[paren_start + 1 .. paren_end];
@@ -1364,7 +1368,7 @@ pub const Parser = struct {
     }
 
     fn tokenizeExprTokens(self: *Parser, raw: []const u8) ![][]const u8 {
-        var tokens = std.ArrayList([]const u8).init(self.allocator);
+        var tokens = std.array_list.Managed([]const u8).init(self.allocator);
         errdefer tokens.deinit();
 
         var it = std.mem.tokenizeAny(u8, raw, " \t,");
@@ -1380,7 +1384,7 @@ pub const Parser = struct {
         return name;
     }
 
-    fn appendInstruction(self: *Parser, out: *std.ArrayList(Instruction), op: OpCode, dest: ?[]const u8, args: []const Operand, dest_type: PrimType) !void {
+    fn appendInstruction(self: *Parser, out: *std.array_list.Managed(Instruction), op: OpCode, dest: ?[]const u8, args: []const Operand, dest_type: PrimType) !void {
         const args_copy = try self.allocator.dupe(Operand, args);
         errdefer self.allocator.free(args_copy);
         try out.append(.{
@@ -1391,14 +1395,14 @@ pub const Parser = struct {
         });
     }
 
-    fn emitTempInstruction(self: *Parser, out: *std.ArrayList(Instruction), op: OpCode, args: []const Operand, dest_type: PrimType) !Operand {
+    fn emitTempInstruction(self: *Parser, out: *std.array_list.Managed(Instruction), op: OpCode, args: []const Operand, dest_type: PrimType) !Operand {
         const dest_name = try self.makeTempName();
         errdefer self.allocator.free(dest_name);
         try self.appendInstruction(out, op, dest_name, args, dest_type);
         return Operand{ .kind = .register, .name = try self.allocator.dupe(u8, dest_name) };
     }
 
-    fn parseExprOperand(self: *Parser, cursor: *TokenCursor, out: *std.ArrayList(Instruction)) !Operand {
+    fn parseExprOperand(self: *Parser, cursor: *TokenCursor, out: *std.array_list.Managed(Instruction)) !Operand {
         const tok = cursor.next() orelse return error.EmptyOperand;
 
         if (!canStartInlineExpr(tok, cursor)) {
@@ -1473,8 +1477,8 @@ pub const Parser = struct {
 
         var current_func_name: ?[]const u8 = null;
         var current_func_params: []const []const u8 = &.{};
-        var current_instructions = std.ArrayList(Instruction).init(self.allocator);
-        var current_blocks = std.ArrayList(BasicBlock).init(self.allocator);
+        var current_instructions = std.array_list.Managed(Instruction).init(self.allocator);
+        var current_blocks = std.array_list.Managed(BasicBlock).init(self.allocator);
         var current_func_returns_result = false;
 
         var idx: usize = 0;
@@ -1516,7 +1520,7 @@ pub const Parser = struct {
                 current_func_returns_result = if (std.mem.indexOf(u8, line[paren_end..], "!")) |_| true else false;
                 const name = std.mem.trim(u8, line[1..paren_start], " \t");
 
-                var params_list = std.ArrayList([]const u8).init(self.allocator);
+                var params_list = std.array_list.Managed([]const u8).init(self.allocator);
                 errdefer {
                     for (params_list.items) |p| self.allocator.free(p);
                     params_list.deinit();
@@ -1550,8 +1554,8 @@ pub const Parser = struct {
                 // std.debug.print("Parsed function name: '{s}' (from '{s}')\n", .{real_name, name});
                 current_func_name = try self.allocator.dupe(u8, real_name);
                 current_func_params = try params_list.toOwnedSlice();
-                current_instructions = std.ArrayList(Instruction).init(self.allocator);
-                current_blocks = std.ArrayList(BasicBlock).init(self.allocator);
+                current_instructions = std.array_list.Managed(Instruction).init(self.allocator);
+                current_blocks = std.array_list.Managed(BasicBlock).init(self.allocator);
                 idx += 1;
             } else if (std.mem.endsWith(u8, line, ":")) {
                 // Basic block label, e.g. L_ENTRY:
@@ -1623,7 +1627,7 @@ pub const Parser = struct {
         return true;
     }
 
-    fn parseInstruction(self: *Parser, line: []const u8, out: *std.ArrayList(Instruction)) !void {
+    fn parseInstruction(self: *Parser, line: []const u8, out: *std.array_list.Managed(Instruction)) !void {
         var op = OpCode.consume;
         var dest: ?[]const u8 = null;
         var dest_type = PrimType.void;
@@ -1654,7 +1658,7 @@ pub const Parser = struct {
         var token_it = std.mem.tokenizeAny(u8, args_raw, " \t");
         const first_token = token_it.next() orelse return error.EmptyInstruction;
 
-        var args_list = std.ArrayList(Operand).init(self.allocator);
+        var args_list = std.array_list.Managed(Operand).init(self.allocator);
         errdefer {
             for (args_list.items) |a| self.allocator.free(a.name);
             args_list.deinit();
@@ -1841,35 +1845,35 @@ pub const Parser = struct {
             op = .ptr_add;
             const arg1 = token_it.next() orelse return error.MissingPtrAddArg1;
             const arg2 = token_it.next() orelse return error.MissingPtrAddArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "add")) {
             op = .add;
             const arg1 = token_it.next() orelse return error.MissingAddArg1;
             const arg2 = token_it.next() orelse return error.MissingAddArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "sub")) {
             op = .sub;
             const arg1 = token_it.next() orelse return error.MissingSubArg1;
             const arg2 = token_it.next() orelse return error.MissingSubArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "mul")) {
             op = .mul;
             const arg1 = token_it.next() orelse return error.MissingMulArg1;
             const arg2 = token_it.next() orelse return error.MissingMulArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "div")) {
             op = .div;
             const arg1 = token_it.next() orelse return error.MissingDivArg1;
             const arg2 = token_it.next() orelse return error.MissingDivArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "rem")) {
@@ -1877,140 +1881,140 @@ pub const Parser = struct {
             op = .rem;
             const arg1 = token_it.next() orelse return error.MissingRemArg1;
             const arg2 = token_it.next() orelse return error.MissingRemArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "and")) {
             op = .and_;
             const arg1 = token_it.next() orelse return error.MissingAndArg1;
             const arg2 = token_it.next() orelse return error.MissingAndArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "or")) {
             op = .or_;
             const arg1 = token_it.next() orelse return error.MissingOrArg1;
             const arg2 = token_it.next() orelse return error.MissingOrArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "xor")) {
             op = .xor_;
             const arg1 = token_it.next() orelse return error.MissingXorArg1;
             const arg2 = token_it.next() orelse return error.MissingXorArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "sgt")) {
             op = .sgt;
             const arg1 = token_it.next() orelse return error.MissingSgtArg1;
             const arg2 = token_it.next() orelse return error.MissingSgtArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "slt")) {
             op = .slt;
             const arg1 = token_it.next() orelse return error.MissingSltArg1;
             const arg2 = token_it.next() orelse return error.MissingSltArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "sge")) {
             op = .sge;
             const arg1 = token_it.next() orelse return error.MissingSgeArg1;
             const arg2 = token_it.next() orelse return error.MissingSgeArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "sle")) {
             op = .sle;
             const arg1 = token_it.next() orelse return error.MissingSleArg1;
             const arg2 = token_it.next() orelse return error.MissingSleArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "ugt")) {
             op = .ugt;
             const arg1 = token_it.next() orelse return error.MissingUgtArg1;
             const arg2 = token_it.next() orelse return error.MissingUgtArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "ult")) {
             op = .ult;
             const arg1 = token_it.next() orelse return error.MissingUltArg1;
             const arg2 = token_it.next() orelse return error.MissingUltArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "uge")) {
             op = .uge;
             const arg1 = token_it.next() orelse return error.MissingUgeArg1;
             const arg2 = token_it.next() orelse return error.MissingUgeArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "ule")) {
             op = .ule;
             const arg1 = token_it.next() orelse return error.MissingUleArg1;
             const arg2 = token_it.next() orelse return error.MissingUleArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "sdiv")) {
             op = .sdiv;
             const arg1 = token_it.next() orelse return error.MissingSdivArg1;
             const arg2 = token_it.next() orelse return error.MissingSdivArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "udiv")) {
             op = .udiv;
             const arg1 = token_it.next() orelse return error.MissingUdivArg1;
             const arg2 = token_it.next() orelse return error.MissingUdivArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "srem")) {
             op = .srem;
             const arg1 = token_it.next() orelse return error.MissingSremArg1;
             const arg2 = token_it.next() orelse return error.MissingSremArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "urem")) {
             op = .urem;
             const arg1 = token_it.next() orelse return error.MissingUremArg1;
             const arg2 = token_it.next() orelse return error.MissingUremArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "shl")) {
             op = .shl;
             const arg1 = token_it.next() orelse return error.MissingShlArg1;
             const arg2 = token_it.next() orelse return error.MissingShlArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "shr")) {
             op = .shr;
             const arg1 = token_it.next() orelse return error.MissingShrArg1;
             const arg2 = token_it.next() orelse return error.MissingShrArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "gt")) {
             op = .gt;
             const arg1 = token_it.next() orelse return error.MissingGtArg1;
             const arg2 = token_it.next() orelse return error.MissingGtArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "lt")) {
             op = .lt;
             const arg1 = token_it.next() orelse return error.MissingLtArg1;
             const arg2 = token_it.next() orelse return error.MissingLtArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "atomic_load")) {
@@ -2114,14 +2118,14 @@ pub const Parser = struct {
             op = .eq;
             const arg1 = token_it.next() orelse return error.MissingEqArg1;
             const arg2 = token_it.next() orelse return error.MissingEqArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "ne")) {
             op = .ne;
             const arg1 = token_it.next() orelse return error.MissingNeArg1;
             const arg2 = token_it.next() orelse return error.MissingNeArg2;
-            const cleaned_arg1 = std.mem.trimRight(u8, arg1, ",");
+            const cleaned_arg1 = std.mem.trimEnd(u8, arg1, ",");
             try args_list.append(try self.parseOperand(cleaned_arg1));
             try args_list.append(try self.parseOperand(arg2));
         } else if (std.mem.eql(u8, first_token, "br")) {
@@ -2134,7 +2138,7 @@ pub const Parser = struct {
             _ = arrow; // "->"
 
             const dest1_raw = token_it.next() orelse return error.MissingBrDest1;
-            const dest1 = std.mem.trimRight(u8, dest1_raw, ",");
+            const dest1 = std.mem.trimEnd(u8, dest1_raw, ",");
             try args_list.append(Operand{ .kind = .label, .name = try self.allocator.dupe(u8, dest1) });
 
             const dest2 = token_it.next() orelse return error.MissingBrDest2;

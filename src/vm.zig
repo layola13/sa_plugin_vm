@@ -1,4 +1,5 @@
 const std = @import("std");
+const sio = @import("sio");
 const parser = @import("parser.zig");
 const ffi = @import("ffi.zig");
 
@@ -248,7 +249,7 @@ fn u64LessThan(_: void, lhs: u64, rhs: u64) bool {
 }
 
 inline fn nowNs() u64 {
-    return @as(u64, @intCast(std.time.nanoTimestamp()));
+    return @as(u64, @intCast(sio.nanoTimestamp()));
 }
 
 inline fn elapsedNs(start: u64) u64 {
@@ -280,10 +281,10 @@ pub const VM = struct {
     compiled_function_ptrs: std.AutoHashMap(usize, *CompiledFunction),
     call_cache: std.AutoHashMap(CallCacheKey, usize),
     memory_epoch: u64,
-    frame_pool: std.ArrayList([]u64),
-    dummy_buffers: std.ArrayList(*u8),
-    heap_allocs: std.ArrayList([]u64),
-    result_allocs: std.ArrayList([]u64),
+    frame_pool: std.array_list.Managed([]u64),
+    dummy_buffers: std.array_list.Managed(*u8),
+    heap_allocs: std.array_list.Managed([]u64),
+    result_allocs: std.array_list.Managed([]u64),
     result_alloc_index: std.AutoHashMap(usize, usize),
     panic_code: ?u8 = null,
     panic_message: ?[]u8 = null,
@@ -311,10 +312,10 @@ pub const VM = struct {
             .compiled_function_ptrs = std.AutoHashMap(usize, *CompiledFunction).init(allocator),
             .call_cache = std.AutoHashMap(CallCacheKey, usize).init(allocator),
             .memory_epoch = 1,
-            .frame_pool = std.ArrayList([]u64).init(allocator),
-            .dummy_buffers = std.ArrayList(*u8).init(allocator),
-            .heap_allocs = std.ArrayList([]u64).init(allocator),
-            .result_allocs = std.ArrayList([]u64).init(allocator),
+            .frame_pool = std.array_list.Managed([]u64).init(allocator),
+            .dummy_buffers = std.array_list.Managed(*u8).init(allocator),
+            .heap_allocs = std.array_list.Managed([]u64).init(allocator),
+            .result_allocs = std.array_list.Managed([]u64).init(allocator),
             .result_alloc_index = std.AutoHashMap(usize, usize).init(allocator),
             .panic_code = null,
             .panic_message = null,
@@ -438,7 +439,7 @@ pub const VM = struct {
         return self.runTestsAfterInit();
     }
 
-    pub fn writeStats(self: *VM, writer: std.io.AnyWriter, preprocess_ns: u64, parse_ns: u64, ffi_load_ns: u64, total_ns: u64, preprocess_cache_status: []const u8, parse_cache_status: []const u8) !void {
+    pub fn writeStats(self: *VM, writer: *std.Io.Writer, preprocess_ns: u64, parse_ns: u64, ffi_load_ns: u64, total_ns: u64, preprocess_cache_status: []const u8, parse_cache_status: []const u8) !void {
         try writer.print(
             "VM stats:\n" ++
                 "  preprocess_ns={d}\n" ++
@@ -492,7 +493,7 @@ pub const VM = struct {
         );
 
         if (self.options.profile_top_n == 0) return;
-        var rows = std.ArrayList(ProfileRow).init(self.allocator);
+        var rows = std.array_list.Managed(ProfileRow).init(self.allocator);
         defer rows.deinit();
         var it = self.function_profile.iterator();
         while (it.next()) |entry| {
@@ -515,7 +516,7 @@ pub const VM = struct {
     }
 
     fn runTestsAfterInit(self: *VM) !i32 {
-        var test_funcs = std.ArrayList(*const parser.Function).init(self.allocator);
+        var test_funcs = std.array_list.Managed(*const parser.Function).init(self.allocator);
         defer test_funcs.deinit();
 
         var func_it = self.program.functions.iterator();
@@ -1050,14 +1051,14 @@ pub const VM = struct {
             (@as(u32, @intFromBool(rhs_is_const)) << 24);
     }
 
-    fn addConstant(constants: *std.ArrayList(u64), value: u64) !u32 {
+    fn addConstant(constants: *std.array_list.Managed(u64), value: u64) !u32 {
         const idx = constants.items.len;
         if (idx > std.math.maxInt(u32)) return error.BytecodeIndexTooLarge;
         try constants.append(value);
         return @as(u32, @intCast(idx));
     }
 
-    fn appendSlow(code: *std.ArrayList(u32), slow_inst_pcs: *std.ArrayList(usize), inst_pc: usize) !void {
+    fn appendSlow(code: *std.array_list.Managed(u32), slow_inst_pcs: *std.array_list.Managed(usize), inst_pc: usize) !void {
         const idx = slow_inst_pcs.items.len;
         if (idx > BYTECODE_PAYLOAD_MAX) return error.BytecodeIndexTooLarge;
         try slow_inst_pcs.append(inst_pc);
@@ -1080,9 +1081,9 @@ pub const VM = struct {
     }
 
     fn appendBinary(
-        code: *std.ArrayList(u32),
-        constants: *std.ArrayList(u64),
-        slow_inst_pcs: *std.ArrayList(usize),
+        code: *std.array_list.Managed(u32),
+        constants: *std.array_list.Managed(u64),
+        slow_inst_pcs: *std.array_list.Managed(usize),
         inst: *const parser.Instruction,
         inst_pc: usize,
         rr_op: ByteOp,
@@ -1107,7 +1108,7 @@ pub const VM = struct {
     }
 
     fn compileTermCmp(
-        constants: *std.ArrayList(u64),
+        constants: *std.array_list.Managed(u64),
         cmp_inst: parser.Instruction,
         br_inst: parser.Instruction,
         use_counts: []const u32,
@@ -1134,7 +1135,7 @@ pub const VM = struct {
     }
 
     fn appendAddUdiv2(
-        code: *std.ArrayList(u32),
+        code: *std.array_list.Managed(u32),
         insts: []const parser.Instruction,
         pc: usize,
         body_end: usize,
@@ -1157,7 +1158,7 @@ pub const VM = struct {
     }
 
     fn appendIndexedLoad8(
-        code: *std.ArrayList(u32),
+        code: *std.array_list.Managed(u32),
         insts: []const parser.Instruction,
         pc: usize,
         body_end: usize,
@@ -1245,8 +1246,8 @@ pub const VM = struct {
 
     fn appendCall(
         self: *VM,
-        code: *std.ArrayList(u32),
-        calls: *std.ArrayList(CallMetadata),
+        code: *std.array_list.Managed(u32),
+        calls: *std.array_list.Managed(CallMetadata),
         inst: *const parser.Instruction,
         inst_pc: usize,
         target: ResolvedCall,
@@ -1284,8 +1285,8 @@ pub const VM = struct {
 
     fn appendIndirectCall(
         self: *VM,
-        code: *std.ArrayList(u32),
-        indirect_calls: *std.ArrayList(IndirectCallMetadata),
+        code: *std.array_list.Managed(u32),
+        indirect_calls: *std.array_list.Managed(IndirectCallMetadata),
         inst: *const parser.Instruction,
         inst_pc: usize,
     ) !void {
@@ -1307,11 +1308,11 @@ pub const VM = struct {
 
     fn compileInstruction(
         self: *VM,
-        code: *std.ArrayList(u32),
-        constants: *std.ArrayList(u64),
-        slow_inst_pcs: *std.ArrayList(usize),
-        calls: *std.ArrayList(CallMetadata),
-        indirect_calls: *std.ArrayList(IndirectCallMetadata),
+        code: *std.array_list.Managed(u32),
+        constants: *std.array_list.Managed(u64),
+        slow_inst_pcs: *std.array_list.Managed(usize),
+        calls: *std.array_list.Managed(CallMetadata),
+        indirect_calls: *std.array_list.Managed(IndirectCallMetadata),
         inst: *const parser.Instruction,
         inst_pc: usize,
         call_target: ResolvedCall,
@@ -1413,20 +1414,20 @@ pub const VM = struct {
         cacheable: bool,
         reads_memory: bool,
     ) !CompiledFunction {
-        var code = std.ArrayList(u32).init(self.allocator);
+        var code = std.array_list.Managed(u32).init(self.allocator);
         errdefer code.deinit();
-        var blocks = std.ArrayList(CompiledBlock).init(self.allocator);
+        var blocks = std.array_list.Managed(CompiledBlock).init(self.allocator);
         errdefer blocks.deinit();
-        var constants = std.ArrayList(u64).init(self.allocator);
+        var constants = std.array_list.Managed(u64).init(self.allocator);
         errdefer constants.deinit();
-        var slow_inst_pcs = std.ArrayList(usize).init(self.allocator);
+        var slow_inst_pcs = std.array_list.Managed(usize).init(self.allocator);
         errdefer slow_inst_pcs.deinit();
-        var calls = std.ArrayList(CallMetadata).init(self.allocator);
+        var calls = std.array_list.Managed(CallMetadata).init(self.allocator);
         errdefer {
             for (calls.items) |meta| self.allocator.free(meta.args);
             calls.deinit();
         }
-        var indirect_calls = std.ArrayList(IndirectCallMetadata).init(self.allocator);
+        var indirect_calls = std.array_list.Managed(IndirectCallMetadata).init(self.allocator);
         errdefer {
             for (indirect_calls.items) |meta| self.allocator.free(meta.args);
             indirect_calls.deinit();
@@ -1763,7 +1764,7 @@ pub const VM = struct {
                 const brace_start = std.mem.indexOf(u8, val_str, "{").?;
                 const brace_end = std.mem.lastIndexOf(u8, val_str, "}").?;
                 const inner = val_str[brace_start + 1 .. brace_end];
-                var methods_list = std.ArrayList(usize).init(self.allocator);
+                var methods_list = std.array_list.Managed(usize).init(self.allocator);
                 errdefer methods_list.deinit();
                 var method_it = std.mem.tokenizeAny(u8, inner, ",");
                 while (method_it.next()) |method| {
@@ -1976,7 +1977,7 @@ pub const VM = struct {
             .func_ptr = @intFromPtr(func),
             .memory_epoch = memory_epoch,
             .argc = @intCast(args.len),
-            .args = [_]usize{0} ** CALL_CACHE_MAX_ARGS,
+            .args = @splat(0),
         };
         for (args, 0..) |arg, idx| key.args[idx] = arg;
         return key;
@@ -2164,16 +2165,16 @@ pub const VM = struct {
         const ret = switch (meta.target) {
             .builtin_print => blk: {
                 const slice = @as([*]const u8, @ptrFromInt(args.items[0]))[0..args.items[1]];
-                _ = std.posix.write(std.posix.STDOUT_FILENO, slice) catch {};
+                sio.getStdOut().writeAll(slice) catch {};
                 break :blk @as(usize, 0);
             },
-            .builtin_time_ms => @as(usize, @intCast(@as(u64, @bitCast(std.time.milliTimestamp())))),
-            .builtin_time_s => @as(usize, @intCast(@as(u64, @bitCast(std.time.timestamp())))),
+            .builtin_time_ms => @as(usize, @intCast(@as(u64, @bitCast((sio.timestampSeconds() * 1000))))),
+            .builtin_time_s => @as(usize, @intCast(@as(u64, @bitCast(sio.timestampSeconds())))),
             .builtin_time_ns => blk: {
-                const ns = @as(i64, @intCast(std.time.nanoTimestamp()));
+                const ns = @as(i64, @intCast(sio.nanoTimestamp()));
                 break :blk @as(usize, @intCast(@as(u64, @bitCast(ns))));
             },
-            .builtin_time_instant_ns => @as(usize, @intCast(std.time.nanoTimestamp())),
+            .builtin_time_instant_ns => @as(usize, @intCast(sio.nanoTimestamp())),
             .interpreted => |target_func| try self.executeInterpretedCall(target_func, args.items),
             .ffi_typed => |ft| blk: {
                 const out = try self.ffi.callSymbolWithPtr(ft.sym, ft.sig, args.items);
@@ -2316,16 +2317,16 @@ pub const VM = struct {
                 const ret = switch (call_targets[inst_pc]) {
                     .builtin_print => blk: {
                         const slice = @as([*]const u8, @ptrFromInt(args.items[0]))[0..args.items[1]];
-                        _ = std.posix.write(std.posix.STDOUT_FILENO, slice) catch {};
+                        sio.getStdOut().writeAll(slice) catch {};
                         break :blk @as(usize, 0);
                     },
-                    .builtin_time_ms => @as(usize, @intCast(@as(u64, @bitCast(std.time.milliTimestamp())))),
-                    .builtin_time_s => @as(usize, @intCast(@as(u64, @bitCast(std.time.timestamp())))),
+                    .builtin_time_ms => @as(usize, @intCast(@as(u64, @bitCast((sio.timestampSeconds() * 1000))))),
+                    .builtin_time_s => @as(usize, @intCast(@as(u64, @bitCast(sio.timestampSeconds())))),
                     .builtin_time_ns => blk: {
-                        const ns = @as(i64, @intCast(std.time.nanoTimestamp()));
+                        const ns = @as(i64, @intCast(sio.nanoTimestamp()));
                         break :blk @as(usize, @intCast(@as(u64, @bitCast(ns))));
                     },
-                    .builtin_time_instant_ns => @as(usize, @intCast(std.time.nanoTimestamp())),
+                    .builtin_time_instant_ns => @as(usize, @intCast(sio.nanoTimestamp())),
                     .interpreted => |target_func| try self.executeInterpretedCall(target_func, args.items),
                     .ffi_typed => |ft| blk: {
                         const out = try self.ffi.callSymbolWithPtr(ft.sym, ft.sig, args.items);
