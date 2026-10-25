@@ -1,0 +1,26 @@
+{
+  "name": "sa-plugin-vm",
+  "version": "0.1.0",
+  "description": "SA plugin: vm. The plugin manifest is sap.json; install with: sa plugin install npm:sa-plugin-vm@0.1.0",
+  "keywords": [
+    "sa-plugin",
+    "sa",
+    "sla"
+  ],
+  "files": [
+    "sap.json",
+    "build.zig",
+    "build.zig.zon",
+    "src",
+    "sa",
+    "*.sai",
+    "*.sal",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {}
+}
